@@ -155,6 +155,11 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
+    # Enable bilateral grid. (experimental)
+    use_bilateral_grid: bool = False
+    # Shape of the bilateral grid (X, Y, W)
+    bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
+
     # Enable depth loss. (experimental)
     depth_loss: bool = False
     # Weight for depth loss
@@ -181,6 +186,9 @@ class Config:
     tb_every: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
+
+    # Whether use fused-bilateral grid
+    use_fused_bilagrid: bool = False
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -380,6 +388,22 @@ class Runner:
                 ),
             ]
 
+        self.bil_grid_optimizers = []
+        if cfg.use_bilateral_grid:
+            self.bil_grids = BilateralGrid(
+                len(self.trainset),
+                grid_X=cfg.bilateral_grid_shape[0],
+                grid_Y=cfg.bilateral_grid_shape[1],
+                grid_W=cfg.bilateral_grid_shape[2],
+            ).to(self.device)
+            self.bil_grid_optimizers = [
+                torch.optim.Adam(
+                    self.bil_grids.parameters(),
+                    lr=2e-3 * math.sqrt(cfg.batch_size),
+                    eps=1e-15,
+                ),
+            ]
+
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -507,6 +531,22 @@ class Runner:
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
+        if cfg.use_bilateral_grid:
+            # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
+            schedulers.append(
+                torch.optim.lr_scheduler.ChainedScheduler(
+                    [
+                        torch.optim.lr_scheduler.LinearLR(
+                            self.bil_grid_optimizers[0],
+                            start_factor=0.01,
+                            total_iters=1000,
+                        ),
+                        torch.optim.lr_scheduler.ExponentialLR(
+                            self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                        ),
+                    ]
+                )
+            )
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
@@ -582,6 +622,20 @@ class Runner:
             else:
                 colors, depths = renders, None
 
+            if cfg.use_bilateral_grid:
+                grid_y, grid_x = torch.meshgrid(
+                    (torch.arange(height, device=self.device) + 0.5) / height,
+                    (torch.arange(width, device=self.device) + 0.5) / width,
+                    indexing="ij",
+                )
+                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+                colors = slice(
+                    self.bil_grids,
+                    grid_xy.expand(colors.shape[0], -1, -1, -1),
+                    colors,
+                    image_ids.unsqueeze(-1),
+                )["rgb"]
+
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
@@ -646,6 +700,9 @@ class Runner:
                     curr_dist_lambda = 0.0
                 distloss = render_distort.mean()
                 loss += distloss * curr_dist_lambda
+            if cfg.use_bilateral_grid:
+                tvloss = 10 * total_variation_loss(self.bil_grids.grids)
+                loss += tvloss
 
             loss.backward()
 
@@ -673,6 +730,8 @@ class Runner:
                     self.writer.add_scalar("train/normalloss", normalloss.item(), step)
                 if cfg.dist_loss:
                     self.writer.add_scalar("train/distloss", distloss.item(), step)
+                if cfg.use_bilateral_grid:
+                    self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
                     canvas = (
                         torch.cat([pixels, colors[..., :3]], dim=2)
@@ -716,6 +775,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
@@ -770,6 +832,8 @@ class Runner:
         )
         ellipse_time = 0
         metrics = {"psnr": [], "ssim": [], "lpips": []}
+        if cfg.use_bilateral_grid:
+            metrics.update({"cc_psnr": [], "cc_ssim": [], "cc_lpips": []})
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -861,18 +925,19 @@ class Runner:
             metrics["psnr"].append(self.psnr(colors, pixels))
             metrics["ssim"].append(self.ssim(colors, pixels))
             metrics["lpips"].append(self.lpips(colors, pixels))
+            if cfg.use_bilateral_grid:
+                cc_colors = color_correct(colors.permute(0, 2, 3, 1), pixels.permute(0, 2, 3, 1))
+                cc_colors = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                metrics["cc_psnr"].append(self.psnr(cc_colors, pixels))
+                metrics["cc_ssim"].append(self.ssim(cc_colors, pixels))
+                metrics["cc_lpips"].append(self.lpips(cc_colors, pixels))
 
         ellipse_time /= len(valloader)
 
         psnr = torch.stack(metrics["psnr"]).mean()
         ssim = torch.stack(metrics["ssim"]).mean()
         lpips = torch.stack(metrics["lpips"]).mean()
-        print(
-            f"PSNR: {psnr.item():.3f}, SSIM: {ssim.item():.4f}, LPIPS: {lpips.item():.3f} "
-            f"Time: {ellipse_time:.3f}s/image "
-            f"Number of GS: {len(self.splats['means'])}"
-        )
-        # save stats as json
+        
         stats = {
             "psnr": psnr.item(),
             "ssim": ssim.item(),
@@ -880,6 +945,30 @@ class Runner:
             "ellipse_time": ellipse_time,
             "num_GS": len(self.splats["means"]),
         }
+        
+        if cfg.use_bilateral_grid:
+            cc_psnr = torch.stack(metrics["cc_psnr"]).mean()
+            cc_ssim = torch.stack(metrics["cc_ssim"]).mean()
+            cc_lpips = torch.stack(metrics["cc_lpips"]).mean()
+            stats.update({
+                "cc_psnr": cc_psnr.item(),
+                "cc_ssim": cc_ssim.item(),
+                "cc_lpips": cc_lpips.item(),
+            })
+            print(
+                f"PSNR: {psnr.item():.3f}, SSIM: {ssim.item():.4f}, LPIPS: {lpips.item():.3f} "
+                f"CC_PSNR: {cc_psnr.item():.3f}, CC_SSIM: {cc_ssim.item():.4f}, CC_LPIPS: {cc_lpips.item():.3f} "
+                f"Time: {ellipse_time:.3f}s/image "
+                f"Number of GS: {len(self.splats['means'])}"
+            )
+        else:
+            print(
+                f"PSNR: {psnr.item():.3f}, SSIM: {ssim.item():.4f}, LPIPS: {lpips.item():.3f} "
+                f"Time: {ellipse_time:.3f}s/image "
+                f"Number of GS: {len(self.splats['means'])}"
+            )
+        
+        # save stats as json
         with open(f"{self.stats_dir}/val_step{step:04d}.json", "w") as f:
             json.dump(stats, f)
         # save stats to tensorboard
@@ -1037,4 +1126,24 @@ def main(cfg: Config):
 if __name__ == "__main__":
     cfg = tyro.cli(Config)
     cfg.adjust_steps(cfg.steps_scaler)
+    
+    # Import BilateralGrid and related functions based on configuration
+    if cfg.use_bilateral_grid or cfg.use_fused_bilagrid:
+        if cfg.use_fused_bilagrid:
+            cfg.use_bilateral_grid = True
+            from fused_bilagrid import (
+                BilateralGrid,
+                color_correct,
+                slice,
+                total_variation_loss,
+            )
+        else:
+            cfg.use_bilateral_grid = True
+            from lib_bilagrid import (
+                BilateralGrid,
+                color_correct,
+                slice,
+                total_variation_loss,
+            )
+    
     main(cfg)

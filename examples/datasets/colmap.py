@@ -24,7 +24,7 @@ def _get_rel_paths(path_dir: str) -> List[str]:
     paths = []
     for dp, dn, fn in os.walk(path_dir):
         for f in fn:
-            paths.append(os.path.relpath(os.path.join(dp, f), path_dir))
+            paths.append(os.path.relpath(os.path.join(dp, f), path_dir).replace("\\", "/"))
     return paths
 
 

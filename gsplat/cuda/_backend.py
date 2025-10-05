@@ -8,6 +8,7 @@ import glob
 import json
 import os
 import shutil
+import sys
 import time
 from subprocess import DEVNULL, call
 
@@ -31,7 +32,7 @@ USE_PRECOMPILED_HEADERS = os.getenv("USE_PRECOMPILED_HEADERS", "0") == "1"
 need_to_unset_max_jobs = False
 if not MAX_JOBS:
     need_to_unset_max_jobs = True
-    os.environ["MAX_JOBS"] = "10"
+    os.environ["MAX_JOBS"] = "6"
 
 # torch has bugs on precompiled headers before 2.2, see:
 # https://github.com/nerfstudio-project/gsplat/pull/583#issuecomment-2732597080
@@ -174,8 +175,15 @@ except ImportError:
 
         extra_include_paths = [os.path.join(PATH, "include/"), glm_path]
         opt_level = "-O0" if FAST_COMPILE else "-O3"
-        extra_cflags = [opt_level, "-Wno-attributes"]
-        extra_cuda_cflags = [opt_level]
+        
+        # Platform-specific compilation flags
+        if sys.platform == 'win32':
+            extra_cflags = ["/O0" if FAST_COMPILE else "/O2"]
+            extra_cuda_cflags = ["-O0" if FAST_COMPILE else "-O3"]
+        else:
+            extra_cflags = [opt_level, "-Wno-attributes"]
+            extra_cuda_cflags = [opt_level]
+        
         if not NO_FAST_MATH:
             extra_cuda_cflags += ["-use_fast_math"]
         sources = (

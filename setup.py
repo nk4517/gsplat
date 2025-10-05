@@ -15,11 +15,11 @@ URL = "https://github.com/nerfstudio-project/gsplat"
 BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", "0") == "1"
 WITH_SYMBOLS = os.getenv("WITH_SYMBOLS", "0") == "1"
 LINE_INFO = os.getenv("LINE_INFO", "0") == "1"
-MAX_JOBS = os.getenv("MAX_JOBS")
+MAX_JOBS = os.getenv("MAX_JOBS", "6")
 need_to_unset_max_jobs = False
 if not MAX_JOBS:
     need_to_unset_max_jobs = True
-    os.environ["MAX_JOBS"] = "10"
+    os.environ["MAX_JOBS"] = "6"
     print(f"Setting MAX_JOBS to {os.environ['MAX_JOBS']}")
 
 

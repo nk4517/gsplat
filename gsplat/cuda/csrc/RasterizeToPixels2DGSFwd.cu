@@ -417,14 +417,20 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
             int32_t g = id_batch[t];
             const float vis = alpha * T;
             const float *c_ptr = colors + g * CDIM;
-            
+
+            // Вычисление глубины через пересечение луча и плоскости
+            // const float depth_at_pixel = s.x * w_M.x + s.y * w_M.y + w_M.z;
+            // не, лучше не надо, иначе сплаты перехлёстываются и "мигают"
+
+            // Get depth from the last channel of colors
+            const float depth_at_pixel = c_ptr[CDIM - 1];
+
             // Track dominating gaussian (the one that consumes most transmittance)
             float consumed_T = T - next_T;  // amount of transmittance consumed by this gaussian
             if (consumed_T > max_consumed_T) {
                 max_consumed_T = consumed_T;
                 dominating_gid = g;
-                // Get depth from the last channel of colors
-                dominating_depth_val = c_ptr[CDIM - 1];
+                dominating_depth_val = depth_at_pixel;
             }
             
 #pragma unroll
@@ -440,7 +446,7 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
 
             if (render_distort != nullptr) {
                 // the last channel of colors is depth
-                const float depth = c_ptr[CDIM - 1];
+                const float depth = depth_at_pixel;
                 // in nerfacc, loss_bi_0 = weights * t_mids *
                 // exclusive_sum(weights)
                 const float distort_bi_0 = vis * depth * (1.0f - T);
@@ -453,7 +459,7 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
 
             // compute median depth
             if (T > 0.5) {
-                median_depth = c_ptr[CDIM - 1];
+                median_depth = depth_at_pixel;
                 median_idx = batch_start + t;
             }
 

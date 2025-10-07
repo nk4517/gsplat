@@ -219,16 +219,17 @@ __global__ void projection_2dgs_fused_fwd_kernel(
     const float radius_x = ceil(3.33f * sqrt(max(1e-4, half_extend.x)));
     const float radius_y = ceil(3.33f * sqrt(max(1e-4, half_extend.y)));
 
-    if (radius_x <= radius_clip && radius_y <= radius_clip) {
-        radii[idx * 2] = 0;
-        radii[idx * 2 + 1] = 0;
-        return;
-    }
-
     // CULLING STEP:
-    // mask out gaussians outside the image region
-    if (mean2d.x + radius_x <= 0 || mean2d.x - radius_x >= image_width ||
-        mean2d.y + radius_y <= 0 || mean2d.y - radius_y >= image_height) {
+    // Check all filtering conditions
+    const bool min_radius_too_small = min(radius_x, radius_y) < 0.5f;
+    const float area = 3.14159265f * radius_x * radius_y;
+    const bool area_too_small = area < 0.5f;
+    const bool radius_below_clip = radius_x <= radius_clip && radius_y <= radius_clip;
+    const bool outside_image = mean2d.x + radius_x <= 0 || mean2d.x - radius_x >= image_width ||
+                               mean2d.y + radius_y <= 0 || mean2d.y - radius_y >= image_height;
+    
+    // Filter out if any condition is met
+    if (min_radius_too_small || area_too_small || radius_below_clip || outside_image) {
         radii[idx * 2] = 0;
         radii[idx * 2 + 1] = 0;
         return;

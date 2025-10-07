@@ -1066,9 +1066,12 @@ class Runner:
         render_tab_state.total_gs_count = len(self.splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
 
-        if render_tab_state.render_mode == "depth":
+        if render_tab_state.render_mode in ("depth(expected)", "depth(dominating)"):
+            if render_tab_state.render_mode == "depth(dominating)":
+                depth = info["dominating_depths"][0, ..., None]
+            else:
+                depth = render_median[0, ..., 0:1]
             # normalize depth to [0, 1]
-            depth = render_median[0, ..., 0:1]
             if render_tab_state.normalize_nearfar:
                 near_plane = render_tab_state.near_plane
                 far_plane = render_tab_state.far_plane

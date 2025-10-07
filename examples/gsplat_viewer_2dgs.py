@@ -139,7 +139,7 @@ class GsplatViewer(Viewer):
 
                 render_mode_dropdown = server.gui.add_dropdown(
                     "Render Mode",
-                    ("rgb", "depth", "normal", "alpha", "domination"),
+                    ("rgb", "depth", "depth(dominating)", "normal", "alpha", "domination"),
                     initial_value=self.render_tab_state.render_mode,
                     hint="Render mode to use.",
                 )

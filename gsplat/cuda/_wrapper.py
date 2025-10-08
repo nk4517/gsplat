@@ -454,6 +454,7 @@ def isect_tiles(
     n_images: Optional[int] = None,
     image_ids: Optional[Tensor] = None,
     gaussian_ids: Optional[Tensor] = None,
+    ray_transforms_2dgs: Optional[Tensor] = None,  # [..., N, 9] or [nnz, 9]
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Maps projected Gaussians to intersecting tiles.
 
@@ -470,6 +471,7 @@ def isect_tiles(
         n_images: Number of images. Required if packed is True.
         image_ids: The image indices of the projected Gaussians. Required if packed is True.
         gaussian_ids: The column indices of the projected Gaussians. Required if packed is True.
+        ray_transforms_2dgs: Ray transforms for 2DGS. Optional. [..., N, 9] if packed is False, [nnz, 9] if packed is True.
 
     Returns:
         A tuple:
@@ -493,6 +495,8 @@ def isect_tiles(
         image_ids = image_ids.contiguous()
         gaussian_ids = gaussian_ids.contiguous()
         I = n_images
+        if ray_transforms_2dgs is not None:
+            assert ray_transforms_2dgs.shape == (nnz, 9), ray_transforms_2dgs.shape
 
     else:
         image_dims = means2d.shape[:-2]
@@ -501,11 +505,14 @@ def isect_tiles(
         assert means2d.shape == image_dims + (N, 2), means2d.shape
         assert radii.shape == image_dims + (N, 2), radii.shape
         assert depths.shape == image_dims + (N,), depths.shape
+        if ray_transforms_2dgs is not None:
+            assert ray_transforms_2dgs.shape == image_dims + (N, 9), ray_transforms_2dgs.shape
 
     tiles_per_gauss, isect_ids, flatten_ids = _make_lazy_cuda_func("intersect_tile")(
         means2d.contiguous(),
         radii.contiguous(),
         depths.contiguous(),
+        ray_transforms_2dgs.contiguous() if ray_transforms_2dgs is not None else None,
         image_ids,
         gaussian_ids,
         I,

@@ -253,6 +253,7 @@ def rasterization_2dgs(
         n_images=I,
         image_ids=image_ids,
         gaussian_ids=gaussian_ids,
+        ray_transforms_2dgs=ray_transforms.reshape(*ray_transforms.shape[:-2], 9) if not packed else ray_transforms.reshape(-1, 9),
     )
     isect_offsets = isect_offset_encode(isect_ids, I, tile_width, tile_height)
     isect_offsets = isect_offsets.reshape(batch_dims + (C, tile_height, tile_width))

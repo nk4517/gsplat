@@ -187,6 +187,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile(
     const at::Tensor means2d,                    // [..., C, N, 2] or [nnz, 2]
     const at::Tensor radii,                      // [..., C, N, 2] or [nnz, 2]
     const at::Tensor depths,                     // [..., C, N] or [nnz]
+    const at::optional<at::Tensor> ray_transforms_2dgs, // [..., C, N, 9] or [nnz, 9]
     const at::optional<at::Tensor> image_ids,    // [nnz]
     const at::optional<at::Tensor> gaussian_ids, // [nnz]
     const uint32_t I,

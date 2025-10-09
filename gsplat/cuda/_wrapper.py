@@ -2253,7 +2253,7 @@ def rasterize_to_pixels_2dgs(
     colors: Tensor,  # [..., N, channels]
     opacities: Tensor,  # [..., N]
     normals: Tensor,  # [..., N, 3]
-    densify: Tensor,  # [..., N, 4]
+    densify: Tensor,  # [..., N, 5]
     image_width: int,
     image_height: int,
     tile_size: int,
@@ -2274,7 +2274,7 @@ def rasterize_to_pixels_2dgs(
         colors: Gaussian colors or ND features. [..., N, channels] if packed is False, [nnz, channels] if packed is True.
         opacities: Gaussian opacities that support per-view values. [..., N] if packed is False, [nnz] if packed is True.
         normals: The normals in camera space. [..., N, 3] if packed is False, [nnz, 3] if packed is True.
-        densify: Dummy variable to keep track of gradient for densification. [..., N, 4] if packed, [nnz, 4] if packed is True.
+        densify: Dummy variable to keep track of gradients for densification/pruning. [..., N, 5] if packed, [nnz, 5] if packed is True.
         tile_size: Tile size.
         isect_offsets: Intersection offsets outputs from `isect_offset_encode()`. [..., tile_height, tile_width]
         flatten_ids: The global flatten indices in [I * N] or [nnz] from  `isect_tiles()`. [n_isects]

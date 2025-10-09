@@ -238,7 +238,7 @@ def rasterization_2dgs(
 
     # Create densify with shape [..., N, 5] or [nnz, 5]
     densify_shape = list(means2d.shape)
-    densify_shape[-1] = 4  # Change last dimension from 2 to 4
+    densify_shape[-1] = 5  # Change last dimension from 2 to 5
     densify = torch.zeros(
         densify_shape, dtype=means.dtype, requires_grad=True, device="cuda"
     )

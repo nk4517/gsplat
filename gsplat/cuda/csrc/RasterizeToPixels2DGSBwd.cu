@@ -87,7 +87,7 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
     scalar_t *__restrict__ v_colors,         // [..., N, CDIM] or [nnz, CDIM]
     scalar_t *__restrict__ v_opacities,      // [..., N] or [nnz]
     scalar_t *__restrict__ v_normals,        // [..., N, 3] or [nnz, 3]
-    scalar_t *__restrict__ v_densify         // [..., N, 4] or [nnz, 4]
+    scalar_t *__restrict__ v_densify         // [..., N, 5] or [nnz, 5]
 ) {
     /**
      * ==============================
@@ -455,6 +455,9 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
             // opacity gradients
             float v_opacity_local = 0.f;
 
+            // gaussian gradient squared for densification
+            float v_gauss_sq_local = 0.f;
+
             // initialize everything to 0, only set if the lane is valid
             /**
              * ==================================================
@@ -564,6 +567,9 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                 if (opac * vis <= 0.999f) {
                     float v_depth = 0.f;
                     const float v_G = opac * v_alpha;
+
+                    // Накопление квадрата градиента для relocate/prune
+                    v_gauss_sq_local = v_G * v_G;
 
                     if constexpr (AA_METHOD == AA_2DGS) {
                         // Градиент по s через mip-фильтрацию
@@ -696,6 +702,7 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                 warpSum(v_xy_abs_local, warp);
             }
             warpSum(v_opacity_local, warp);
+            warpSum(v_gauss_sq_local, warp);
             warpSum(v_densify_local, warp);
             int32_t g = id_batch[t]; // flatten index in [I * N] or [nnz]
 
@@ -741,11 +748,12 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
 
                 gpuAtomicAdd(v_opacities + g, v_opacity_local);
                 if (v_densify != nullptr) {
-                    float *v_densify_ptr = (float *)(v_densify) + 4 * g;
+                    float *v_densify_ptr = (float *)(v_densify) + 5 * g;
                     gpuAtomicAdd(v_densify_ptr, v_densify_local.x);
                     gpuAtomicAdd(v_densify_ptr + 1, v_densify_local.y);
                     gpuAtomicAdd(v_densify_ptr + 2, v_densify_local.z);
                     gpuAtomicAdd(v_densify_ptr + 3, v_densify_local.w);
+                    gpuAtomicAdd(v_densify_ptr + 4, v_gauss_sq_local);
                 }
             }
 
@@ -769,7 +777,7 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
     const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor opacities,                 // [..., N] or [nnz]
     const at::Tensor normals,                   // [..., N, 3] or [nnz, 3]
-    const at::Tensor densify,                   // [..., N, 4] or [nnz, 4]
+    const at::Tensor densify,                   // [..., N, 5] or [nnz, 5]
     const at::optional<at::Tensor> backgrounds, // [..., CDIM]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -797,7 +805,7 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
     at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_opacities,                 // [..., N] or [nnz]
     at::Tensor v_normals,                   // [..., N, 3] or [nnz, 3]
-    at::Tensor v_densify                    // [..., N, 2] or [nnz, 2]
+    at::Tensor v_densify                    // [..., N, 5] or [nnz, 5]
 ) {
     bool packed = means2d.dim() == 2;
 

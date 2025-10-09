@@ -33,6 +33,8 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from examples.utils import normalize_robust, index_map_to_pseudocolor
+from gsplat.strategy.ops import scaling_inverse_activation, opacity_inverse_activation, scaling_activation, opacity_activation
+
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -247,9 +249,9 @@ def create_splats_with_optimizers(
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    scales = scaling_inverse_activation(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
     quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    opacities = opacity_inverse_activation(torch.full((N,), init_opacity))  # [N,]
 
     params = [
         # name, value, lr
@@ -482,8 +484,8 @@ class Runner:
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        scales = scaling_activation(self.splats["scales"])  # [N, 3]
+        opacities = opacity_activation(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         override_colors = kwargs.pop("override_colors", None)

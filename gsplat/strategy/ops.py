@@ -9,6 +9,31 @@ from gsplat import quat_scale_to_covar_preci
 from gsplat.relocation import compute_relocation
 from gsplat.utils import normalized_quat_to_rotmat
 
+# Activation functions
+def inverse_sigmoid(x):
+    return torch.logit(x)
+
+def build_covariance_from_scaling_rotation_2dgs(scaling, rotation):
+    """Build 3D covariance matrix from scaling and rotation quaternion."""
+    # This is a placeholder for 2DGS which doesn't use this directly
+    # The actual implementation would be in gsplat library
+    raise NotImplementedError("build_covariance_from_scaling_rotation is not used in 2DGS")
+
+
+def build_covariance_from_scaling_rotation(scaling, rotation):
+    """Build 3D covariance matrix from scaling and rotation quaternion."""
+    from gsplat.utils import normalized_quat_to_rotmat
+    rotmats = normalized_quat_to_rotmat(rotation)  # [N, 3, 3]
+    scale_mats = torch.diag_embed(scaling ** 2)  # [N, 3, 3]
+    return torch.bmm(torch.bmm(rotmats, scale_mats), rotmats.transpose(1, 2))  # [N, 3, 3]
+
+scaling_activation = torch.exp
+scaling_inverse_activation = torch.log
+covariance_activation = build_covariance_from_scaling_rotation
+opacity_activation = torch.sigmoid
+opacity_inverse_activation = inverse_sigmoid
+rotation_activation = F.normalize
+
 
 @torch.no_grad()
 def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Tensor:
@@ -141,8 +166,8 @@ def split(
     sel = torch.where(mask)[0]
     rest = torch.where(~mask)[0]
 
-    scales = torch.exp(params["scales"][sel])
-    quats = F.normalize(params["quats"][sel], dim=-1)
+    scales = scaling_activation(params["scales"][sel])
+    quats = rotation_activation(params["quats"][sel], dim=-1)
     rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
     samples = torch.einsum(
         "nij,nj,bnj->bni",
@@ -156,10 +181,10 @@ def split(
         if name == "means":
             p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
         elif name == "scales":
-            p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+            p_split = scaling_inverse_activation(scales / 1.6).repeat(2, 1)  # [2N, 3]
         elif name == "opacities" and revised_opacity:
-            new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
-            p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
+            new_opacities = 1.0 - torch.sqrt(1.0 - opacity_activation(p[sel]))
+            p_split = opacity_inverse_activation(new_opacities).repeat(repeats)  # [2N]
         else:
             p_split = p[sel].repeat(repeats)
         p_new = torch.cat([p[rest], p_split])
@@ -227,7 +252,7 @@ def reset_opa(
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "opacities":
-            opacities = torch.clamp(p, max=torch.logit(torch.tensor(value)).item())
+            opacities = torch.clamp(p, max=opacity_inverse_activation(torch.tensor(value)).item())
             return torch.nn.Parameter(opacities, requires_grad=p.requires_grad)
         else:
             raise ValueError(f"Unexpected parameter name: {name}")
@@ -258,7 +283,7 @@ def relocate(
         mask: A boolean mask to indicates which Gaussians are dead.
     """
     # support "opacities" with shape [N,] or [N, 1]
-    opacities = torch.sigmoid(params["opacities"])
+    opacities = opacity_activation(params["opacities"])
 
     dead_indices = mask.nonzero(as_tuple=True)[0]
     alive_indices = (~mask).nonzero(as_tuple=True)[0]
@@ -271,7 +296,7 @@ def relocate(
     sampled_idxs = alive_indices[sampled_idxs]
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
-        scales=torch.exp(params["scales"])[sampled_idxs],
+        scales=scaling_activation(params["scales"])[sampled_idxs],
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
     )
@@ -279,9 +304,9 @@ def relocate(
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "opacities":
-            p[sampled_idxs] = torch.logit(new_opacities)
+            p[sampled_idxs] = opacity_inverse_activation(new_opacities)
         elif name == "scales":
-            p[sampled_idxs] = torch.log(new_scales)
+            p[sampled_idxs] = scaling_inverse_activation(new_scales)
         p[dead_indices] = p[sampled_idxs]
         return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
@@ -306,14 +331,14 @@ def sample_add(
     binoms: Tensor,
     min_opacity: float = 0.005,
 ):
-    opacities = torch.sigmoid(params["opacities"])
+    opacities = opacity_activation(params["opacities"])
 
     eps = torch.finfo(torch.float32).eps
     probs = opacities.flatten()
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
-        scales=torch.exp(params["scales"])[sampled_idxs],
+        scales=scaling_activation(params["scales"])[sampled_idxs],
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
     )
@@ -321,9 +346,9 @@ def sample_add(
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "opacities":
-            p[sampled_idxs] = torch.logit(new_opacities)
+            p[sampled_idxs] = opacity_inverse_activation(new_opacities)
         elif name == "scales":
-            p[sampled_idxs] = torch.log(new_scales)
+            p[sampled_idxs] = scaling_inverse_activation(new_scales)
         p_new = torch.cat([p, p[sampled_idxs]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
@@ -347,8 +372,8 @@ def inject_noise_to_position(
     state: Dict[str, Tensor],
     scaler: float,
 ):
-    opacities = torch.sigmoid(params["opacities"].flatten())
-    scales = torch.exp(params["scales"])
+    opacities = opacity_activation(params["opacities"].flatten())
+    scales = scaling_activation(params["scales"])
     covars, _ = quat_scale_to_covar_preci(
         params["quats"],
         scales,

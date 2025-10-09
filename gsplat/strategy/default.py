@@ -4,8 +4,12 @@ from typing import Any, Dict, Tuple, Union
 import torch
 from typing_extensions import Literal
 
+from .ops import (
+    duplicate, remove, reset_opa, split, split_n,
+    opacity_activation, scaling_activation
+)
+
 from .base import Strategy
-from .ops import duplicate, remove, reset_opa, split
 
 
 @dataclass

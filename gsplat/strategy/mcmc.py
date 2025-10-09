@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from .base import Strategy
-from .ops import inject_noise_to_position, relocate, sample_add
+from .ops import inject_noise_to_position, relocate, sample_add, opacity_activation
 from .epoch_stats import EpochStatistics, EpochContext
 
 
@@ -161,7 +161,7 @@ class MCMCStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
     ) -> int:
-        opacities = torch.sigmoid(params["opacities"].flatten())
+        opacities = opacity_activation(params["opacities"].flatten())
         dead_mask = opacities <= self.min_opacity
         n_gs = dead_mask.sum().item()
         if n_gs > 0:

@@ -36,11 +36,10 @@ from examples.utils import normalize_robust, index_map_to_pseudocolor
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
-    apply_depth_colormap,
-    colormap,
     knn,
     rgb_to_sh,
     set_random_seed,
+    scalar_to_colormap,
 )
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper

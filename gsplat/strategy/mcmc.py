@@ -1,12 +1,13 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 from torch import Tensor
 
 from .base import Strategy
 from .ops import inject_noise_to_position, relocate, sample_add
+from .epoch_stats import EpochStatistics, EpochContext
 
 
 @dataclass
@@ -24,9 +25,9 @@ class MCMCStrategy(Strategy):
     Args:
         cap_max (int): Maximum number of GSs. Default to 1_000_000.
         noise_lr (float): MCMC samping noise learning rate. Default to 5e5.
-        refine_start_iter (int): Start refining GSs after this iteration. Default to 500.
-        refine_stop_iter (int): Stop refining GSs after this iteration. Default to 25_000.
-        refine_every (int): Refine GSs every this steps. Default to 100.
+        refine_start_epochs (int): Start refining GSs after this many epochs. Default is 15.
+        refine_stop_epochs (int): Stop refining GSs after this many epochs. Default is 500.
+        refine_every_epochs (int): Refine GSs every this many epochs. Default is 3.
         min_opacity (float): GSs with opacity below this value will be pruned. Default to 0.005.
         growth_factor (float): Factor for growing the number of GSs. Default to 1.05.
         verbose (bool): Whether to print verbose information. Default to False.
@@ -49,9 +50,9 @@ class MCMCStrategy(Strategy):
 
     cap_max: int = 1_000_000
     noise_lr: float = 5e5
-    refine_start_iter: int = 500
-    refine_stop_iter: int = 25_000
-    refine_every: int = 100
+    refine_start_epochs: int = 15  # Start refining GSs after this many epochs
+    refine_stop_epochs: int = 500  # Stop refining GSs after this many epochs
+    refine_every_epochs: int = 3  # Refine GSs every this many epochs
     min_opacity: float = 0.005
     growth_factor: float = 1.05
     verbose: bool = False
@@ -110,32 +111,39 @@ class MCMCStrategy(Strategy):
         step: int,
         info: Dict[str, Any],
         lr: float,
+        epoch_ctx: EpochContext,
     ):
         """Callback function to be executed after the `loss.backward()` call.
 
         Args:
             lr (float): Learning rate for "means" attribute of the GS.
+            epoch_ctx (EpochContext): Context information about the current epoch.
         """
         # move to the correct device
+
+        if not epoch_ctx.epoch_end:
+            return
+
         state["binoms"] = state["binoms"].to(params["means"].device)
 
         binoms = state["binoms"]
 
-        if (
-            step < self.refine_stop_iter
-            and step > self.refine_start_iter
-            and step % self.refine_every == 0
-        ):
+        # Check if refinement should happen at this epoch
+        should_refine = (self.refine_stop_epochs <= epoch_ctx.i_epoch < self.refine_start_epochs and
+                         epoch_ctx.i_epoch % self.refine_every_epochs == 0)
+
+
+        if should_refine:
             # teleport GSs
             n_relocated_gs = self._relocate_gs(params, optimizers, binoms)
             if self.verbose:
-                print(f"Step {step}: Relocated {n_relocated_gs} GSs.")
+                print(f"Epoch {epoch_ctx.i_epoch} (Step {step}): Relocated {n_relocated_gs} GSs.")
 
             # add new GSs
             n_new_gs = self._add_new_gs(params, optimizers, binoms)
             if self.verbose:
                 print(
-                    f"Step {step}: Added {n_new_gs} GSs. "
+                    f"Epoch {epoch_ctx.i_epoch} (Step {step}): Added {n_new_gs} GSs. "
                     f"Now having {len(params['means'])} GSs."
                 )
 

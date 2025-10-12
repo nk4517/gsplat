@@ -44,13 +44,14 @@ class DefaultStrategy(Strategy):
           this value will be pruned. Default is 0.15.
         refine_scale2d_stop_iter (int): Stop refining GSs based on 2d scale after this
           iteration. Default is 0. Set to a positive value to enable this feature.
-        refine_start_iter (int): Start refining GSs after this iteration. Default is 500.
-        refine_stop_iter (int): Stop refining GSs after this iteration. Default is 15_000.
-        reset_every (int): Reset opacities every this steps. Default is 3000.
-        refine_every (int): Refine GSs every this steps. Default is 100.
-        pause_refine_after_reset (int): Pause refining GSs until this number of steps after
-          reset, Default is 0 (no pause at all) and one might want to set this number to the
-          number of images in training set.
+        refine_start_epochs (int): Start refining GSs after this many epochs. Default is 15.
+        refine_stop_epochs (int): Stop refining GSs after this many epochs. Default is 500.
+        reset_every_epochs (int): Reset opacities every this many epochs. Default is 30.
+        reset_start_epochs (int): Start resetting opacities after this many epochs. Default is 0.
+        reset_end_epochs (int): Stop resetting opacities after this many epochs. Default is 10000.
+        refine_every_epochs (int): Refine GSs every this many epochs. Default is 3.
+        pause_refine_after_reset_epochs (int): Pause refining GSs for this many epochs after
+          reset. Default is 1.
         absgrad (bool): Use absolute gradients for GS splitting. Default is False.
         revised_opacity (bool): Whether to use revised opacity heuristic from
           arXiv:2404.06109 (experimental). Default is False.
@@ -83,11 +84,13 @@ class DefaultStrategy(Strategy):
     prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
-    refine_start_iter: int = 500
-    refine_stop_iter: int = 15_000
-    reset_every: int = 3000
-    refine_every: int = 100
-    pause_refine_after_reset: int = 0
+    refine_start_epochs: int = 15  # Start refining GSs after this many epochs
+    refine_stop_epochs: int = 500  # Stop refining GSs after this many epochs
+    reset_start_epochs: int = 100  # Start resetting opacities after this many epochs
+    reset_end_epochs: int = 10000  # Stop resetting opacities after this many epochs
+    reset_every_epochs: int = 20  # Reset opacities every this many epochs
+    refine_every_epochs: int = 5  # Refine GSs every this many epochs
+    pause_refine_after_reset_epochs: int = 1  # Pause refining for this many epochs after reset
     absgrad: bool = False
     revised_opacity: bool = False
     verbose: bool = False
@@ -142,6 +145,7 @@ class DefaultStrategy(Strategy):
         state: Dict[str, Any],
         step: int,
         info: Dict[str, Any],
+        epoch_ctx: EpochContext,
     ):
         """Callback function to be executed before the `loss.backward()` call."""
         assert (
@@ -156,6 +160,7 @@ class DefaultStrategy(Strategy):
         state: Dict[str, Any],
         step: int,
         info: Dict[str, Any],
+        epoch_ctx: EpochContext,
         packed: bool = False,
     ):
         """Callback function to be executed after the `loss.backward()` call."""
@@ -164,11 +169,17 @@ class DefaultStrategy(Strategy):
 
         self._update_state(params, state, info, packed=packed)
 
-        if (
-            step > self.refine_start_iter
-            and step % self.refine_every == 0
-            and step % self.reset_every >= self.pause_refine_after_reset
-        ):
+        if not epoch_ctx.epoch_end:
+            return
+
+        # Check if we should reset opacities at this epoch
+        should_reset = (self.reset_every_epochs > 0 and 
+                       epoch_ctx.i_epoch > 0 and 
+                       epoch_ctx.i_epoch % self.reset_every_epochs == 0 and
+                       epoch_ctx.i_epoch >= self.reset_start_epochs and
+                       epoch_ctx.i_epoch <= self.reset_end_epochs)
+        
+        if should_reset:
             # grow GSs
             n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
             if self.verbose:
@@ -178,12 +189,13 @@ class DefaultStrategy(Strategy):
                 )
 
             # prune GSs
-            n_prune = self._prune_gs(params, optimizers, state, step)
+            n_prune = self._prune_gs(params, optimizers, state, step, epoch_ctx, n_new_gs=n_dupli+n_split, protected_mask=protected_mask)
             if self.verbose:
                 print(
-                    f"Step {step}: {n_prune} GSs pruned. "
+                    f"Epoch {epoch_ctx.i_epoch} (Step {step}): {n_prune} GSs pruned. "
                     f"Now having {len(params['means'])} GSs."
                 )
+
 
             # reset running stats
             state["grad2d"].zero_()
@@ -192,6 +204,24 @@ class DefaultStrategy(Strategy):
                 state["radii"].zero_()
             torch.cuda.empty_cache()
 
+    def step_epoch_start(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        epoch_ctx: EpochContext,
+    ):
+        """Callback function to be executed before forward pass of the first camera in batch."""
+        # Reset epoch-based statistics at the start of each epoch
+        n_gaussian = len(list(params.values())[0])
+        device = list(params.values())[0].device
+        
+        # Initialize epoch statistics block
+        if "epoch_stats" not in state:
+            state["epoch_stats"] = EpochStatistics(n_gaussian, device)
+        else:
+            state["epoch_stats"].reset()
         if step % self.reset_every == 0 and step > 0:
             reset_opa(
                 params=params,
@@ -259,6 +289,10 @@ class DefaultStrategy(Strategy):
                 radii / float(max(info["width"], info["height"])),
             )
 
+        if "epoch_stats" in state:
+            # ========== Epoch-based statistics block ==========
+            # ========== End of epoch-based statistics block ==========
+
     @torch.no_grad()
     def _grow_gs(
         self,
@@ -266,7 +300,8 @@ class DefaultStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
-    ) -> Tuple[int, int]:
+        epoch_ctx: EpochContext,
+    ) -> Tuple[int, int, torch.Tensor]:
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
@@ -288,6 +323,8 @@ class DefaultStrategy(Strategy):
         # first duplicate
         if n_dupli > 0:
             duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)
+            # Resize epoch statistics after duplication
+            self._extend_epoch_stats(state, n_dupli)
 
         # new GSs added by duplication will not be split
         is_split = torch.cat(
@@ -315,6 +352,7 @@ class DefaultStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
+        epoch_ctx: EpochContext,
     ) -> int:
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
         if step > self.reset_every:
@@ -335,5 +373,8 @@ class DefaultStrategy(Strategy):
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
+            # Resize epoch statistics after pruning
+            if "epoch_stats" in state:
+                state["epoch_stats"].prune(is_prune)
 
         return n_prune

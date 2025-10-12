@@ -28,6 +28,7 @@ class MCMCStrategy(Strategy):
         refine_stop_iter (int): Stop refining GSs after this iteration. Default to 25_000.
         refine_every (int): Refine GSs every this steps. Default to 100.
         min_opacity (float): GSs with opacity below this value will be pruned. Default to 0.005.
+        growth_factor (float): Factor for growing the number of GSs. Default to 1.05.
         verbose (bool): Whether to print verbose information. Default to False.
 
     Examples:
@@ -52,6 +53,7 @@ class MCMCStrategy(Strategy):
     refine_stop_iter: int = 25_000
     refine_every: int = 100
     min_opacity: float = 0.005
+    growth_factor: float = 1.05
     verbose: bool = False
 
     def initialize_state(self) -> Dict[str, Any]:
@@ -173,7 +175,7 @@ class MCMCStrategy(Strategy):
         binoms: Tensor,
     ) -> int:
         current_n_points = len(params["means"])
-        n_target = min(self.cap_max, int(1.05 * current_n_points))
+        n_target = min(self.cap_max, int(self.growth_factor * current_n_points))
         n_gs = max(0, n_target - current_n_points)
         if n_gs > 0:
             sample_add(

@@ -1060,6 +1060,7 @@ class Runner:
             render_mode="RGB+ED",
             backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device) / 255.0,
             track_domination=True,
+            distloss=render_tab_state.render_mode == "distort",
             override_colors=override_colors,
             overmax_opacity=overmax_opacity,
         )  # [1, H, W, 3]
@@ -1097,6 +1098,25 @@ class Runner:
         elif render_tab_state.render_mode == "domination":
             renders = (
                 index_map_to_pseudocolor(info["dominating_gauss_ids"][0, ...])
+                .cpu()
+                .numpy()
+            )
+        elif render_tab_state.render_mode == "distort":
+            dist = render_distort[0, ..., 0:1]
+            # normalize distortion to [0, 1]
+            if render_tab_state.normalize_nearfar:
+                # Use near/far plane for normalization
+                near_plane = render_tab_state.near_plane
+                far_plane = render_tab_state.far_plane
+                dist_norm = (dist - near_plane) / (far_plane - near_plane + 1e-10)
+                dist_norm = torch.clip(dist_norm, 0, 1)
+            else:
+                # Use robust normalization to exclude outliers
+                dist_norm = normalize_robust(dist)
+            if render_tab_state.inverse:
+                dist_norm = 1 - dist_norm
+            renders = (
+                apply_float_colormap(dist_norm, render_tab_state.colormap)
                 .cpu()
                 .numpy()
             )

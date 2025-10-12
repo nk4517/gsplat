@@ -18,7 +18,7 @@ class GsplatRenderTabState(RenderTabState):
     eps2d: float = 0.3
     backgrounds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     render_mode: Literal[
-        "rgb", "depth", "normal", "alpha", "domination"
+        "rgb", "depth", "normal", "alpha", "domination", "distort"
     ] = "rgb"
     normalize_nearfar: bool = False
     inverse: bool = False
@@ -139,7 +139,7 @@ class GsplatViewer(Viewer):
 
                 render_mode_dropdown = server.gui.add_dropdown(
                     "Render Mode",
-                    ("rgb", "depth", "depth(dominating)", "normal", "alpha", "domination"),
+                    ("rgb", "depth", "depth(dominating)", "normal", "alpha", "domination", "distort"),
                     initial_value=self.render_tab_state.render_mode,
                     hint="Render mode to use.",
                 )

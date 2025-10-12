@@ -222,3 +222,25 @@ def apply_depth_colormap(
     if acc is not None:
         img = img * acc + (1.0 - acc)
     return img
+
+
+def index_map_to_pseudocolor(index_map):
+    """Convert integer index map to pseudocolor visualization.
+    
+    Args:
+        index_map: Tensor with integer indices, -1 for invalid/empty
+        
+    Returns:
+        RGB pseudocolor image tensor
+    """
+    colored_img = torch.zeros((*index_map.shape, 3), dtype=torch.float32, device=index_map.device)
+    
+    # Generate pseudocolor using prime multipliers for better color distribution
+    colored_img[..., 0] = ((index_map * 67) % 256) / 255
+    colored_img[..., 1] = ((index_map * 129) % 256) / 255
+    colored_img[..., 2] = ((index_map * 193) % 256) / 255
+    
+    # Mark invalid/empty pixels as gray
+    colored_img[index_map == -1, :] = 0.5
+
+    return colored_img

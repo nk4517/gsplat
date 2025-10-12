@@ -31,6 +31,8 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+from examples.utils import normalize_robust, index_map_to_pseudocolor
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -1081,6 +1083,12 @@ class Runner:
             alpha = render_alphas[0, ..., 0:1]
             renders = (
                 apply_float_colormap(alpha, render_tab_state.colormap).cpu().numpy()
+            )
+        elif render_tab_state.render_mode == "domination":
+            renders = (
+                index_map_to_pseudocolor(info["dominating_gauss_ids"][0, ...])
+                .cpu()
+                .numpy()
             )
         else:
             render_colors = render_colors[0, ..., 0:3].clamp(0, 1)

@@ -855,9 +855,7 @@ class Runner:
             )
 
             # write median depths
-            render_median = (render_median - render_median.min()) / (
-                render_median.max() - render_median.min()
-            )
+            render_median = normalize_robust(render_median)
             # render_median = render_median.detach().cpu().squeeze(0).unsqueeze(-1).repeat(1, 1, 3).numpy()
             render_median = (
                 apply_float_colormap(render_median).detach().cpu().squeeze(0).numpy()
@@ -892,9 +890,7 @@ class Runner:
             # write distortions
 
             render_dist = render_distort
-            dist_max = torch.max(render_dist)
-            dist_min = torch.min(render_dist)
-            render_dist = (render_dist - dist_min) / (dist_max - dist_min)
+            render_dist = normalize_robust(render_dist)
             render_dist = (
                 apply_float_colormap(render_dist).detach().cpu().squeeze(0).numpy()
             )
@@ -994,11 +990,9 @@ class Runner:
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
             depths = renders[0, ..., 3:4]  # [H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
+            depths = normalize_robust(depths)
 
-            surf_normals = (surf_normals - surf_normals.min()) / (
-                surf_normals.max() - surf_normals.min()
-            )
+            surf_normals = normalize_robust(surf_normals)
 
             # write images
             canvas = torch.cat(
@@ -1063,11 +1057,10 @@ class Runner:
             if render_tab_state.normalize_nearfar:
                 near_plane = render_tab_state.near_plane
                 far_plane = render_tab_state.far_plane
+                depth_norm = (depth - near_plane) / (far_plane - near_plane + 1e-10)
+                depth_norm = torch.clip(depth_norm, 0, 1)
             else:
-                near_plane = depth.min()
-                far_plane = depth.max()
-            depth_norm = (depth - near_plane) / (far_plane - near_plane + 1e-10)
-            depth_norm = torch.clip(depth_norm, 0, 1)
+                depth_norm = normalize_robust(depth)
             if render_tab_state.inverse:
                 depth_norm = 1 - depth_norm
             renders = (

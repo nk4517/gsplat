@@ -1,4 +1,5 @@
 import random
+from typing import Optional
 
 import numpy as np
 import torch
@@ -202,6 +203,7 @@ def apply_depth_colormap(
     acc: torch.Tensor = None,
     near_plane: float = None,
     far_plane: float = None,
+    robust: bool = True,
 ) -> torch.Tensor:
     """Converts a depth image to color for easier analysis.
 
@@ -210,18 +212,117 @@ def apply_depth_colormap(
         acc (torch.Tensor | None): (..., 1) optional accumulation mask.
         near_plane: Closest depth to consider. If None, use min image value.
         far_plane: Furthest depth to consider. If None, use max image value.
+        robust (bool): Use robust normalization with quantiles.
 
     Returns:
         (..., 3) colored depth image with colors in [0, 1].
     """
-    near_plane = near_plane or float(torch.min(depth))
-    far_plane = far_plane or float(torch.max(depth))
-    depth = (depth - near_plane) / (far_plane - near_plane + 1e-10)
-    depth = torch.clip(depth, 0.0, 1.0)
+    if robust:
+        depth_flat = depth.flatten()
+        val_min = torch.quantile(depth_flat, 0.025)
+        val_max = torch.quantile(depth_flat, 0.975)
+        depth = (depth - val_min) / (val_max - val_min + 1e-10)
+        depth = torch.clip(depth, 0, 1)
+    else:
+        near_plane = near_plane or float(torch.min(depth))
+        far_plane = far_plane or float(torch.max(depth))
+        depth = (depth - near_plane) / (far_plane - near_plane + 1e-10)
+        depth = torch.clip(depth, 0.0, 1.0)
     img = apply_float_colormap(depth, colormap="turbo")
     if acc is not None:
         img = img * acc + (1.0 - acc)
     return img
+
+
+def normalize_robust(
+    tensor: torch.Tensor,
+    quantile_min: Optional[float] = 0.025,
+    quantile_max: Optional[float] = 0.975,
+    explicit_min: Optional[float] = None,
+    explicit_max: Optional[float] = None
+) -> torch.Tensor:
+    """Normalize tensor to [0, 1] using quantiles to exclude outliers or explicit min/max.
+
+    Args:
+        tensor: Input tensor to normalize
+        quantile_min: Lower quantile for robust normalization (None for full min)
+        quantile_max: Upper quantile for robust normalization (None for full max)
+        explicit_min: Explicit minimum value (overrides quantile_min)
+        explicit_max: Explicit maximum value (overrides quantile_max)
+
+    Returns:
+        Normalized tensor in [0, 1] range
+    """
+    tensor_flat = tensor.flatten()
+
+    # Filter out NaN and Inf values for statistics computation
+    valid_mask = torch.isfinite(tensor_flat)
+    valid_values = tensor_flat[valid_mask]
+
+    # Handle case when all values are invalid
+    if valid_values.numel() == 0:
+        return torch.zeros_like(tensor)
+
+    if explicit_min is not None:
+        val_min = explicit_min
+    elif quantile_min is None:
+        val_min = valid_values.min()
+    else:
+        val_min = torch.quantile(valid_values, quantile_min)
+
+    if explicit_max is not None:
+        val_max = explicit_max
+    elif quantile_max is None:
+        val_max = valid_values.max()
+    else:
+        val_max = torch.quantile(valid_values, quantile_max)
+
+    normalized = (tensor - val_min) / (val_max - val_min + 1e-10)
+
+    # Replace NaN/Inf values with 0 after normalization
+    normalized = torch.where(torch.isfinite(normalized), normalized, torch.zeros_like(normalized))
+
+    return torch.clip(normalized, 0, 1)
+
+
+# Helper function to convert scalar values to colormap
+def scalar_to_colormap(values: torch.Tensor,
+                       colormap: str = "turbo",
+                       inverse: bool = False,
+                       quantile_min: Optional[float] = 0.025,
+                       quantile_max: Optional[float] = 0.975,
+                       explicit_min: Optional[float] = None,
+                       explicit_max: Optional[float] = None
+                       ) -> torch.Tensor:
+    """Convert scalar values to RGB colors using colormap.
+
+    Args:
+        values: Scalar tensor of shape [N] or [N, 1]
+        colormap: Name of the colormap to use
+        inverse: Whether to invert the normalized values
+        quantile_min: Lower quantile for robust normalization (None for full min)
+        quantile_max: Upper quantile for robust normalization (None for full max)
+        explicit_min: Explicit minimum value (overrides quantile_min)
+        explicit_max: Explicit maximum value (overrides quantile_max)
+
+    Returns:
+        RGB colors of shape [N, 3] for rasterization
+    """
+    if values.dim() == 1:
+        values = values.unsqueeze(-1)
+    # Normalize for visualization
+    normalized = normalize_robust(
+        values,
+        quantile_min=quantile_min,
+        quantile_max=quantile_max,
+        explicit_min=explicit_min,
+        explicit_max=explicit_max
+    )
+    if inverse:
+        normalized = 1 - normalized
+    # Apply colormap to get RGB pseudocolors
+    pseudocolors = apply_float_colormap(normalized.clip(0, 1), colormap)  # [N, 3]
+    return pseudocolors
 
 
 def index_map_to_pseudocolor(index_map):

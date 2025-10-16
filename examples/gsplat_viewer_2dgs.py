@@ -18,10 +18,12 @@ class GsplatRenderTabState(RenderTabState):
     eps2d: float = 0.3
     backgrounds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     render_mode: Literal[
-        "rgb", "depth", "normal", "alpha", "domination", "distort"
+        "rgb", "depth(expected)", "depth(dominating)", "normal", "alpha", "domination", "distort",
+        "max_sampling_rate", "accumulated_max_sampling_rate", "sigma_smooth"
     ] = "rgb"
     normalize_nearfar: bool = False
     inverse: bool = False
+    rasterize_mode: Literal["classic", "antialiased"] = "antialiased"
     colormap: Literal[
         "turbo", "viridis", "magma", "inferno", "cividis", "gray"
     ] = "turbo"
@@ -139,14 +141,15 @@ class GsplatViewer(Viewer):
 
                 render_mode_dropdown = server.gui.add_dropdown(
                     "Render Mode",
-                    ("rgb", "depth", "depth(dominating)", "normal", "alpha", "domination", "distort"),
+                    ("rgb", "depth(expected)", "depth(dominating)", "normal", "alpha", "domination", "distort",
+                     "max_sampling_rate", "accumulated_max_sampling_rate", "sigma_smooth"),
                     initial_value=self.render_tab_state.render_mode,
                     hint="Render mode to use.",
                 )
 
                 @render_mode_dropdown.on_update
                 def _(_) -> None:
-                    if render_mode_dropdown.value in ("depth", "depth(dominating)"):
+                    if render_mode_dropdown.value in ("depth(expected)", "depth(dominating)"):
                         normalize_nearfar_checkbox.disabled = False
                         inverse_checkbox.disabled = False
                     else:
@@ -193,6 +196,18 @@ class GsplatViewer(Viewer):
                     self.render_tab_state.colormap = colormap_dropdown.value
                     self.rerender(_)
 
+                rasterize_mode_dropdown = server.gui.add_dropdown(
+                    "Anti-Aliasing",
+                    ("classic", "antialiased"),
+                    initial_value=self.render_tab_state.rasterize_mode,
+                    hint="Whether to use classic or antialiased rasterization.",
+                )
+
+                @rasterize_mode_dropdown.on_update
+                def _(_) -> None:
+                    self.render_tab_state.rasterize_mode = rasterize_mode_dropdown.value
+                    self.rerender(_)
+
         self._rendering_tab_handles.update(
             {
                 "total_gs_count_number": total_gs_count_number,
@@ -205,6 +220,7 @@ class GsplatViewer(Viewer):
                 "normalize_nearfar_checkbox": normalize_nearfar_checkbox,
                 "inverse_checkbox": inverse_checkbox,
                 "colormap_dropdown": colormap_dropdown,
+                "rasterize_mode_dropdown": rasterize_mode_dropdown,
             }
         )
         super()._populate_rendering_tab()

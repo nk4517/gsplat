@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import viser
 from pathlib import Path
 from gsplat.distributed import cli
-from gsplat.rendering import rasterization_2dgs
+from gsplat import rasterization_2dgs
 
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
@@ -87,7 +87,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
         render_tab_state.total_gs_count = len(means)
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
 
-        if render_tab_state.render_mode == "depth":
+        if render_tab_state.render_mode == "depth(expected)":
             # normalize depth to [0, 1]
             depth = render_median
             if render_tab_state.normalize_nearfar:

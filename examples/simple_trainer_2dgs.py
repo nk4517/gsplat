@@ -494,6 +494,7 @@ class Runner:
         Ks: Tensor,
         width: int,
         height: int,
+        rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -506,6 +507,7 @@ class Runner:
         image_ids = kwargs.pop("image_ids", None)
         override_colors = kwargs.pop("override_colors", None)
         overmax_opacity = kwargs.pop("overmax_opacity", False)
+        f_orig = kwargs.pop("f_orig", None)
 
         if override_colors is not None:
             # Use provided override colors (e.g., for colormapped visualizations)
@@ -1143,10 +1145,52 @@ class Runner:
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
+        focal = float(K[0, 0] + K[1, 1])/2  # Use focal length from K matrix
+        K_orig = list(self.parser.Ks_dict.values())[0]
+        f_orig = float(K_orig[0, 0] + K_orig[1, 1])/2
         # Prepare override colors for colormapped visualization
         override_colors = None
         overmax_opacity = None
 
+        if render_tab_state.render_mode == "max_sampling_rate" and "max_sampling_rate_sq" in self.strategy_state:
+            max_sampling_rate_sq = self.strategy_state["max_sampling_rate_sq"]
+            # Take square root to get actual sampling rate
+            max_sampling_rate = torch.sqrt(max_sampling_rate_sq)
+            override_colors = scalar_to_colormap(
+                max_sampling_rate,
+                colormap=render_tab_state.colormap,
+                inverse=render_tab_state.inverse,
+                explicit_min=10,
+                explicit_max=1000,
+            ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+
+        elif render_tab_state.render_mode == "accumulated_max_sampling_rate":
+            # Use accumulated max sampling rate from epoch statistics if available
+            if "epoch_stats" in self.strategy_state and hasattr(self.strategy_state["epoch_stats"], "max_sampling_rate"):
+                accumulated_rate = self.strategy_state["epoch_stats"].max_sampling_rate
+                override_colors = scalar_to_colormap(
+                    accumulated_rate,
+                    colormap=render_tab_state.colormap,
+                    inverse=render_tab_state.inverse,
+                    explicit_min=10,
+                    explicit_max=1000,
+                ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+
+        elif render_tab_state.render_mode == "sigma_smooth" and "max_sampling_rate_sq" in self.strategy_state:
+            max_sampling_rate_sq = self.strategy_state["max_sampling_rate_sq"]
+            # Calculate smoothing sigma squared
+            # изменения вблизи очень слабозаметны, хотя и применяются правильно
+            sigma_smooth = torch.sqrt(calc_sigma_sq(max_sampling_rate_sq, self.cfg.aa_smoothing_reg, focal, f_orig))
+            scales = scaling_activation(self.splats["scales"])  # [N, 3]
+            min_scales = scales[:, :2].min(dim=1).values  # [N]
+            relative_change = sigma_smooth / min_scales  # [N]
+            override_colors = scalar_to_colormap(
+                relative_change,
+                colormap=render_tab_state.colormap,
+                inverse=render_tab_state.inverse,
+                # explicit_min=0.001,
+                # explicit_max=2.0
+            ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
         (
             render_colors,
             render_alphas,
@@ -1171,6 +1215,8 @@ class Runner:
             distloss=render_tab_state.render_mode == "distort",
             override_colors=override_colors,
             overmax_opacity=overmax_opacity,
+            rasterize_mode=render_tab_state.rasterize_mode,
+            f_orig=f_orig,
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(self.splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()

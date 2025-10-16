@@ -8,6 +8,7 @@ from .ops import (
     duplicate, remove, reset_opa, split, split_n,
     opacity_activation, scaling_activation
 )
+from ..antialias_2dgs import update_depth_stats, update_max_sampling_rate
 
 from .base import Strategy
 
@@ -157,6 +158,7 @@ class DefaultStrategy(Strategy):
         ), "The 2D means of the Gaussians is required but missing."
         info[self.key_for_gradient].retain_grad()
 
+    @torch.no_grad()
     def step_post_backward(
         self,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -168,13 +170,29 @@ class DefaultStrategy(Strategy):
         packed: bool = False,
     ):
         """Callback function to be executed after the `loss.backward()` call."""
-        if step >= self.refine_stop_iter:
+        # Check if refinement should be stopped based on epochs
+        if epoch_ctx.i_epoch >= self.refine_stop_epochs:
             return
 
         self._update_state(params, state, info, packed=packed)
 
         if not epoch_ctx.epoch_end:
             return
+
+
+        # нужно вызывать именно здесь. после последнего обновления статов но до opacity/refine/prune
+        # Recompute max_sampling_rate_sq for AA-2DGS at the end of epoch
+        if epoch_ctx.i_epoch > 0 and "aa_params" in info:
+            aa_params = info["aa_params"]
+            if epoch_ctx.i_epoch % aa_params["aa_compute_every"] == 0:
+                update_max_sampling_rate(
+                    params,
+                    state,
+                    aa_params["trainset"],
+                    aa_params["near_plane"],
+                    aa_params["far_plane"],
+                    aa_params["device"]
+                )
 
         # Check if we should reset opacities at this epoch
         should_reset = (self.reset_every_epochs > 0 and 
@@ -295,6 +313,35 @@ class DefaultStrategy(Strategy):
 
         if "epoch_stats" in state:
             # ========== Epoch-based statistics block ==========
+            # Update minimum depth statistics if available
+            if "camtoworlds" in info and "Ks" in info:
+                # Compute euclidean distances from camera to gaussians
+                camtoworlds = info["camtoworlds"]
+                viewmat = torch.linalg.inv(camtoworlds)  # [C, 4, 4]
+                
+                # Get gaussian means
+                means = params["means"]  # [N, 3]
+                n_gaussian = len(means)
+                
+                # Transform gaussians to camera space for all cameras at once
+                means_homo = torch.cat([means, torch.ones(n_gaussian, 1, device=means.device)], dim=1)  # [N, 4]
+                
+                # Batch matrix multiplication: [C, 4, 4] @ [4, N] -> [C, 4, N]
+                means_cam = viewmat @ means_homo.transpose(0, 1)  # [C, 4, N]
+                means_cam = means_cam[:, :3, :].transpose(1, 2)  # [C, N, 3]
+                
+                # Euclidean distance from camera to gaussian center
+                distances = torch.norm(means_cam, dim=2)  # [C, N]
+                
+                # Use imported update_depth_stats function
+                update_depth_stats(
+                    max_sampling_rate=state["epoch_stats"].max_sampling_rate,
+                    distances=distances, 
+                    radii=info["radii"], 
+                    Ks=info["Ks"], 
+                    gs_ids=gs_ids, 
+                    packed=packed
+                )
             # ========== End of epoch-based statistics block ==========
 
     @torch.no_grad()

@@ -34,6 +34,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from examples.utils import normalize_robust, index_map_to_pseudocolor
 from gsplat.strategy.ops import scaling_inverse_activation, opacity_inverse_activation, scaling_activation, opacity_activation
+from gsplat.antialias_2dgs import apply_flat_smoothing, calc_sigma_sq, update_max_sampling_rate
 
 from utils import (
     AppearanceOptModule,
@@ -199,6 +200,11 @@ class Config:
 
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
+
+    # AA-2DGS parameters
+    use_aa_smoothing: bool = True  # Enable AA-2DGS smoothing
+    aa_smoothing_reg: float = 0.1  # s_reg parameter from paper
+    aa_compute_every: int = 1  # Recompute compute_min_depth_normalized_sq every N epochs
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -455,6 +461,16 @@ class Runner:
                 ),
             ]
 
+        if cfg.use_aa_smoothing:
+            compute_max_sampling_rate_sq(
+                self.splats,
+                self.strategy_state,
+                self.trainset,
+                self.cfg.near_plane,
+                self.cfg.far_plane,
+                self.device
+            )
+
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -509,6 +525,22 @@ class Runner:
         assert self.cfg.antialiased is False, "Antialiased is not supported for 2DGS"
 
         if self.model_type == "2dgs":
+            # Apply AA-2DGS smoothing for 2DGS
+            cfg_aa = self.cfg.use_aa_smoothing
+            gui_aa = rasterize_mode == "antialiased"
+            not_gui = rasterize_mode is None
+            if (gui_aa or (not_gui and cfg_aa)) and "max_sampling_rate_sq" in self.strategy_state:
+                
+                # Get focal length from K matrix
+                focal = float((Ks[0, 0, 0] + Ks[0, 1, 1]) / 2.0)
+                if f_orig is None:
+                    f_orig = focal
+
+                # Apply AA-2DGS smoothing
+                scales, opacities = apply_flat_smoothing(
+                    scales, opacities, self.strategy_state["max_sampling_rate_sq"],
+                    s_reg=self.cfg.aa_smoothing_reg, focal=focal, f_orig=f_orig, blur_mod=blur_mod)
+
             if overmax_opacity:  # self._scale_modifier <= 0.02:
                 opacities = torch.full_like(opacities, fill_value=1e3)
 
@@ -611,6 +643,11 @@ class Runner:
 
             # Call batch start callback at the beginning of each epoch
             if epoch_ctx.epoch_start:
+                # нужно до сброса. и оно до начала тренировки высчитывается
+                # Recompute compute_min_depth_normalized_sq for AA-2DGS at the beginning of each epoch
+                if self.cfg.use_aa_smoothing and epoch_ctx.i_epoch > 0 and epoch_ctx.i_epoch % self.cfg.aa_compute_every == 0:
+                    self._compute_max_sampling_rate_sq()
+
                 self.cfg.strategy.step_epoch_start(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -663,6 +700,21 @@ class Runner:
                 distloss=self.cfg.dist_loss,
                 track_domination=True,
             )
+            
+            # Add camtoworlds to info for distance computation in strategy
+            info["camtoworlds"] = camtoworlds
+            info["Ks"] = Ks
+            
+            # Add AA-2DGS parameters if enabled
+            if cfg.use_aa_smoothing:
+                info["aa_params"] = {
+                    "trainset": self.trainset,
+                    "near_plane": cfg.near_plane,
+                    "far_plane": cfg.far_plane,
+                    "device": self.device,
+                    "aa_compute_every": cfg.aa_compute_every,
+                }
+
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:

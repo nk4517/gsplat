@@ -393,6 +393,7 @@ def rasterization_2dgs(
         "height": height,
         "tile_size": tile_size,
         "n_cameras": C,
+        "Ks": Ks,
         "render_distort": render_distort,
         "gradient_2dgs": densify,  # This holds the gradient used for densification for 2dgs
         "n_touched": domik.n_touched,

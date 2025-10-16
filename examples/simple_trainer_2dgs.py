@@ -1195,6 +1195,19 @@ class Runner:
                 # explicit_min=0.001,
                 # explicit_max=2.0
             ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+
+        elif render_tab_state.render_mode == "n_cameras_visible":
+            # Use n_cameras_visible_from from epoch statistics if available
+            if "epoch_stats" in self.strategy_state and hasattr(self.strategy_state["epoch_stats"], "n_cameras_visible_from"):
+                n_cameras = self.strategy_state["epoch_stats"].n_cameras_visible_from.clone().float()
+                n_cameras[n_cameras == 0] = -len(self.trainset) # чтобы палитра начиналась с середины, а ноль выделялся цветом
+                override_colors = scalar_to_colormap(
+                    n_cameras,
+                    colormap=render_tab_state.colormap,
+                    inverse=render_tab_state.inverse,
+                    explicit_min=-len(self.trainset),
+                    explicit_max=len(self.trainset),
+                ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
         (
             render_colors,
             render_alphas,

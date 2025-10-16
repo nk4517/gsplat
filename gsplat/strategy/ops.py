@@ -7,6 +7,7 @@ from torch import Tensor
 
 from gsplat import quat_scale_to_covar_preci
 from gsplat.relocation import compute_relocation
+from gsplat.strategy.base import StateWrapper
 from gsplat.utils import normalized_quat_to_rotmat
 
 # Activation functions
@@ -129,6 +130,7 @@ def duplicate(
         mask: A boolean mask to duplicate the Gaussians.
     """
     device = mask.device
+    assert device.type == 'cuda', f"Device must be cuda, got {device}"
     sel = torch.where(mask)[0]
 
     def param_fn(name: str, p: Tensor) -> Tensor:
@@ -140,9 +142,10 @@ def duplicate(
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     # update the extra running state
-    for k, v in state.items():
+    wrapped_state = StateWrapper(state)
+    for k, v in wrapped_state.items():
         if isinstance(v, torch.Tensor):
-            state[k] = torch.cat((v, v[sel]))
+            wrapped_state[k] = torch.cat((v, v[sel]))
 
 
 @torch.no_grad()
@@ -192,17 +195,31 @@ def split(
         return p_new
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return torch.cat([v[rest], v_split])
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    # update the extra running state
+    wrapped_state = StateWrapper(state)
+    for k, v in wrapped_state.items():
+        if isinstance(v, torch.Tensor):
+            repeats = [N] + [1] * (v.dim() - 1)
+            v_new = v[sel].repeat(repeats)
+            wrapped_state[k] = torch.cat((v[rest], v_new))
+
         v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
         return torch.cat([v[rest], v_split])
 
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     # update the extra running state
-    for k, v in state.items():
+    wrapped_state = StateWrapper(state)
+    for k, v in wrapped_state.items():
         if isinstance(v, torch.Tensor):
             repeats = [2] + [1] * (v.dim() - 1)
             v_new = v[sel].repeat(repeats)
-            state[k] = torch.cat((v[rest], v_new))
+            wrapped_state[k] = torch.cat((v[rest], v_new))
+
 
 
 @torch.no_grad()
@@ -230,9 +247,10 @@ def remove(
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     # update the extra running state
-    for k, v in state.items():
+    wrapped_state = StateWrapper(state)
+    for k, v in wrapped_state.items():
         if isinstance(v, torch.Tensor):
-            state[k] = v[sel]
+            wrapped_state[k] = v[sel]
 
 
 @torch.no_grad()
@@ -317,7 +335,8 @@ def relocate(
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     # update the extra running state
-    for k, v in state.items():
+    wrapped_state = StateWrapper(state)
+    for k, v in wrapped_state.items():
         if isinstance(v, torch.Tensor):
             v[sampled_idxs] = 0
 
@@ -359,10 +378,11 @@ def sample_add(
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     # update the extra running state
-    for k, v in state.items():
-        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+    wrapped_state = StateWrapper(state)
+    for k, v in wrapped_state.items():
         if isinstance(v, torch.Tensor):
-            state[k] = torch.cat((v, v_new))
+            v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+            wrapped_state[k] = torch.cat((v, v_new))
 
 
 @torch.no_grad()

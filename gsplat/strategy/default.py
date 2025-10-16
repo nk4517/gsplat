@@ -4,13 +4,40 @@ from typing import Any, Dict, Tuple, Union
 import torch
 from typing_extensions import Literal
 
+from .base import Strategy, EpochContext, StateWrapper
 from .ops import (
     duplicate, remove, reset_opa, split, split_n,
     opacity_activation, scaling_activation
 )
 from ..antialias_2dgs import update_depth_stats, update_max_sampling_rate
 
-from .base import Strategy
+
+def _accumulate_by_ids(
+        target_tensor: torch.Tensor,
+        gs_ids: torch.Tensor,
+        values: torch.Tensor,
+        packed: bool,
+):
+    """Generic accumulation method that handles both packed and non-packed cases.
+
+    Args:
+        target_tensor: Tensor to accumulate into
+        gs_ids: Gaussian IDs for indexing
+        values: Values to accumulate
+        packed: Whether the data is in packed format
+    """
+    if packed:
+        # Direct index_add for packed case
+        target_tensor.index_add_(0, gs_ids, values)
+    else:
+        # For non-packed case, need to handle per-camera data
+        if values.dim() == 2:  # [C, N] format
+            # Sum across cameras for each gaussian
+            values_sum = values.sum(dim=0)  # [N]
+            target_tensor += values_sum
+        else:  # [N] format
+            target_tensor += values
+
 
 
 @dataclass

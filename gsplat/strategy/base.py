@@ -6,6 +6,57 @@ import torch
 from .epoch_stats import EpochContext
 
 
+class StateWrapper:
+    """Wrapper that exposes both state dict and EpochStatistics tensors for unified updates."""
+
+    def __init__(self, state: Dict[str, any]):
+        self.state = state
+        self.epoch_stats = state.get("epoch_stats", None)
+        self._epoch_stats_tensors = {}
+
+        # Map EpochStatistics tensor attributes to prefixed keys
+        if self.epoch_stats is not None:
+            for attr_name in dir(self.epoch_stats):
+                attr = getattr(self.epoch_stats, attr_name)
+                if isinstance(attr, torch.Tensor):
+                    # Prefix with __epoch_stats__ to avoid conflicts
+                    key = f"__epoch_stats__{attr_name}"
+                    self._epoch_stats_tensors[key] = attr_name
+
+    def items(self):
+        """Iterate over both state items and EpochStatistics tensors."""
+        # First yield regular state items (except epoch_stats object itself)
+        for k, v in self.state.items():
+            if k != "epoch_stats":
+                yield k, v
+
+        # Then yield EpochStatistics tensors with special keys
+        if self.epoch_stats is not None:
+            for key, attr_name in self._epoch_stats_tensors.items():
+                yield key, getattr(self.epoch_stats, attr_name)
+
+    def __getitem__(self, key):
+        """Get item from state or EpochStatistics."""
+        if key.startswith("__epoch_stats__"):
+            attr_name = self._epoch_stats_tensors[key]
+            return getattr(self.epoch_stats, attr_name)
+        return self.state[key]
+
+    def __setitem__(self, key, value):
+        """Set item in state or EpochStatistics."""
+        if key.startswith("__epoch_stats__"):
+            attr_name = self._epoch_stats_tensors[key]
+            setattr(self.epoch_stats, attr_name, value)
+        else:
+            self.state[key] = value
+
+    def __contains__(self, key):
+        """Check if key exists in state or EpochStatistics."""
+        if key.startswith("__epoch_stats__"):
+            return key in self._epoch_stats_tensors
+        return key in self.state
+
+
 @dataclass
 class Strategy:
     """Base class for the GS densification strategy.

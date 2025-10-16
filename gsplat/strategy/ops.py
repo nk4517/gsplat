@@ -262,6 +262,7 @@ def reset_opa(
     optimizers: Dict[str, torch.optim.Optimizer],
     state: Dict[str, Tensor],
     value: float,
+    mask: Optional[Tensor] = None,
 ):
     """Inplace reset the opacities to the given post-sigmoid value.
 
@@ -269,17 +270,34 @@ def reset_opa(
         params: A dictionary of parameters.
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
         value: The value to reset the opacities
+        mask: Optional boolean mask to selectively reset opacities. If None, reset all.
     """
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "opacities":
-            opacities = torch.clamp(p, max=opacity_inverse_activation(torch.tensor(value)).item())
-            return torch.nn.Parameter(opacities, requires_grad=p.requires_grad)
+            if mask is not None:
+                # Only reset opacities where mask is True
+                opacities = p.clone()
+                opacities[mask] = torch.clamp(
+                    p[mask], 
+                    max=opacity_inverse_activation(torch.tensor(value)).item()
+                )
+                return torch.nn.Parameter(opacities, requires_grad=p.requires_grad)
+            else:
+                # Reset all opacities
+                opacities = torch.clamp(p, max=opacity_inverse_activation(torch.tensor(value)).item())
+                return torch.nn.Parameter(opacities, requires_grad=p.requires_grad)
         else:
             raise ValueError(f"Unexpected parameter name: {name}")
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        return torch.zeros_like(v)
+        if mask is not None:
+            # Only reset optimizer state where mask is True
+            v_new = v.clone()
+            v_new[mask] = 0
+            return v_new
+        else:
+            return torch.zeros_like(v)
 
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(

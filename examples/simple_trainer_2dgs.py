@@ -508,6 +508,7 @@ class Runner:
         override_colors = kwargs.pop("override_colors", None)
         overmax_opacity = kwargs.pop("overmax_opacity", False)
         f_orig = kwargs.pop("f_orig", None)
+        blur_mod = kwargs.pop("blur_mod", None)
 
         if override_colors is not None:
             # Use provided override colors (e.g., for colormapped visualizations)
@@ -1148,6 +1149,9 @@ class Runner:
         focal = float(K[0, 0] + K[1, 1])/2  # Use focal length from K matrix
         K_orig = list(self.parser.Ks_dict.values())[0]
         f_orig = float(K_orig[0, 0] + K_orig[1, 1])/2
+
+        blur_mod = render_tab_state.blur_mod
+
         # Prepare override colors for colormapped visualization
         override_colors = None
         overmax_opacity = None
@@ -1217,6 +1221,7 @@ class Runner:
             overmax_opacity=overmax_opacity,
             rasterize_mode=render_tab_state.rasterize_mode,
             f_orig=f_orig,
+            blur_mod=blur_mod,
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(self.splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()

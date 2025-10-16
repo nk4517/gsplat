@@ -16,6 +16,7 @@ class GsplatRenderTabState(RenderTabState):
     far_plane: float = 1e2
     radius_clip: float = 0.0
     eps2d: float = 0.3
+    blur_mod: float = 1.0
     backgrounds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     render_mode: Literal[
         "rgb", "depth(expected)", "depth(dominating)", "normal", "alpha", "domination", "distort",
@@ -128,6 +129,20 @@ class GsplatViewer(Viewer):
                     self.render_tab_state.eps2d = eps2d_slider.value
                     self.rerender(_)
 
+                blur_mod_slider = server.gui.add_slider(
+                    "Blur Modulation",
+                    initial_value=self.render_tab_state.blur_mod,
+                    min=0.1,
+                    max=2.0,
+                    step=0.01,
+                    hint="Blur modulation factor for AA-2DGS smoothing.",
+                )
+
+                @blur_mod_slider.on_update
+                def _(_) -> None:
+                    self.render_tab_state.blur_mod = blur_mod_slider.value
+                    self.rerender(_)
+
                 backgrounds_slider = server.gui.add_rgb(
                     "Background",
                     initial_value=self.render_tab_state.backgrounds,
@@ -215,6 +230,7 @@ class GsplatViewer(Viewer):
                 "near_far_plane_vec2": near_far_plane_vec2,
                 "radius_clip_slider": radius_clip_slider,
                 "eps2d_slider": eps2d_slider,
+                "blur_mod_slider": blur_mod_slider,
                 "backgrounds_slider": backgrounds_slider,
                 "render_mode_dropdown": render_mode_dropdown,
                 "normalize_nearfar_checkbox": normalize_nearfar_checkbox,

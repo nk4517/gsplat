@@ -839,6 +839,14 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
+            # Prepare extra features for rendering (e.g., skyness)
+            extra_features = None
+            sky_mask_rendered = None
+            if cfg.skysphere_enabled:
+                # Add skyness as extra feature to be rendered alongside colors
+                skyness_values = torch.sigmoid(self.splats["skyness"]).unsqueeze(-1)  # [N, 1]
+                extra_features = skyness_values
+
             # forward
             (
                 renders,
@@ -860,7 +868,16 @@ class Runner:
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
                 distloss=self.cfg.dist_loss,
                 track_domination=True,
+                extra_features=extra_features,  # Pass extra features to render
             )
+            
+            # Extract rendered skyness mask if available
+            if cfg.skysphere_enabled and "rendered_extras" in info:
+                sky_mask_rendered = info["rendered_extras"][0, :, :, 0]  # [H, W] - skyness probability
+                # Create world mask (inverse of sky mask) for regularizations
+                world_mask = 1.0 - sky_mask_rendered  # Higher values for world objects
+            else:
+                world_mask = torch.ones((height, width), device=device)
             
             # Add camtoworlds to info for distance computation in strategy
             info["camtoworlds"] = camtoworlds
@@ -938,10 +955,22 @@ class Runner:
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, M, 1]
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                
+                # Sample world mask at the same points if skysphere is enabled
+                if cfg.skysphere_enabled and "rendered_extras" in info:
+                    world_mask_sampled = F.grid_sample(
+                        world_mask.unsqueeze(0).unsqueeze(0), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    world_mask_sampled = world_mask_sampled.squeeze(3).squeeze(1)  # [1, M]
+                else:
+                    world_mask_sampled = torch.ones_like(depths)  # No masking if skysphere disabled
+                
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                # Apply world mask to depth loss - only compute loss for world objects
+                depthloss = (torch.abs(disp - disp_gt) * world_mask_sampled).sum() / (world_mask_sampled.sum() + 1e-6)
+                depthloss = depthloss * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
 
             if cfg.normal_loss:
@@ -956,7 +985,9 @@ class Runner:
                     normals_from_depth = normals_from_depth.squeeze(0)
                 normals_from_depth = normals_from_depth.permute((2, 0, 1))
                 normal_error = (1 - (normals * normals_from_depth).sum(dim=0))[None]
-                normalloss = curr_normal_lambda * normal_error.mean()
+                # Apply world mask to normal loss - only compute loss for world objects
+                normal_error_masked = normal_error * world_mask.unsqueeze(0)
+                normalloss = curr_normal_lambda * normal_error_masked.sum() / (world_mask.sum() + 1e-6)
                 loss += normalloss
 
             if cfg.dist_loss:
@@ -964,7 +995,9 @@ class Runner:
                     curr_dist_lambda = cfg.dist_lambda
                 else:
                     curr_dist_lambda = 0.0
-                distloss = render_distort.mean()
+                # Apply world mask to distortion loss - only compute loss for world objects
+                render_distort_masked = render_distort * world_mask.unsqueeze(0).unsqueeze(-1)
+                distloss = render_distort_masked.sum() / (world_mask.sum() + 1e-6)
                 loss += distloss * curr_dist_lambda
 
             if cfg.skysphere_enabled and cfg.skyness_reg > 0:

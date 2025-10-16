@@ -210,7 +210,7 @@ __global__ void intersect_tile_kernel(
     int32_t tile_count = 0;
     
     // 2DGS ray transforms
-    const bool use_2dgs = ray_transforms_2dgs != nullptr;
+    const bool use_2dgs = false; //ray_transforms_2dgs != nullptr;
     vec3 u_M, v_M, w_M;
 
     if (use_2dgs) {

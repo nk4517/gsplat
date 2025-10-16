@@ -1,10 +1,12 @@
 import math
 import struct
 import warnings
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from nerfview import apply_float_colormap
 from torch import Tensor
 
 

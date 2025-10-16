@@ -3,7 +3,8 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+from typing_extensions import Literal, assert_never
 from pathlib import Path
 
 from examples.vs_env import set_vc_envs; set_vc_envs()
@@ -19,7 +20,6 @@ from examples.lib_compose import CompositingOrder, compose_renders
 from examples.lib_skysphere import reproject_skysphere
 
 import imageio
-import nerfview
 import numpy as np
 import torch
 
@@ -30,6 +30,7 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
+# from tiny_renderer.minigui import CUDARenderer
 from datasets.colmap import Dataset, Parser
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
@@ -37,7 +38,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from examples.utils import normalize_robust, index_map_to_pseudocolor
+from utils import normalize_robust, index_map_to_pseudocolor
+from gsplat import MCMCStrategy
 from gsplat.strategy.ops import scaling_inverse_activation, opacity_inverse_activation, scaling_activation, opacity_activation
 from gsplat.antialias_2dgs import apply_flat_smoothing, calc_sigma_sq, update_max_sampling_rate
 
@@ -51,25 +53,38 @@ from utils import (
     skyness_to_colormap,
 )
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
-from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
+from gsplat import rasterization_2dgs
 from gsplat.strategy import DefaultStrategy
 from gsplat.strategy.epoch_stats import training_data_generator
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+@torch.jit.script
+def binary_cross_entropy_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return -(target * torch.log(input) + (1 - target) * torch.log(1 - input)).mean()
 
 @dataclass
 class Config:
     # Disable viewer
     disable_viewer: bool = False
+    use_viser: bool = True
     # Path to the .pt file. If provide, it will skip training and render a video
     ckpt: Optional[str] = None
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube05\towel"
+    # data_dir: str = r"X:\_ai\_gsplat\datasets\garden"
+    # data_dir: str = r"x:\_ai\_gsplat\datasets\bicycle"
+    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\mip360\kitchen"
+    # data_dir: str = r"x:\_ai\_gsplat\datasets\fb_colmap_res"
+    # data_dir: str = r"y:\_gopro_kv92\extracted_keyframes\GOPR6996_colmap"
+    data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
+    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
+    # data_dir: str = r"x:\_ai\_glomap\data\south-building"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/garden"
+    # result_dir: str = r"x:\_ai\_my_nerfstudio_results\koneva1"
+    result_dir: str = r"x:\_ai\_my_nerfstudio_results\bicycle"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -78,6 +93,8 @@ class Config:
     global_scale: float = 1.0
     # Normalize the world space
     normalize_world_space: bool = True
+    # Preload all images into memory for faster training
+    preload_images: bool = False
 
     # Port for the viewer server
     port: int = 8080
@@ -101,7 +118,7 @@ class Config:
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
-    sh_degree: int = 3
+    sh_degree: int = 0
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -114,29 +131,37 @@ class Config:
     # Near plane clipping distance
     near_plane: float = 0.2
     # Far plane clipping distance
-    far_plane: float = 200
+    far_plane: float = 20000000
 
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.05
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float = 0.0002
+    grow_grad2d: float = 0.0008
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
     prune_scale3d: float = 0.1
 
     # Start refining GSs after this epoch
-    refine_start_epochs: int = 15
+    refine_start_epochs: int = 3
     # Stop refining GSs after this epoch
     refine_stop_epochs: int = 500
     # Refine GSs every this many epochs
-    refine_every_epochs: int = 5
+    refine_every_epochs: int = 1
+    # Start resetting opacities after this epoch
+    reset_start_epochs: int = 100
+    # Stop resetting opacities after this epoch
+    reset_end_epochs: int = 10000
+    # Reset opacities every this many epochs
+    reset_every_epochs: int = 20
+    # Pause refining for this many epochs after reset
+    pause_refine_after_reset_epochs: int = 1
 
     # Auto-calculate epoch parameters from legacy step-based values
-    auto_epoch_params: bool = False
+    auto_epoch_params: bool = True
     # Legacy step-based values for auto-calculation
-    legacy_refine_start_iter: int = 500
-    legacy_refine_stop_iter: int = 15_000
+    legacy_refine_start_iter: int = 1
+    legacy_refine_stop_iter: int = 25_000
     legacy_reset_every_iter: int = 3000
     legacy_refine_every_iter: int = 100
 
@@ -152,10 +177,10 @@ class Config:
     revised_opacity: bool = False
 
     # Use random background for training to discourage transparency
-    random_bkgd: bool = False
+    random_bkgd: bool = True
 
     # Enable camera optimization.
-    pose_opt: bool = False
+    pose_opt: bool = True
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -173,14 +198,14 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Skysphere parameters
     skysphere_enabled: bool = True
     # Radius of skysphere as multiple of scene extent
-    skysphere_radius_multiplier: float = 50.0
+    skysphere_radius_multiplier: float = 20.0
     # Number of points to sample on skysphere
     skysphere_points: int = 50_000
     # Learning rate for skyness attribute
@@ -188,30 +213,37 @@ class Config:
     # Regularization weight for skyness
     skyness_reg: float = 0.01
     # Enable skyness supervision from sky masks
-    skyness_supervision: bool = False
+    skyness_supervision: bool = True
     # Weight for skyness supervision loss
     skyness_supervision_lambda: float = 0.1
     # Weight for skysphere deviation loss
     skysphere_radius_reg: float = 0.01
 
     # Enable depth loss. (experimental)
-    depth_loss: bool = False
+    depth_loss: bool = True
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
     # Enable normal consistency loss. (Currently for 2DGS only)
-    normal_loss: bool = False
+    normal_loss: bool = True
     # Weight for normal loss
     normal_lambda: float = 5e-2
     # Iteration to start normal consistency regulerization
     normal_start_iter: int = 7_000
 
     # Distortion loss. (experimental)
-    dist_loss: bool = False
+    dist_loss: bool = True
     # Weight for distortion loss
     dist_lambda: float = 1e-2
     # Iteration to start distortion loss regulerization
     dist_start_iter: int = 3_000
+
+    # Opacity entropy regularization (penalizes partial transparency)
+    opacity_entropy_loss: bool = False
+    # Weight for opacity entropy loss
+    opacity_entropy_lambda: float = 1e-3
+    # Iteration to start opacity entropy regularization
+    opacity_entropy_start_iter: int = 1_000
 
     # Model for splatting.
     model_type: Literal["2dgs", "2dgs-inria"] = "2dgs"
@@ -222,16 +254,26 @@ class Config:
     tb_save_image: bool = False
 
     # Whether use fused-bilateral grid
-    use_fused_bilagrid: bool = False
+    use_fused_bilagrid: bool = True
+
+    # Strategy for GS densification
+    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+        default_factory=lambda: DefaultStrategy()
+    )
 
     # AA-2DGS parameters
     use_aa_smoothing: bool = True  # Enable AA-2DGS smoothing
     aa_smoothing_reg: float = 0.1  # s_reg parameter from paper
     aa_compute_every: int = 1  # Recompute compute_min_depth_normalized_sq every N epochs
 
+    # Split parameters for gaussians that dominate or touch too many pixels
+    split_big_dominated_pct: float = 0.0005  # Split gaussians dominating more than this percentage of pixels
+    split_big_touched_pct: float = 0.001  # Split gaussians touching more than this percentage of pixels
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
+        # self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
     
@@ -244,11 +286,8 @@ class Config:
         
         self.eval_steps = [align_to_epoch_end(step) for step in self.eval_steps]
         self.save_steps = [align_to_epoch_end(step) for step in self.save_steps]
-        
-        # Ensure max_steps is also aligned
-        max_epochs = math.ceil(self.max_steps / n_cameras_per_epoch)
-        self.max_steps = max_epochs * n_cameras_per_epoch
-        self.reset_every = int(self.reset_every * factor)
+        # self.ply_steps = [align_to_epoch_end(step) for step in self.ply_steps]
+        self.max_steps = align_to_epoch_end(self.max_steps)
 
 
 def create_splats_with_optimizers(
@@ -420,7 +459,11 @@ class Runner:
             # Auto-calculate epoch parameters
             cfg.refine_start_epochs = max(1, math.ceil(legacy_refine_start_iter / n_cameras_per_epoch))
             cfg.refine_stop_epochs = max(1, math.ceil(legacy_refine_stop_iter / n_cameras_per_epoch))
+            cfg.reset_every_epochs = max(1, math.ceil(legacy_reset_every_iter / n_cameras_per_epoch))
             cfg.refine_every_epochs = max(1, math.ceil(legacy_refine_every_iter / n_cameras_per_epoch))
+            
+            # Adjust reset_start_epochs to be after some refinement cycles
+            cfg.reset_start_epochs = cfg.refine_start_epochs + cfg.refine_every_epochs * 2
             
             print(f"Auto-calculated epoch parameters from legacy step-based values:")
         else:
@@ -430,6 +473,9 @@ class Runner:
               f"refine_stop={cfg.refine_stop_epochs} epochs")
         print(f"  reset_every={cfg.reset_every_epochs} epochs, "
               f"refine_every={cfg.refine_every_epochs} epochs")
+        print(f"  reset_start={cfg.reset_start_epochs} epochs, "
+              f"reset_end={cfg.reset_end_epochs} epochs")
+
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
@@ -460,27 +506,81 @@ class Runner:
             key_for_gradient = "means2d"
 
         # Densification Strategy
-        self.strategy = DefaultStrategy(
-            verbose=True,
-            prune_opa=cfg.prune_opa,
-            grow_grad2d=cfg.grow_grad2d,
-            grow_scale3d=cfg.grow_scale3d,
-            prune_scale3d=cfg.prune_scale3d,
-            # refine_scale2d_stop_iter=4000, # splatfacto behavior
-            refine_start_iter=cfg.refine_start_iter,
-            refine_stop_iter=cfg.refine_stop_iter,
-            reset_every=cfg.reset_every,
-            refine_every=cfg.refine_every,
-            absgrad=cfg.absgrad,
-            revised_opacity=cfg.revised_opacity,
-            key_for_gradient=key_for_gradient,
-        )
-        self.strategy.check_sanity(self.splats, self.optimizers)
-        self.strategy_state = self.strategy.initialize_state()
+        # self.strategy = DefaultStrategy(
+        #     verbose=True,
+        #     prune_opa=cfg.prune_opa,
+        #     grow_grad2d=cfg.grow_grad2d,
+        #     grow_scale3d=cfg.grow_scale3d,
+        #     prune_scale3d=cfg.prune_scale3d,
+        #     # refine_scale2d_stop_iter=4000, # splatfacto behavior
+        #     refine_start_iter=cfg.refine_start_iter,
+        #     refine_stop_iter=cfg.refine_stop_iter,
+        #     reset_every=cfg.reset_every,
+        #     refine_every=max(cfg.refine_every, len(self.parser.train_cameras)),
+        #     absgrad=cfg.absgrad,
+        #     revised_opacity=cfg.revised_opacity,
+        #     key_for_gradient=key_for_gradient,
+        # )
+
+        self.cfg.strategy.verbose = True
+        
+        # Update strategy with epoch parameters from config
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            self.cfg.strategy.refine_start_epochs = cfg.refine_start_epochs
+            self.cfg.strategy.refine_stop_epochs = cfg.refine_stop_epochs
+            self.cfg.strategy.reset_start_epochs = cfg.reset_start_epochs
+            self.cfg.strategy.reset_end_epochs = cfg.reset_end_epochs
+            self.cfg.strategy.reset_every_epochs = cfg.reset_every_epochs
+            self.cfg.strategy.refine_every_epochs = cfg.refine_every_epochs
+            self.cfg.strategy.pause_refine_after_reset_epochs = cfg.pause_refine_after_reset_epochs
+            self.cfg.strategy.prune_opa = cfg.prune_opa
+            self.cfg.strategy.grow_grad2d = cfg.grow_grad2d
+            self.cfg.strategy.grow_scale3d = cfg.grow_scale3d
+            self.cfg.strategy.prune_scale3d = cfg.prune_scale3d
+            self.cfg.strategy.absgrad = cfg.absgrad
+            self.cfg.strategy.revised_opacity = cfg.revised_opacity
+            self.cfg.strategy.key_for_gradient = key_for_gradient
+            # Importance-based pruning parameters
+            self.cfg.strategy.importance_prune_enabled = cfg.importance_prune_enabled
+            self.cfg.strategy.importance_prune_start_epoch = cfg.importance_prune_start_epoch
+            self.cfg.strategy.importance_prune_end_epoch = cfg.importance_prune_end_epoch
+            self.cfg.strategy.importance_prune_every_epochs = cfg.importance_prune_every_epochs
+            self.cfg.strategy.importance_prune_ratio = cfg.importance_prune_ratio
+            # Split parameters for gaussians that dominate or touch too many pixels
+            self.cfg.strategy.split_big_dominated_pct = cfg.split_big_dominated_pct
+            self.cfg.strategy.split_big_touched_pct = cfg.split_big_touched_pct
+        elif isinstance(self.cfg.strategy, MCMCStrategy):
+            # Update MCMCStrategy with epoch parameters
+            self.cfg.strategy.refine_start_epochs = cfg.refine_start_epochs
+            self.cfg.strategy.refine_stop_epochs = cfg.refine_stop_epochs
+            self.cfg.strategy.refine_every_epochs = cfg.refine_every_epochs
+            self.cfg.strategy.growth_factor = 1.15
+            self.cfg.strategy.verbose = True
+
+        # Densification Strategy
+        self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state(
+                scene_scale=self.scene_scale
+            )
+        elif isinstance(self.cfg.strategy, MCMCStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state()
+        else:
+            assert_never(self.cfg.strategy)
 
         self.pose_optimizers = []
         if cfg.pose_opt:
             self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
+
+            # def gradient_hook(grad):
+            #     grad_norm = grad.norm()
+            #     if grad_norm > 3000:
+            #         print(f"WARNING: Large gradient norm {grad_norm:.2f}")
+            #     return grad
+            #
+            # self.pose_adjust.embeds.weight.register_hook(gradient_hook)
+
             self.pose_adjust.zero_init()
             self.pose_optimizers = [
                 torch.optim.Adam(
@@ -531,7 +631,7 @@ class Runner:
             ]
 
         if cfg.use_aa_smoothing:
-            compute_max_sampling_rate_sq(
+            update_max_sampling_rate(
                 self.splats,
                 self.strategy_state,
                 self.trainset,
@@ -548,7 +648,7 @@ class Runner:
         )
 
         # Viewer
-        if not self.cfg.disable_viewer:
+        if not self.cfg.disable_viewer and self.cfg.use_viser:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
             self.viewer = GsplatViewer(
                 server=self.server,
@@ -557,6 +657,8 @@ class Runner:
                 mode="training",
             )
 
+        elif not self.cfg.disable_viewer and not self.cfg.use_viser:
+            self.tinyrenderr = CUDARenderer()
 
     def _initialize_skysphere(self):
         """Initialize skysphere points from camera views.
@@ -771,8 +873,8 @@ class Runner:
         device = self.device
 
         # Dump cfg.
-        with open(f"{cfg.result_dir}/cfg.json", "w") as f:
-            json.dump(vars(cfg), f)
+        # with open(f"{cfg.result_dir}/cfg.json", "w") as f:
+        #     json.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
         init_step = 0
@@ -831,7 +933,7 @@ class Runner:
         pbar = tqdm.tqdm(range(init_step, max_steps))
         
         for step, data, epoch_ctx in training_data_generator(trainloader, pbar):
-            if not cfg.disable_viewer:
+            if not cfg.disable_viewer and cfg.use_viser:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
@@ -839,10 +941,10 @@ class Runner:
 
             # Call batch start callback at the beginning of each epoch
             if epoch_ctx.epoch_start:
-                # нужно до сброса. и оно до начала тренировки высчитывается
-                # Recompute compute_min_depth_normalized_sq for AA-2DGS at the beginning of each epoch
-                if self.cfg.use_aa_smoothing and epoch_ctx.i_epoch > 0 and epoch_ctx.i_epoch % self.cfg.aa_compute_every == 0:
-                    self._compute_max_sampling_rate_sq()
+                # # нужно до сброса. и оно до начала тренировки высчитывается
+                # # Recompute compute_min_depth_normalized_sq for AA-2DGS at the beginning of each epoch
+                # if self.cfg.use_aa_smoothing and epoch_ctx.i_epoch > 0 and epoch_ctx.i_epoch % self.cfg.aa_compute_every == 0:
+                #     self._compute_max_sampling_rate_sq()
 
                 self.cfg.strategy.step_epoch_start(
                     params=self.splats,
@@ -859,7 +961,10 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            if cfg.depth_loss:
+
+            this_pass_depth_loss = cfg.depth_loss and "points" in data and "depths" in data
+
+            if this_pass_depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
@@ -900,7 +1005,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
+                render_mode="RGB+ED" if this_pass_depth_loss else "RGB+D",
                 distloss=self.cfg.dist_loss,
                 track_domination=True,
                 extra_features=extra_features,  # Pass extra features to render
@@ -957,7 +1062,7 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
-            self.strategy.step_pre_backward(
+            self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
                 state=self.strategy_state,
@@ -976,7 +1081,7 @@ class Runner:
                 pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            if cfg.depth_loss:
+            if this_pass_depth_loss:
                 # query depths from depth map
                 points = torch.stack(
                     [
@@ -1034,6 +1139,20 @@ class Runner:
                 render_distort_masked = render_distort * world_mask.unsqueeze(0).unsqueeze(-1)
                 distloss = render_distort_masked.sum() / (world_mask.sum() + 1e-6)
                 loss += distloss * curr_dist_lambda
+            
+            if cfg.opacity_entropy_loss:
+                if step > cfg.opacity_entropy_start_iter:
+                    curr_opacity_entropy_lambda = cfg.opacity_entropy_lambda
+                else:
+                    curr_opacity_entropy_lambda = 0.0
+                # Binary cross-entropy of opacities with themselves (entropy regularization)
+                # This penalizes partial transparency (values near 0.5)
+                activated_opacities = opacity_activation(self.splats["opacities"])
+                # Clamp to avoid log(0)
+                activated_opacities_clamped = torch.clamp(activated_opacities, 1e-7, 1 - 1e-7)
+                opacity_entropy = -(activated_opacities_clamped * torch.log(activated_opacities_clamped) + 
+                                   (1 - activated_opacities_clamped) * torch.log(1 - activated_opacities_clamped)).mean()
+                loss += opacity_entropy * curr_opacity_entropy_lambda
 
             if cfg.skysphere_enabled and cfg.skyness_reg > 0:
                 # SKYNESS REGULARIZATION:
@@ -1094,10 +1213,12 @@ class Runner:
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             desc += f"epoch={epoch_ctx.i_epoch} ({100.0 * (epoch_ctx.i + 1) / epoch_ctx.epoch_len:.1f}%)| "
-            if cfg.depth_loss:
+            if this_pass_depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.dist_loss:
                 desc += f"dist loss={distloss.item():.6f}"
+            if cfg.opacity_entropy_loss and step > cfg.opacity_entropy_start_iter:
+                desc += f" ent={opacity_entropy.item():.4f}"
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -1111,12 +1232,14 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
-                if cfg.depth_loss:
+                if this_pass_depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.normal_loss:
                     self.writer.add_scalar("train/normalloss", normalloss.item(), step)
                 if cfg.dist_loss:
                     self.writer.add_scalar("train/distloss", distloss.item(), step)
+                if cfg.opacity_entropy_loss:
+                    self.writer.add_scalar("train/opacity_entropy_loss", opacity_entropy.item(), step)
                 if cfg.skysphere_enabled and cfg.skyness_reg > 0:
                     skyness_probs = torch.sigmoid(self.splats["skyness"])
                     self.writer.add_scalar("train/skyness_entropy", skyness_entropy.item(), step)
@@ -1135,14 +1258,6 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
-            self.strategy.step_post_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-                packed=cfg.packed,
-            )
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1160,7 +1275,8 @@ class Runner:
                     )
 
             # optimize
-            for optimizer in self.optimizers.values():
+            for k, optimizer in self.optimizers.items():
+                # print(k)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
@@ -1174,6 +1290,40 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
+
+
+            # Run post-backward steps after backward and optimizer
+            if isinstance(self.cfg.strategy, DefaultStrategy):
+                # Add skyness-aware densification parameters
+                if cfg.skysphere_enabled and "skyness" in info:
+                    # Sky points (skyness > 0.75) should have different densification behavior
+                    skyness_probs = info["skyness"]
+                    info["is_sky"] = skyness_probs > 0.75
+                    info["is_world"] = skyness_probs < 0.25
+                    # Sky points should be pruned more aggressively if they're too close
+                    info["skysphere_radius"] = self.scene_scale * cfg.skysphere_radius_multiplier
+                
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    epoch_ctx=epoch_ctx,
+                    packed=cfg.packed,
+                )
+            elif isinstance(self.cfg.strategy, MCMCStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    lr=schedulers[0].get_last_lr()[0],
+                    epoch_ctx=epoch_ctx,
+                )
+            else:
+                assert_never(self.cfg.strategy)
 
             # save checkpoint
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
@@ -1199,7 +1349,7 @@ class Runner:
                 self.eval(step)
                 self.render_traj(step)
 
-            if not cfg.disable_viewer:
+            if not cfg.disable_viewer and cfg.use_viser:
                 self.viewer.lock.release()
                 num_train_steps_per_sec = 1.0 / (max(time.time() - tic, 1e-10))
                 num_train_rays_per_sec = (
@@ -1651,3 +1801,4 @@ if __name__ == "__main__":
             )
     
     main(cfg)
+

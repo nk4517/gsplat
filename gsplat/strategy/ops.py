@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Callable, Dict, List, Union
+from typing import Callable, Dict, List, Union, Optional
 
 import torch
 import torch.nn.functional as F
@@ -155,6 +155,7 @@ def split(
     state: Dict[str, Tensor],
     mask: Tensor,
     revised_opacity: bool = False,
+    N: int=2,
 ):
     """Inplace split the Gaussian with the given mask.
 
@@ -176,11 +177,11 @@ def split(
         "nij,nj,bnj->bni",
         rotmats,
         scales,
-        torch.randn(2, len(scales), 3, device=device),
+        torch.randn(N, len(scales), 3, device=device),
     )  # [2, N, 3]
 
     def param_fn(name: str, p: Tensor) -> Tensor:
-        repeats = [2] + [1] * (p.dim() - 1)
+        repeats = [N] + [1] * (p.dim() - 1)
         if name == "means":
             p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
         elif name == "scales":
@@ -195,6 +196,7 @@ def split(
         return p_new
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_split = torch.zeros((N * len(sel), *v.shape[1:]), device=device)
         return torch.cat([v[rest], v_split])
 
     # update the parameters and the state in the optimizers
@@ -207,7 +209,8 @@ def split(
             v_new = v[sel].repeat(repeats)
             wrapped_state[k] = torch.cat((v[rest], v_new))
 
-        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_split = torch.zeros((n_splits * n_selected, *v.shape[1:]), device=device)
         return torch.cat([v[rest], v_split])
 
     # update the parameters and the state in the optimizers
@@ -216,7 +219,7 @@ def split(
     wrapped_state = StateWrapper(state)
     for k, v in wrapped_state.items():
         if isinstance(v, torch.Tensor):
-            repeats = [2] + [1] * (v.dim() - 1)
+            repeats = [n_splits] + [1] * (v.dim() - 1)
             v_new = v[sel].repeat(repeats)
             wrapped_state[k] = torch.cat((v[rest], v_new))
 

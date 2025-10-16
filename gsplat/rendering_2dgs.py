@@ -41,6 +41,7 @@ def rasterization_2dgs(
     distloss: bool = False,
     depth_mode: Literal["expected", "median"] = "expected",
     track_domination: bool = False,
+    extra_features: Optional[Tensor] = None,  # [..., N, F] additional features to render
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
     """Rasterize a set of 2D Gaussians (N) to a batch of image planes (C).
 
@@ -89,6 +90,8 @@ def rasterization_2dgs(
         distloss: If true, use distortion regularization to get better geometry detail.
         depth_mode: render depth mode. Choose from expected depth and median depth.
         track_domination: If true, track the number of touched and dominated Gaussians. arXiv:2403.14166
+        extra_features: Optional extra features to render alongside colors. [..., N, F] where F is the
+            number of extra feature channels. These will be rendered and returned in meta["rendered_extras"].
     Returns:
         A tuple:
 
@@ -151,6 +154,11 @@ def rasterization_2dgs(
     I = B * C
     device = means.device
     channels = colors.shape[-1]
+    
+    # Account for extra features in total channel count
+    extra_channels = 0
+    if extra_features is not None:
+        extra_channels = extra_features.shape[-1]
 
     assert means.shape == batch_dims + (N, 3), means.shape
     assert quats.shape == batch_dims + (N, 4), quats.shape
@@ -283,6 +291,20 @@ def rasterization_2dgs(
         # make it apple-to-apple with Inria's CUDA Backend.
         colors = torch.clamp_min(colors + 0.5, 0.0)
 
+    # Handle extra features if provided
+    if extra_features is not None:
+        if packed:
+            # For packed mode, select the features for visible gaussians
+            extra_features = extra_features.view(B, N, -1)[batch_ids, gaussian_ids]
+        else:
+            # Broadcast extra features to all cameras if needed
+            if extra_features.dim() == num_batch_dims + 2:  # [..., N, F]
+                extra_features = torch.broadcast_to(
+                    extra_features[..., None, :, :], batch_dims + (C, N, extra_channels)
+                )  # [..., C, N, F]
+        # Concatenate extra features with colors (extra features first)
+        colors = torch.cat([extra_features, colors], dim=-1)
+
     # Rasterize to pixels
     if render_mode in ["RGB+D", "RGB+ED"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
@@ -321,6 +343,15 @@ def rasterization_2dgs(
         distloss=distloss,
         track_domination=track_domination,
     )
+    
+    # Extract extra features from rendered colors if they were provided
+    rendered_extras = None
+    if extra_features is not None:
+        # Extra features are always at the beginning
+        rendered_extras = render_colors[..., :extra_channels]
+        # Remove extra features from render_colors
+        render_colors = render_colors[..., extra_channels:]
+    
     render_normals_from_depth = None
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
@@ -369,6 +400,9 @@ def rasterization_2dgs(
         "dominating_weights": domik.dominating_weights,
         "dominating_depths": domik.dominating_depthmap,
     }
+    
+    if rendered_extras is not None:
+        meta["rendered_extras"] = rendered_extras
 
     render_normals = torch.einsum(
         "...ij,...hwj->...hwi", torch.linalg.inv(viewmats)[..., :3, :3], render_normals

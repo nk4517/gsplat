@@ -438,7 +438,13 @@ class Runner:
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
-        if self.cfg.app_opt:
+        override_colors = kwargs.pop("override_colors", None)
+        overmax_opacity = kwargs.pop("overmax_opacity", False)
+
+        if override_colors is not None:
+            # Use provided override colors (e.g., for colormapped visualizations)
+            colors = override_colors
+        elif self.cfg.app_opt:
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
@@ -453,6 +459,9 @@ class Runner:
         assert self.cfg.antialiased is False, "Antialiased is not supported for 2DGS"
 
         if self.model_type == "2dgs":
+            if overmax_opacity:  # self._scale_modifier <= 0.02:
+                opacities = torch.full_like(opacities, fill_value=1e3)
+
             (
                 render_colors,
                 render_alphas,
@@ -1026,6 +1035,10 @@ class Runner:
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
+        # Prepare override colors for colormapped visualization
+        override_colors = None
+        overmax_opacity = None
+
         (
             render_colors,
             render_alphas,
@@ -1047,6 +1060,8 @@ class Runner:
             render_mode="RGB+ED",
             backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device) / 255.0,
             track_domination=True,
+            override_colors=override_colors,
+            overmax_opacity=overmax_opacity,
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(self.splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()

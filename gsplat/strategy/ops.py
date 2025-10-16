@@ -209,6 +209,109 @@ def split(
             v_new = v[sel].repeat(repeats)
             wrapped_state[k] = torch.cat((v[rest], v_new))
 
+
+@torch.no_grad()
+def split_n_2dgs(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    n_splits: int = 7,
+    revised_opacity: bool = False,
+    distribution_scale: float = 0.7,
+    size_scale: float = 0.35,
+):
+    """Inplace split 2DGS flat Gaussians into N parts arranged on an ellipse.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        state: A dictionary of extra state tensors.
+        mask: A boolean mask to split the Gaussians.
+        n_splits: Number of new Gaussians to create from each original. Default: 7.
+        revised_opacity: Whether to use revised opacity formulation. Default: False.
+        distribution_scale: Scale factor for ellipse radius (0-1). Default: 0.7.
+        size_scale: Scale factor for new Gaussian sizes. Default: 0.35.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+    rest = torch.where(~mask)[0]
+    n_selected = len(sel)
+
+    # Get covariance matrices from quats and scales
+    scales = scaling_activation(params["scales"][sel])  # [N, 3]
+    quats = rotation_activation(params["quats"][sel], dim=-1)  # [N, 4]
+    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    
+    # Compute covariance matrices: R @ diag(scales^2) @ R^T
+    scale_mats = torch.diag_embed(scales ** 2)  # [N, 3, 3]
+    covars = torch.bmm(torch.bmm(rotmats, scale_mats), rotmats.transpose(1, 2))  # [N, 3, 3]
+    
+    # Eigendecomposition for ellipse parameters
+    eigenvalues, eigenvectors = torch.linalg.eigh(covars)  # eigenvalues: [N, 3], eigenvectors: [N, 3, 3]
+    
+    # Sort eigenvalues and eigenvectors in descending order
+    eigenvalues, indices = torch.sort(eigenvalues, dim=-1, descending=True)
+    # Correctly reorder eigenvectors columns based on sorted eigenvalue indices
+    batch_indices = torch.arange(n_selected, device=device).unsqueeze(1).unsqueeze(2).expand(-1, 3, 3)
+    row_indices = torch.arange(3, device=device).unsqueeze(0).unsqueeze(2).expand(n_selected, -1, 3)
+    col_indices = indices.unsqueeze(1).expand(-1, 3, -1)
+    eigenvectors = eigenvectors[batch_indices, row_indices, col_indices]
+    
+    # Ellipse semi-axes (1 sigma for tighter distribution)
+    semi_axes = torch.sqrt(eigenvalues) * distribution_scale  # [N, 3]
+    
+    # Generate positions on ellipse for each Gaussian
+    positions = []
+    for i in range(n_splits):
+        t = 2 * torch.pi * i / n_splits
+        
+        # Position on unit sphere
+        cos_t = torch.cos(torch.tensor(t, device=device))
+        sin_t = torch.sin(torch.tensor(t, device=device))
+        
+        # Create position vectors in ellipse space
+        # Using first two principal axes for 2D ellipse, third axis stays 0
+        local_pos = torch.zeros(n_selected, 3, device=device)
+        local_pos[:, 0] = semi_axes[:, 0] * cos_t
+        local_pos[:, 1] = semi_axes[:, 1] * sin_t
+        
+        # Transform to world space using eigenvectors
+        world_pos = torch.bmm(eigenvectors, local_pos.unsqueeze(-1)).squeeze(-1)  # [N, 3]
+        positions.append(world_pos)
+    
+    # Stack all positions: [n_splits, N, 3]
+    positions = torch.stack(positions, dim=0)
+    
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        repeats = [n_splits] + [1] * (p.dim() - 1)
+        if name == "means":
+            # Add offsets to original positions
+            p_split = (p[sel].unsqueeze(0) + positions).reshape(-1, 3)  # [n_splits*N, 3]
+        elif name == "scales":
+            # Make new Gaussians more spherical (rounder) than parent
+            # Use geometric mean of parent scales for all axes
+            geometric_mean = torch.exp(torch.log(scales + 1e-7).mean(dim=-1, keepdim=True))
+            new_scales = geometric_mean.expand(-1, 3) * size_scale
+            p_split = scaling_inverse_activation(new_scales).unsqueeze(0).repeat([n_splits, 1, 1]).reshape(-1, 3)  # [n_splits*N, 3]
+        # elif name == "opacities" and revised_opacity:
+        #     new_opacities = 1.0 - torch.pow(1.0 - opacity_activation(p[sel]), 1.0 / n_splits)
+        #     # Additional reduction for overlap
+        #     new_opacities = new_opacities * 0.85
+        #     new_opacities = torch.clamp(new_opacities, min=1e-6, max=1.0 - 1e-6)
+        #     p_split = opacity_inverse_activation(new_opacities).repeat(repeats)  # [n_splits*N]
+        elif name == "opacities":
+            # Opacity division with better overlap handling
+            new_opacities = opacity_activation(p[sel]) / torch.sqrt(torch.tensor(n_splits, dtype=torch.float32, device=device))
+            # new_opacities = new_opacities * 0.85  # Additional reduction factor
+            new_opacities = torch.clamp(new_opacities, min=1e-6, max=1.0 - 1e-6)
+            p_split = opacity_inverse_activation(new_opacities).repeat(repeats)  # [n_splits*N]
+        else:
+            p_split = p[sel].repeat(repeats)
+        
+        p_new = torch.cat([p[rest], p_split])
+        return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
         v_split = torch.zeros((n_splits * n_selected, *v.shape[1:]), device=device)
         return torch.cat([v[rest], v_split])

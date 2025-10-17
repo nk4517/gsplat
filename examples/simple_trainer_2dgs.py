@@ -266,6 +266,13 @@ class Config:
     aa_smoothing_reg: float = 0.1  # s_reg parameter from paper
     aa_compute_every: int = 1  # Recompute compute_min_depth_normalized_sq every N epochs
 
+    # Importance-based pruning parameters (Speedy-Splat style)
+    importance_prune_enabled: bool = False  # Enable importance-based pruning
+    importance_prune_start_epoch: int = 8  # Start importance pruning after this epoch
+    importance_prune_end_epoch: int = 10000  # Stop importance pruning after this epoch
+    importance_prune_every_epochs: int = 1  # Perform importance pruning every this many epochs
+    importance_prune_ratio: float = 0.005  # Fraction to prune (0.3 = remove 30% least important)
+
     # Split parameters for gaussians that dominate or touch too many pixels
     split_big_dominated_pct: float = 0.0005  # Split gaussians dominating more than this percentage of pixels
     split_big_touched_pct: float = 0.001  # Split gaussians touching more than this percentage of pixels

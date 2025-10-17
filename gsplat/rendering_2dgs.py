@@ -305,6 +305,13 @@ def rasterization_2dgs(
                 )  # [..., C, N, F]
         # Concatenate extra features with colors (extra features first)
         colors = torch.cat([extra_features, colors], dim=-1)
+        
+        # Add zero padding to backgrounds for extra features
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                (torch.zeros(backgrounds.shape[:-1] + (extra_channels,), device=backgrounds.device, dtype=backgrounds.dtype), 
+                 backgrounds), dim=-1
+            )
 
     # Rasterize to pixels
     if render_mode in ["RGB+D", "RGB+ED"]:

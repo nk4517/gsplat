@@ -366,13 +366,37 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-        )
-        self.valset = Dataset(self.parser, split="val")
+        
+        # Choose between preloaded and regular dataset
+        if cfg.preload_images:
+            from datasets.preloaded_dataset import PreloadedDataset
+            self.trainset = PreloadedDataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+                device=self.device,
+                pin_memory=True,
+                to_gpu=True,  # Store directly on GPU for fastest access
+            )
+            self.valset = PreloadedDataset(
+                self.parser,
+                split="val",
+                patch_size=None,
+                load_depths=False,
+                device=self.device,
+                pin_memory=True,
+                to_gpu=False,  # Keep validation in pinned memory to save GPU memory
+            )
+        else:
+            self.trainset = Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = Dataset(self.parser, split="val")
+        
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -783,14 +807,24 @@ class Runner:
                 )
             )
 
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+        # Create dataloader based on preload_images setting
+        if cfg.preload_images:
+            from datasets.preloaded_dataset import PreloadedDataLoader
+            trainloader = PreloadedDataLoader(
+                self.trainset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                device=device,
+            )
+        else:
+            trainloader = torch.utils.data.DataLoader(
+                self.trainset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=4,
+                persistent_workers=True,
+                pin_memory=True,
+            )
 
         # Training loop.
         global_tic = time.time()
@@ -1185,9 +1219,20 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
-        )
+        # Create validation dataloader based on preload_images setting
+        if cfg.preload_images:
+            from datasets.preloaded_dataset import PreloadedDataLoader
+            valloader = PreloadedDataLoader(
+                self.valset,
+                batch_size=1,
+                shuffle=False,
+                device=device,
+            )
+        else:
+            valloader = torch.utils.data.DataLoader(
+                self.valset, batch_size=1, shuffle=False, num_workers=1
+            )
+        
         ellipse_time = 0
         metrics = {"psnr": [], "ssim": [], "lpips": []}
         if cfg.use_bilateral_grid:

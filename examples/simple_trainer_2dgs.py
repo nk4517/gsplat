@@ -48,6 +48,7 @@ from utils import (
     rgb_to_sh,
     set_random_seed,
     scalar_to_colormap,
+    skyness_to_colormap,
 )
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
@@ -1466,13 +1467,7 @@ class Runner:
         elif render_tab_state.render_mode == "skyness":
             # Visualize skyness probability
             skyness_probs = torch.sigmoid(self.splats["skyness"])
-            override_colors = scalar_to_colormap(
-                skyness_probs,
-                colormap=render_tab_state.colormap,
-                inverse=render_tab_state.inverse,
-                explicit_min=0.0,
-                explicit_max=1.0,
-            ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            override_colors = skyness_to_colormap(skyness_probs).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
         (
             render_colors,

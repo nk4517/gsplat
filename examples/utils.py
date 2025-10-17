@@ -345,3 +345,36 @@ def index_map_to_pseudocolor(index_map):
     colored_img[index_map == -1, :] = 0.5
 
     return colored_img
+
+def skyness_to_colormap(skyness: torch.Tensor) -> torch.Tensor:
+    """Convert skyness probabilities to informative RGB colors.
+    
+    Color scheme:
+    - Blue: High skyness - sky gaussians
+    - Yellow: Low skyness - world objects
+    - Purple: Uncertain - transition zone
+    - Gray: undefined/empty
+    
+    Args:
+        skyness: Tensor of shape [N] or [N, 1] with probabilities in [0, 1]
+        
+    Returns:
+        RGB colors of shape [N, 3]
+    """
+    if skyness.dim() == 1:
+        skyness = skyness.unsqueeze(-1)
+    
+    skyness = skyness.squeeze(-1)  # [N]
+    colors = torch.full((skyness.shape[0], 3), 0.5, device=skyness.device)
+    
+    # Red channel: high for world objects (low skyness)
+    colors[:, 0] = 1.0 - skyness
+    
+    # Green channel: high for extreme values (0 or 1)
+    colors[:, 1] = (skyness - 0.5).abs()
+    
+    # Blue channel: high for sky (high skyness)
+    colors[:, 2] = skyness
+    
+    return colors
+

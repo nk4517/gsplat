@@ -476,26 +476,7 @@ class Runner:
                 **kwargs,
             )
         elif self.model_type == "2dgs-inria":
-            renders, info = rasterization_2dgs_inria_wrapper(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,
-                colors=colors,
-                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-                Ks=Ks,  # [C, 3, 3]
-                width=width,
-                height=height,
-                packed=self.cfg.packed,
-                absgrad=self.cfg.absgrad,
-                sparse_grad=self.cfg.sparse_grad,
-                **kwargs,
-            )
-            render_colors, render_alphas = renders
-            render_normals = info["normals_rend"]
-            normals_from_depth = info["normals_surf"]
-            render_distort = info["render_distloss"]
-            render_median = render_colors[..., 3]
+            raise NotImplementedError("2dgs-inria disabled")
 
         return (
             render_colors,

@@ -418,12 +418,13 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
             const float vis = alpha * T;
             const float *c_ptr = colors + g * CDIM;
 
-            // Вычисление глубины через пересечение луча и плоскости
-            // const float depth_at_pixel = s.x * w_M.x + s.y * w_M.y + w_M.z;
+            // Вычисление глубины через пересечение луча и плоскости сплата
+             const float depth_at_pixel = s.x * w_M.x + s.y * w_M.y + w_M.z;
             // не, лучше не надо, иначе сплаты перехлёстываются и "мигают"
+            // upd. они и так и эдак мигают
 
-            // Get depth from the last channel of colors
-            const float depth_at_pixel = c_ptr[CDIM - 1];
+//            // Get central point depth from the last channel of colors
+//            const float depth_at_pixel = c_ptr[CDIM - 1];
 
             // Track dominating gaussian (the one that consumes most transmittance)
             float consumed_T = T - next_T;  // amount of transmittance consumed by this gaussian

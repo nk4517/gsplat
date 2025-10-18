@@ -349,9 +349,16 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
             vec3 h_v; // homogeneous plane parameter for vs, per pixel
             vec3 ray_cross; // ray cross product, the ray of plane intersection,
                             // per pixel
+            vec3 u_M; // u component of the ray transform matrix, per pixel
+            vec3 v_M; // v component of the ray transform matrix, per pixel
             vec3 w_M; // depth component of the ray transform matrix, per pixel
             float gauss_weight_mip, norm_factor;
             float inv_a11, inv_a12, inv_a22, inv_det;
+            
+            // Variables for supersampled method (declared early to avoid recomputation)
+            vec2 s_samples[5];
+            float sample_weights[5];
+            vec2 s_center;
 
             /**
              * ==================================================
@@ -363,8 +370,8 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
 
                 opac = xy_opac.z;
 
-                const vec3 u_M = u_Ms_batch[t];
-                const vec3 v_M = v_Ms_batch[t];
+                u_M = u_Ms_batch[t];
+                v_M = v_Ms_batch[t];
 
                 w_M = w_Ms_batch[t];
 
@@ -387,6 +394,11 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                     compute_mip_filter_weight(h_u, h_v, w_M, s, ray_cross.z,
                              gauss_weight, norm_factor,
                              &inv_a11, &inv_a12, &inv_a22, &inv_det);
+                } else if constexpr (AA_METHOD == HDGS) {
+                    // HDGS-style frustum-based supersampling
+                    compute_supersample_filter_weight(px, py, u_M, v_M, w_M,
+                                                    gauss_weight, s_center,
+                                                    s_samples, sample_weights);
                 } else { // DEFAULT
                     // Original 2DGS method - minimum of ray-intersection and 2D gaussian
                     gauss_weight_3d = s.x * s.x + s.y * s.y;
@@ -588,6 +600,12 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                             px * v_h_u.y + py * v_h_v.y + v_depth * v_z_w_M.y,
                             px * v_h_u.z + py * v_h_v.z + v_depth * v_z_w_M.z
                         };
+                    } else if constexpr (AA_METHOD == HDGS) {
+                        // Градиенты для HDGS-style frustum-based supersampling
+                        // Используем уже вычисленные s_samples и sample_weights из forward pass
+                        compute_supersample_filter_gradients(v_G, vis, s_samples, sample_weights,
+                                                            px, py, u_M, v_M, w_M,
+                                                            v_u_M_local, v_v_M_local, v_w_M_local);
                     } else { // DEFAULT
                         // Градиенты для оригинального 2DGS метода
                         const bool use_2d = gauss_weight == gauss_weight_2d;

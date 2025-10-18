@@ -382,6 +382,14 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
                 compute_mip_filter_weight(h_u, h_v, w_M, s, ray_cross.z,
                                         gauss_weight_mip, norm_factor);
                 gauss_weight_final = gauss_weight_mip;
+            } else if constexpr (AA_METHOD == HDGS) {
+                // HDGS: frustum-based supersampling
+                float gauss_weight_super;
+                vec2 s_center;
+                compute_supersample_filter_weight(px, py, u_M, v_M, w_M,
+                                                gauss_weight_super, s_center);
+                gauss_weight_final = gauss_weight_super;
+                // Note: s_center could be used instead of s if needed
             } else {
                 // DEFAULT: Original 2DGS method - minimum of ray-intersection and 2D gaussian
                 // point of intersection in uv space

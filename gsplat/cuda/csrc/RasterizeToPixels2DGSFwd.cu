@@ -5,6 +5,7 @@
 
 #include "Common.h"
 #include "Rasterization.h"
+#include "MipFilter2DGS.cuh"
 
 namespace gsplat {
 
@@ -360,7 +361,9 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
             const vec3 h_v = py * w_M - v_M;
 
             const vec3 ray_cross = glm::cross(h_u, h_v);
-            if (ray_cross.z == 0.0)
+
+            const float RAY_CROSS_EPSILON = 1e-8;
+            if (abs(ray_cross.z) < RAY_CROSS_EPSILON)
                 continue;
 
             const vec2 s =
@@ -368,21 +371,36 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
 
             // IMPORTANT: This is where the gaussian kernel is evaluated!!!!!
 
-            // point of interseciton in uv space
-            const float gauss_weight_3d = s.x * s.x + s.y * s.y;
+            // Antialiasing method is selected in MipFilter2DGS.cuh
+            
+            float gauss_weight_final;
+            float norm_factor = 1.0f;
+            
+            if constexpr (AA_METHOD == AA_2DGS) {
+                // AA-2DGS: Mip-NeRF 360 style filter with Jacobian-based covariance
+                float gauss_weight_mip;
+                compute_mip_filter_weight(h_u, h_v, w_M, s, ray_cross.z,
+                                        gauss_weight_mip, norm_factor);
+                gauss_weight_final = gauss_weight_mip;
+            } else {
+                // DEFAULT: Original 2DGS method - minimum of ray-intersection and 2D gaussian
+                // point of intersection in uv space
+                const float gauss_weight_3d = s.x * s.x + s.y * s.y;
+                
+                // projected gaussian kernel
+                const vec2 d = {xy_opac.x - px, xy_opac.y - py};
+                #define FILTER_INV_SQUARE_2DGS 2.0f
+                const float gauss_weight_2d =
+                    FILTER_INV_SQUARE_2DGS * (d.x * d.x + d.y * d.y);
+                
+                // merge ray-intersection kernel and 2d gaussian kernel
+                gauss_weight_final = min(gauss_weight_3d, gauss_weight_2d);
+                norm_factor = 1.0f; // no normalization for default method
+            }
 
-            // projected gaussian kernel
-            const vec2 d = {xy_opac.x - px, xy_opac.y - py};
-            // #define FILTER_INV_SQUARE_2DGS 2.0f
-            const float gauss_weight_2d =
-                FILTER_INV_SQUARE_2DGS * (d.x * d.x + d.y * d.y);
-
-            // merge ray-intersection kernel and 2d gaussian kernel
-            const float gauss_weight = min(gauss_weight_3d, gauss_weight_2d);
-
-            const float sigma = 0.5f * gauss_weight;
+            const float sigma = 0.5f * gauss_weight_final;
             // evaluation of the gaussian exponential term
-            float alpha = min(0.999f, opac * __expf(-sigma));
+            float alpha = min(0.999f, opac * norm_factor * __expf(-sigma));
 
             // ignore transparent gaussians
             if (sigma < 0.f || alpha < ALPHA_THRESHOLD) {

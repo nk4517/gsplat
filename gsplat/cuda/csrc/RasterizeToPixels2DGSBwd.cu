@@ -7,6 +7,7 @@
 #include "Common.h"
 #include "Rasterization.h"
 #include "Utils.cuh"
+#include "MipFilter2DGS.cuh"
 
 namespace gsplat {
 
@@ -242,6 +243,8 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
     const int32_t warp_bin_final =
         cg::reduce(warp, bin_final, cg::greater<int>());
 
+    // Antialiasing method is selected in MipFilter2DGS.cuh
+
     /**
      * =======================================================
      * Calculating Derivatives
@@ -347,6 +350,8 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
             vec3 ray_cross; // ray cross product, the ray of plane intersection,
                             // per pixel
             vec3 w_M; // depth component of the ray transform matrix, per pixel
+            float gauss_weight_mip, norm_factor;
+            float inv_a11, inv_a12, inv_a22, inv_det;
 
             /**
              * ==================================================
@@ -368,24 +373,36 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
 
                 ray_cross = glm::cross(h_u, h_v);
 
-                // no ray_crossion
-                if (ray_cross.z == 0.0)
+                const float RAY_CROSS_EPSILON = 1e-8;
+                if (abs(ray_cross.z) < RAY_CROSS_EPSILON)
                     valid = false;
                 s = {ray_cross.x / ray_cross.z, ray_cross.y / ray_cross.z};
 
-                // GAUSSIAN KERNEL EVALUATION
-                gauss_weight_3d = s.x * s.x + s.y * s.y;
-                d = {xy_opac.x - px, xy_opac.y - py};
+                // Compile-time selection between antialiasing methods
+                float gauss_weight;
+                float norm_factor = 1.0f;
+                
+                if constexpr (AA_METHOD == AA_2DGS) {
+                    // Mip-NeRF 360 style filter with Jacobian-based covariance
+                    compute_mip_filter_weight(h_u, h_v, w_M, s, ray_cross.z,
+                             gauss_weight, norm_factor,
+                             &inv_a11, &inv_a12, &inv_a22, &inv_det);
+                } else { // DEFAULT
+                    // Original 2DGS method - minimum of ray-intersection and 2D gaussian
+                    gauss_weight_3d = s.x * s.x + s.y * s.y;
+                    
+                    d = {xy_opac.x - px, xy_opac.y - py};
+                    #define FILTER_INV_SQUARE_2DGS 2.0f
+                    gauss_weight_2d = FILTER_INV_SQUARE_2DGS * (d.x * d.x + d.y * d.y);
+                    
+                    gauss_weight = min(gauss_weight_3d, gauss_weight_2d);
+                    norm_factor = 1.0f;
+                }
 
-                // 2D gaussian weight using the projected 2D mean
-                gauss_weight_2d =
-                    FILTER_INV_SQUARE_2DGS * (d.x * d.x + d.y * d.y);
-                gauss_weight = min(gauss_weight_3d, gauss_weight_2d);
-
-                // visibility and alpha
+                // visibility и alpha с учётом norm_factor
                 const float sigma = 0.5f * gauss_weight;
-                vis = __expf(-sigma);
-                alpha = min(0.999f, opac * vis); // clipped alpha
+                vis = norm_factor * __expf(-sigma);  // добавлен norm_factor
+                alpha = min(0.999f, opac * vis);
 
                 // gaussian throw out
                 if (sigma < 0.f || alpha < ALPHA_THRESHOLD) {
@@ -531,21 +548,23 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                  * d_G_i w.r.t geometry parameters
                  * ==================================================
                  */
+                // Градиенты для выбранного метода антиалиасинга
                 if (opac * vis <= 0.999f) {
                     float v_depth = 0.f;
-                    // d(a_i * G_i) / d(G_i) = a_i
                     const float v_G = opac * v_alpha;
 
-                    // case 1: in the forward pass, the proper ray-primitive
-                    // intersection is used
-                    if (gauss_weight_3d <= gauss_weight_2d) {
-
-                        // derivative of G_i w.r.t. ray-primitive intersection
-                        // uv coordinates
+                    if constexpr (AA_METHOD == AA_2DGS) {
+                        // Градиент по s через mip-фильтрацию
+                        // ∂L/∂s = -v_G * vis * Σ'^{-1} * s
                         const vec2 v_s = {
-                            v_G * -vis * s.x + v_depth * w_M.x,
-                            v_G * -vis * s.y + v_depth * w_M.y
+                            -v_G * vis * (inv_a22 * s.x + inv_a12 * s.y) + v_depth * w_M.x,
+                            -v_G * vis * (inv_a12 * s.x + inv_a11 * s.y) + v_depth * w_M.y
                         };
+
+                        // Градиент через norm_factor = 1/sqrt(det(Σ'))
+                        // ∂vis/∂norm_factor = exp(-0.5*q)
+                        // ∂norm_factor/∂det = -0.5 * det^{-3/2}
+                        // Это влияет на градиенты по J, но требует дополнительных вычислений
 
                         // backward through the projective transform
                         // @see rasterize_to_pixels_2dgs_fwd.cu to understand
@@ -569,24 +588,49 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                             px * v_h_u.y + py * v_h_v.y + v_depth * v_z_w_M.y,
                             px * v_h_u.z + py * v_h_v.z + v_depth * v_z_w_M.z
                         };
-
-                        // case 2: in the forward pass, the 2D gaussian
-                        // projected gaussian weight is used
-                    } else {
-                        // computing the derivative of G_i w.r.t. 2d projected
-                        // gaussian parameters (trivial)
-                        const float v_G_ddelx =
-                            -vis * FILTER_INV_SQUARE_2DGS * d.x;
-                        const float v_G_ddely =
-                            -vis * FILTER_INV_SQUARE_2DGS * d.y;
-                        v_xy_local = {v_G * v_G_ddelx, v_G * v_G_ddely};
-                        if (v_means2d_abs != nullptr) {
-                            v_xy_abs_local = {
-                                abs(v_xy_local.x), abs(v_xy_local.y)
+                    } else { // DEFAULT
+                        // Градиенты для оригинального 2DGS метода
+                        const bool use_2d = gauss_weight == gauss_weight_2d;
+                        
+                        if (use_2d) {
+                            // Градиент по 2D проекции
+                            const float v_G_vis = -v_G * vis;
+                            v_xy_local.x = v_G_vis * FILTER_INV_SQUARE_2DGS * 2.0f * d.x;
+                            v_xy_local.y = v_G_vis * FILTER_INV_SQUARE_2DGS * 2.0f * d.y;
+                            
+                            if (v_means2d_abs != nullptr) {
+                                v_xy_abs_local.x = abs(v_xy_local.x);
+                                v_xy_abs_local.y = abs(v_xy_local.y);
+                            }
+                        } else {
+                            // Градиент по 3D ray-intersection
+                            const vec2 v_s = {
+                                -v_G * vis * s.x + v_depth * w_M.x,
+                                -v_G * vis * s.y + v_depth * w_M.y
+                            };
+                            
+                            // backward through the projective transform
+                            const vec3 v_z_w_M = {s.x, s.y, 1.0};
+                            const float v_sx_pz = v_s.x / ray_cross.z;
+                            const float v_sy_pz = v_s.y / ray_cross.z;
+                            const vec3 v_ray_cross = {
+                                v_sx_pz, v_sy_pz, -(v_sx_pz * s.x + v_sy_pz * s.y)
+                            };
+                            const vec3 v_h_u = glm::cross(h_v, v_ray_cross);
+                            const vec3 v_h_v = glm::cross(v_ray_cross, h_u);
+                            
+                            v_u_M_local = {-v_h_u.x, -v_h_u.y, -v_h_u.z};
+                            v_v_M_local = {-v_h_v.x, -v_h_v.y, -v_h_v.z};
+                            v_w_M_local = {
+                                px * v_h_u.x + py * v_h_v.x + v_depth * v_z_w_M.x,
+                                px * v_h_u.y + py * v_h_v.y + v_depth * v_z_w_M.y,
+                                px * v_h_u.z + py * v_h_v.z + v_depth * v_z_w_M.z
                             };
                         }
                     }
-                    v_opacity_local = vis * v_alpha;
+
+                    // Градиент по opacity с учётом norm_factor
+                    v_opacity_local = norm_factor * vis * v_alpha;  // добавлен norm_factor
                 }
 
 /**

@@ -300,7 +300,15 @@ class DefaultStrategy(Strategy):
             state["importance"].zero_()
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
+
+        # оно всегда, но на всякий случай чтобы понятно было
+        if epoch_ctx.epoch_end:
+            if "epoch_stats" in state:
+                state["epoch_stats"].reset()
+
+        if should_refine or should_reset or epoch_ctx.epoch_end:
             torch.cuda.empty_cache()
+
 
     @torch.no_grad()
     def step_epoch_start(
@@ -319,8 +327,6 @@ class DefaultStrategy(Strategy):
         # Initialize epoch statistics block
         if "epoch_stats" not in state:
             state["epoch_stats"] = EpochStatistics(n_gaussian, device)
-        else:
-            state["epoch_stats"].reset()
 
     @torch.no_grad()
     def _update_state(
@@ -439,8 +445,10 @@ class DefaultStrategy(Strategy):
         # Filter out sky gaussians if skyness is available
         is_not_sky = torch.ones(n_before, dtype=torch.bool, device=device)
         if "skyness" in params:
-            skyness_probs = torch.sigmoid(params["skyness"])
+            skyness_probs = torch.sigmoid(params["skyness"].detach())
             is_not_sky = skyness_probs < 0.66  # Only process gaussians with skyness < 66%
+
+        is_certain_sky = ~is_not_sky
 
         # is_grad_high = grads > self.grow_grad2d
         # is_small = (
@@ -460,11 +468,13 @@ class DefaultStrategy(Strategy):
         # Split gaussians that dominate too many pixels (using current epoch statistics)
         if "epoch_stats" in state and hasattr(state["epoch_stats"], "max_touchedPct"):
             # Use split_n for very large gaussians (> 2% of image)
-            is_split_huge = state["epoch_stats"].max_touchedPct > 0.005
+            is_split_huge = (state["epoch_stats"].max_touchedPct > 0.005) & is_not_sky
+            is_split_huge |= (state["epoch_stats"].max_touchedPct > 0.05) & is_certain_sky
             
             # Use regular split for moderately large gaussians
             split_by_domination = (state["epoch_stats"].max_dominatedPct > self.split_big_dominated_pct) & ~is_split_huge
-            split_by_big_touch = (state["epoch_stats"].max_touchedPct > self.split_big_touched_pct) & ~split_by_domination
+            split_by_big_touch = ((state["epoch_stats"].max_touchedPct > self.split_big_touched_pct) & ~split_by_domination) & is_not_sky
+            split_by_big_touch |= ((state["epoch_stats"].max_touchedPct > self.split_big_touched_pct*10) & ~split_by_domination) & is_certain_sky
 
             print("split_n by huge touch pct:", is_split_huge.sum().item())
             print("split by domination pct:", split_by_domination.sum().item())
@@ -544,13 +554,13 @@ class DefaultStrategy(Strategy):
         # Filter out sky gaussians if skyness is available
         is_not_sky = torch.ones(n_total, dtype=torch.bool, device=device)
         if "skyness" in params:
-            skyness_probs = torch.sigmoid(params["skyness"])
+            skyness_probs = torch.sigmoid(params["skyness"].detach())
             is_not_sky = skyness_probs < 0.66  # Only process gaussians with skyness < 66%
 
         # Apply pruning criteria only to old gaussians
 
         # Opacity-based pruning for old gaussians
-        is_prune = opacity_activation(params["opacities"].flatten()) < self.prune_opa
+        is_prune |= opacity_activation(params["opacities"].detach().flatten()) < self.prune_opa
         
         # Apply skyness filter - sky gaussians should not be pruned
         # is_prune = is_prune & is_not_sky

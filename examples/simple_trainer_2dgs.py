@@ -18,6 +18,8 @@ print("import 111")
 from examples.lib_compose import CompositingOrder, compose_renders
 
 from examples.lib_skysphere import reproject_skysphere
+from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+from nerfstudio.cameras.cameras import Cameras
 
 import imageio
 import numpy as np
@@ -38,12 +40,12 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from utils import normalize_robust, index_map_to_pseudocolor
+from examples.utils import normalize_robust, index_map_to_pseudocolor
 from gsplat import MCMCStrategy
 from gsplat.strategy.ops import scaling_inverse_activation, opacity_inverse_activation, scaling_activation, opacity_activation
 from gsplat.antialias_2dgs import apply_flat_smoothing, calc_sigma_sq, update_max_sampling_rate
 
-from utils import (
+from examples.utils import (
     AppearanceOptModule,
     CameraOptModule,
     knn,
@@ -81,7 +83,7 @@ class Config:
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
     # data_dir: str = r"x:\_ai\_glomap\data\south-building"
     # Downsample factor for the dataset
-    data_factor: int = 1
+    data_factor: int = 4
     # Directory to save results
     # result_dir: str = r"x:\_ai\_my_nerfstudio_results\koneva1"
     result_dir: str = r"x:\_ai\_my_nerfstudio_results\bicycle"
@@ -179,14 +181,8 @@ class Config:
     # Use random background for training to discourage transparency
     random_bkgd: bool = True
 
-    # Enable camera optimization.
-    pose_opt: bool = True
-    # Learning rate for camera optimization
-    pose_opt_lr: float = 1e-5
-    # Regularization for camera optimization as weight decay
-    pose_opt_reg: float = 1e-6
-    # Add noise to camera extrinsics. This is only to test the camera pose optimization.
-    pose_noise: float = 0.0
+    # Camera optimizer configuration (from nerfstudio)
+    camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
 
     # Enable appearance optimization. (experimental)
     app_opt: bool = False
@@ -217,7 +213,7 @@ class Config:
     # Weight for skyness supervision loss
     skyness_supervision_lambda: float = 0.1
     # Weight for skysphere deviation loss
-    skysphere_radius_reg: float = 0.01
+    skysphere_radius_reg: float = 0.05
 
     # Enable depth loss. (experimental)
     depth_loss: bool = True
@@ -576,30 +572,11 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
-        self.pose_optimizers = []
-        if cfg.pose_opt:
-            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
-
-            # def gradient_hook(grad):
-            #     grad_norm = grad.norm()
-            #     if grad_norm > 3000:
-            #         print(f"WARNING: Large gradient norm {grad_norm:.2f}")
-            #     return grad
-            #
-            # self.pose_adjust.embeds.weight.register_hook(gradient_hook)
-
-            self.pose_adjust.zero_init()
-            self.pose_optimizers = [
-                torch.optim.Adam(
-                    self.pose_adjust.parameters(),
-                    lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
-                    weight_decay=cfg.pose_opt_reg,
-                )
-            ]
-
-        if cfg.pose_noise > 0.0:
-            self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
-            self.pose_perturb.random_init(cfg.pose_noise)
+        # Initialize camera optimizer from nerfstudio
+        self.camera_optimizer: CameraOptimizer = cfg.camera_optimizer.setup(
+            num_cameras=len(self.trainset), device=self.device
+        )
+        self.pose_optimizers = []  # Will be populated in train() if camera optimization is enabled
 
         self.app_optimizers = []
         if cfg.app_opt:
@@ -892,13 +869,27 @@ class Runner:
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
-        if cfg.pose_opt:
-            # pose optimization has a learning rate schedule
-            schedulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+        
+        # Get camera optimizer's optimizers and add schedulers for them
+        camera_optimizers = {}
+        self.camera_optimizer.get_param_groups(camera_optimizers)
+        for opt_name, opt_params in camera_optimizers.items():
+            if opt_params:  # Only if there are parameters to optimize
+                optimizer = torch.optim.Adam(
+                    opt_params,
+                    lr=1e-5 * math.sqrt(cfg.batch_size),  # Default lr, can be adjusted
+                    weight_decay=1e-6,
                 )
-            )
+                schedulers.append(
+                    torch.optim.lr_scheduler.ExponentialLR(
+                        optimizer, gamma=0.01 ** (1.0 / max_steps)
+                    )
+                )
+                # Store optimizer for later use
+                if not hasattr(self, 'pose_optimizers'):
+                    self.pose_optimizers = []
+                self.pose_optimizers.append(optimizer)
+        
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
@@ -977,11 +968,24 @@ class Runner:
 
             height, width = pixels.shape[1:3]
 
-            if cfg.pose_noise:
-                camtoworlds = self.pose_perturb(camtoworlds, image_ids)
-
-            if cfg.pose_opt:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+            # Apply camera optimization
+            if self.camera_optimizer.config.mode != "off":
+                # Create a Cameras object for nerfstudio camera optimizer
+                camera = Cameras(
+                    camera_to_worlds=camtoworlds,
+                    fx=Ks[:, 0, 0],
+                    fy=Ks[:, 1, 1],
+                    cx=Ks[:, 0, 2],
+                    cy=Ks[:, 1, 2],
+                    width=torch.tensor([width], device=device),
+                    height=torch.tensor([height], device=device),
+                    metadata={"cam_idx": image_ids[0].item()} if image_ids.numel() == 1 else None,
+                )
+                # apply_to_camera returns [1, 3, 4], need to convert to [1, 4, 4]
+                optimized_c2w = self.camera_optimizer.apply_to_camera(camera)
+                # Add the homogeneous row [0, 0, 0, 1]
+                bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], device=device)
+                camtoworlds = torch.cat([optimized_c2w, bottom_row], dim=1)
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
@@ -1195,6 +1199,7 @@ class Runner:
             # SKYNESS SUPERVISION FROM SKY MASKS:
             # If sky masks are available, use them as ground truth to supervise skyness learning
             # This creates a cross-entropy loss between rendered skyness and ground truth sky mask
+            skyness_supervision_loss = torch.Tensor([0,])
             if cfg.skyness_supervision and cfg.skysphere_enabled and "sky_mask" in data:
                 sky_mask_gt = data["sky_mask"].to(device).float()  # [H, W] binary mask
                 
@@ -1216,6 +1221,33 @@ class Runner:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
+            # Add loss from camera optimizer
+            loss_dict = {}
+            self.camera_optimizer.get_loss_dict(loss_dict)
+            for loss_name, loss_value in loss_dict.items():
+                loss += loss_value
+
+            assert self.splats["means"].isfinite().all()
+
+            # Debug: Check loss before backward
+            if not torch.isfinite(loss):
+                print(f"\nWARNING: Loss is NaN/Inf before backward at step {step}")
+                print(f"  l1loss: {l1loss.item()}")
+                print(f"  ssimloss: {ssimloss.item()}")
+                if cfg.depth_loss and this_pass_depth_loss:
+                    print(f"  depthloss: {depthloss.item()}")
+                if cfg.normal_loss:
+                    print(f"  normalloss: {normalloss.item()}")
+                if cfg.dist_loss:
+                    print(f"  distloss: {distloss.item()}")
+                # Check info tensors
+                if "gradient_2dgs" in info:
+                    grad_2dgs = info["gradient_2dgs"]
+                    print(f"  gradient_2dgs: min={grad_2dgs.min().item():.6f}, max={grad_2dgs.max().item():.6f}, has_nan={not grad_2dgs.isfinite().all()}")
+                if "scores_dG_sq" in info:
+                    scores = info["scores_dG_sq"]
+                    print(f"  scores_dG_sq: min={scores.min().item():.6f}, max={scores.max().item():.6f}, has_nan={not scores.isfinite().all()}")
+
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -1226,10 +1258,6 @@ class Runner:
                 desc += f"dist loss={distloss.item():.6f}"
             if cfg.opacity_entropy_loss and step > cfg.opacity_entropy_start_iter:
                 desc += f" ent={opacity_entropy.item():.4f}"
-            if cfg.pose_opt and cfg.pose_noise:
-                # monitor the pose error if we inject noise
-                pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
-                desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
 
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
@@ -1249,6 +1277,7 @@ class Runner:
                     self.writer.add_scalar("train/opacity_entropy_loss", opacity_entropy.item(), step)
                 if cfg.skysphere_enabled and cfg.skyness_reg > 0:
                     skyness_probs = torch.sigmoid(self.splats["skyness"])
+                    self.writer.add_scalar("train/skyness_supervision_loss", skyness_supervision_loss.item(), step)
                     self.writer.add_scalar("train/skyness_entropy", skyness_entropy.item(), step)
                     self.writer.add_scalar("train/skyness_sky_count", (skyness_probs > 0.75).sum().item(), step)
                     self.writer.add_scalar("train/skyness_world_count", (skyness_probs < 0.25).sum().item(), step)
@@ -1614,7 +1643,7 @@ class Runner:
         overmax_opacity = None
 
         if render_tab_state.render_mode == "max_sampling_rate" and "max_sampling_rate_sq" in self.strategy_state:
-            max_sampling_rate_sq = self.strategy_state["max_sampling_rate_sq"]
+            max_sampling_rate_sq = self.strategy_state["max_sampling_rate_sq"].clone().detach()
             # Take square root to get actual sampling rate
             max_sampling_rate = torch.sqrt(max_sampling_rate_sq)
             override_colors = scalar_to_colormap(
@@ -1628,7 +1657,7 @@ class Runner:
         elif render_tab_state.render_mode == "accumulated_max_sampling_rate":
             # Use accumulated max sampling rate from epoch statistics if available
             if "epoch_stats" in self.strategy_state and hasattr(self.strategy_state["epoch_stats"], "max_sampling_rate"):
-                accumulated_rate = self.strategy_state["epoch_stats"].max_sampling_rate
+                accumulated_rate = self.strategy_state["epoch_stats"].max_sampling_rate.clone().detach()
                 override_colors = scalar_to_colormap(
                     accumulated_rate,
                     colormap=render_tab_state.colormap,
@@ -1638,7 +1667,7 @@ class Runner:
                 ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
         elif render_tab_state.render_mode == "sigma_smooth" and "max_sampling_rate_sq" in self.strategy_state:
-            max_sampling_rate_sq = self.strategy_state["max_sampling_rate_sq"]
+            max_sampling_rate_sq = self.strategy_state["max_sampling_rate_sq"].clone().detach()
             # Calculate smoothing sigma squared
             # изменения вблизи очень слабозаметны, хотя и применяются правильно
             sigma_smooth = torch.sqrt(calc_sigma_sq(max_sampling_rate_sq, self.cfg.aa_smoothing_reg, focal, f_orig))

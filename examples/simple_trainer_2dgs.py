@@ -241,6 +241,15 @@ class Config:
     # Iteration to start opacity entropy regularization
     opacity_entropy_start_iter: int = 1_000
 
+    # Elongation regularization (penalizes stretched gaussians)
+    elongation_loss: bool = True
+    # Weight for elongation loss
+    elongation_lambda: float = 1e-3
+    # Threshold for elongation ratio (penalty starts after this ratio)
+    elongation_threshold: float = 4.0
+    # Iteration to start elongation regularization
+    elongation_start_iter: int = 1_000
+
     # Model for splatting.
     model_type: Literal["2dgs", "2dgs-inria"] = "2dgs"
 
@@ -1179,6 +1188,22 @@ class Runner:
                                    (1 - activated_opacities_clamped) * torch.log(1 - activated_opacities_clamped)).mean()
                 loss += opacity_entropy * curr_opacity_entropy_lambda
 
+            if cfg.elongation_loss:
+                if step > cfg.elongation_start_iter:
+                    curr_elongation_lambda = cfg.elongation_lambda
+                else:
+                    curr_elongation_lambda = 0.0
+                # Calculate elongation ratio (max scale / min scale for each gaussian)
+                activated_scales = scaling_activation(self.splats["scales"])[..., :2]  # [N, 3]
+                max_scales, _ = activated_scales.max(dim=1)  # [N]
+                min_scales, _ = activated_scales.min(dim=1)  # [N]
+                elongation_ratio = max_scales / (min_scales + 1e-8)  # [N] - avoid division by zero
+                
+                # Apply quadratic penalty for ratios above threshold
+                excess_ratio = torch.clamp(elongation_ratio - cfg.elongation_threshold, min=0.0)
+                elongation_loss = (excess_ratio ** 2).mean()
+                loss += elongation_loss * curr_elongation_lambda
+
             if cfg.skysphere_enabled and cfg.skyness_reg > 0:
                 # SKYNESS REGULARIZATION:
                 # This loss encourages gaussians to commit to being either sky or world objects,
@@ -1263,6 +1288,9 @@ class Runner:
             if cfg.opacity_entropy_loss and step > cfg.opacity_entropy_start_iter:
                 loss_components["opacity_entropy"] = opacity_entropy
 
+            if cfg.elongation_loss and step > cfg.elongation_start_iter:
+                loss_components["elongation_loss"] = elongation_loss
+
             if cfg.skysphere_enabled:
                 if cfg.skyness_reg > 0:
                     loss_components["skyness_entropy"] = skyness_entropy
@@ -1285,6 +1313,8 @@ class Runner:
                 desc += f"dist loss={distloss.item():.6f}"
             if cfg.opacity_entropy_loss and step > cfg.opacity_entropy_start_iter:
                 desc += f" ent={opacity_entropy.item():.4f}"
+            if cfg.elongation_loss and step > cfg.elongation_start_iter:
+                desc += f" elong={elongation_loss.item():.4f}"
             pbar.set_description(desc)
 
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
@@ -1302,6 +1332,8 @@ class Runner:
                     self.writer.add_scalar("train/distloss", distloss.item(), step)
                 if cfg.opacity_entropy_loss:
                     self.writer.add_scalar("train/opacity_entropy_loss", opacity_entropy.item(), step)
+                if cfg.elongation_loss and step > cfg.elongation_start_iter:
+                    self.writer.add_scalar("train/elongation_loss", elongation_loss.item(), step)
                 if cfg.skysphere_enabled and cfg.skyness_reg > 0:
                     skyness_probs = torch.sigmoid(self.splats["skyness"])
                     self.writer.add_scalar("train/skyness_supervision_loss", skyness_supervision_loss.item(), step)

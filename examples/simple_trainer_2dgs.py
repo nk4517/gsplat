@@ -17,7 +17,7 @@ print("import 111")
 
 from examples.lib_compose import CompositingOrder, compose_renders
 
-from examples.lib_skysphere import reproject_skysphere
+from examples.lib_skysphere import reproject_skysphere, compute_skysphere_geometry
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 
@@ -667,58 +667,23 @@ class Runner:
         This provides a good initialization for sky regions that can be further optimized.
         """
         cfg = self.cfg
-        skysphere_radius = self.scene_scale * cfg.skysphere_radius_multiplier
         device = self.device
-        samples = cfg.skysphere_points
-        trainset = self.trainset
 
-        all_colors, all_points = reproject_skysphere(trainset, skysphere_radius, samples, device)
+        # Get skysphere geometry from lib_skysphere
+        new_points, new_colors, new_quats = compute_skysphere_geometry(
+            self.trainset,
+            self.scene_scale * cfg.skysphere_radius_multiplier,
+            cfg.skysphere_points,
+            device
+        )
 
-        if len(all_points) > 0:
-            # Concatenate all skysphere points
-            new_points = torch.cat(all_points, dim=0)
-            new_colors = torch.cat(all_colors, dim=0)
+        if new_points is not None:
             N_sky = new_points.shape[0]
             
             # Create parameters for skysphere points
             dist2_avg = (knn(new_points, min(4, N_sky))[:, 1:] ** 2).mean(dim=-1)
             dist_avg = torch.sqrt(dist2_avg)
             new_scales = scaling_inverse_activation(dist_avg * self.cfg.init_scale).unsqueeze(-1).repeat(1, 3)
-            
-            # Calculate quaternions so that normals point towards origin
-            # Normal is the Z axis in local coordinate system
-            # We need to rotate Z axis (0,0,1) to point from splat position to origin
-            directions = -new_points / torch.norm(new_points, dim=1, keepdim=True)  # Direction to origin
-            # Create quaternions from two vectors: (0,0,1) to directions
-            # Using the formula: q = normalize([1 + dot(v1,v2), cross(v1,v2)])
-            z_axis = torch.tensor([0.0, 0.0, 1.0], device=device)
-            dots = directions[:, 2]  # dot product with z_axis
-            cross = torch.stack([
-                -directions[:, 1],  # cross_x = z_y * dir_z - z_z * dir_y = -dir_y
-                directions[:, 0],    # cross_y = z_z * dir_x - z_x * dir_z = dir_x
-                torch.zeros(N_sky, device=device)  # cross_z = z_x * dir_y - z_y * dir_x = 0
-            ], dim=1)
-            
-            # Handle special case when direction is parallel to Z axis
-            parallel_mask = dots.abs() > 0.999
-            
-            # General case quaternion
-            new_quats = torch.zeros((N_sky, 4), device=device)
-            new_quats[:, 0] = 1 + dots  # w component
-            new_quats[:, 1:4] = cross    # x, y, z components
-            
-            # Normalize quaternions
-            new_quats = new_quats / torch.norm(new_quats, dim=1, keepdim=True)
-            
-            # Handle parallel case (use identity or 180 degree rotation around X axis)
-            if parallel_mask.any():
-                # Points looking down (positive dot) keep identity, points looking up (negative dot) rotate 180 around X
-                parallel_dots = dots[parallel_mask]
-                for i, mask_idx in enumerate(torch.where(parallel_mask)[0]):
-                    if parallel_dots[i] > 0:
-                        new_quats[mask_idx] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
-                    else:
-                        new_quats[mask_idx] = torch.tensor([0.0, 1.0, 0.0, 0.0], device=device)
             
             new_opacities = opacity_inverse_activation(torch.full((N_sky,), self.cfg.init_opa, device=device))
             # Initialize skyness in logit space: logit(0.75) ≈ 1.1 for sky points

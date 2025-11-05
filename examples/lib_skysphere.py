@@ -39,6 +39,8 @@ def reproject_skysphere(trainset, skysphere_radius, samples, device):
 
         # Check if sky mask is available
         sky_mask = data.get("sky_mask", None)
+        if sky_mask is None:
+            continue
 
         # Project skysphere points to camera
         worldtocam = torch.linalg.inv(camtoworld[0])
@@ -64,24 +66,23 @@ def reproject_skysphere(trainset, skysphere_radius, samples, device):
         un_y = visible_unpopulated_xy[:, 1].clamp(0, height - 1)
         un_x = visible_unpopulated_xy[:, 0].clamp(0, width - 1)
 
-        # Filter by sky mask if available
-        if sky_mask is not None:
-            sky_mask = sky_mask.to(device)
-            # Check which points are in sky regions
-            is_sky = sky_mask[un_y, un_x]
-            # Update visible_unpopulated to only include sky points
-            visible_unpopulated_indices = torch.where(visible_unpopulated)[0]
-            visible_unpopulated_sky = visible_unpopulated_indices[is_sky]
-            visible_unpopulated = torch.zeros_like(visible_unpopulated)
-            visible_unpopulated[visible_unpopulated_sky] = True
+        sky_mask = sky_mask.to(device)
+        # Check which points are in sky regions
+        is_sky = sky_mask[un_y, un_x]
+        # Update visible_unpopulated to only include sky points
+        visible_unpopulated_indices = torch.where(visible_unpopulated)[0]
+        visible_unpopulated_sky = visible_unpopulated_indices[is_sky]
 
-            if not visible_unpopulated.any():
-                continue
+        visible_unpopulated.zero_()
+        visible_unpopulated[visible_unpopulated_sky] = True
 
-            # Re-sample coordinates for filtered points
-            visible_unpopulated_xy = points_2d[visible_unpopulated].long()
-            un_y = visible_unpopulated_xy[:, 1].clamp(0, height - 1)
-            un_x = visible_unpopulated_xy[:, 0].clamp(0, width - 1)
+        if not visible_unpopulated.any():
+            continue
+
+        # Re-sample coordinates for filtered points
+        visible_unpopulated_xy = points_2d[visible_unpopulated].long()
+        un_y = visible_unpopulated_xy[:, 1].clamp(0, height - 1)
+        un_x = visible_unpopulated_xy[:, 0].clamp(0, width - 1)
 
         pts3d_to_add = skysphere_pts3d[visible_unpopulated]
         colors_to_add = image[un_y, un_x]

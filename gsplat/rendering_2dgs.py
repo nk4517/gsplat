@@ -388,6 +388,7 @@ def rasterization_2dgs(
         "means2d": means2d,
         "depths": depths,
         "ray_transforms": ray_transforms,
+        "scales": scales,
         "opacities": opacities,
         "normals": normals,
         "tile_width": tile_width,

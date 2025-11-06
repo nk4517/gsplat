@@ -74,12 +74,12 @@ class Config:
 
     # Path to the Mip-NeRF 360 dataset
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube05\towel"
-    # data_dir: str = r"X:\_ai\_gsplat\datasets\garden"
+    data_dir: str = r"X:\_ai\_gsplat\datasets\garden"
     # data_dir: str = r"x:\_ai\_gsplat\datasets\bicycle"
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\mip360\kitchen"
     # data_dir: str = r"x:\_ai\_gsplat\datasets\fb_colmap_res"
     # data_dir: str = r"y:\_gopro_kv92\extracted_keyframes\GOPR6996_colmap"
-    data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
+    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
     # data_dir: str = r"x:\_ai\_glomap\data\south-building"
     # Downsample factor for the dataset
@@ -199,7 +199,7 @@ class Config:
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Skysphere parameters
-    skysphere_enabled: bool = True
+    skysphere_enabled: bool = False
     # Radius of skysphere as multiple of scene extent
     skysphere_radius_multiplier: float = 20.0
     # Number of points to sample on skysphere
@@ -418,7 +418,6 @@ class Runner:
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
                 device=self.device,
-                pin_memory=True,
                 to_gpu=True,  # Store directly on GPU for fastest access
             )
             self.valset = PreloadedDataset(
@@ -427,8 +426,7 @@ class Runner:
                 patch_size=None,
                 load_depths=False,
                 device=self.device,
-                pin_memory=True,
-                to_gpu=False,  # Keep validation in pinned memory to save GPU memory
+                to_gpu=False, # Store directly on GPU for fastest access
             )
         else:
             self.trainset = Dataset(
@@ -764,14 +762,30 @@ class Runner:
         width: int,
         height: int,
         rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
+        splats: Optional[Dict[str, Tensor]] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
+        # Use provided splats or fall back to self.splats
+        if splats is None:
+            splats = self.splats
+
+        means = splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = scaling_activation(self.splats["scales"])  # [N, 3]
-        opacities = opacity_activation(self.splats["opacities"])  # [N,]
+        quats = splats["quats"]  # [N, 4]
+        scales = scaling_activation(splats["scales"])  # [N, 3]
+        opacities = opacity_activation(splats["opacities"])  # [N,]
+
+        # Check for non-finite values before rasterization
+        param_checks = [
+            ("means", means),
+            ("quats", quats),
+            ("scales", scales),
+            ("opacities", opacities),
+        ]
+
+        if kwargs.get("extra_features") is not None:
+            param_checks.append(("extra", kwargs["extra_features"]))
 
         image_ids = kwargs.pop("image_ids", None)
         override_colors = kwargs.pop("override_colors", None)
@@ -784,15 +798,15 @@ class Runner:
             colors = override_colors
         elif self.cfg.app_opt:
             colors = self.app_module(
-                features=self.splats["features"],
+                features=splats["features"],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
             )
-            colors = colors + self.splats["colors"]
+            colors = colors + splats["colors"]
             colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            colors = torch.cat([splats["sh0"], splats["shN"]], 1)  # [N, K, 3]
 
         assert self.cfg.antialiased is False, "Antialiased is not supported for 2DGS"
 
@@ -802,7 +816,7 @@ class Runner:
             gui_aa = rasterize_mode == "antialiased"
             not_gui = rasterize_mode is None
             if (gui_aa or (not_gui and cfg_aa)) and "max_sampling_rate_sq" in self.strategy_state:
-                
+
                 # Get focal length from K matrix
                 focal = float((Ks[0, 0, 0] + Ks[0, 1, 1]) / 2.0)
                 if f_orig is None:
@@ -869,7 +883,7 @@ class Runner:
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
-        
+
         # Get camera optimizer's optimizers and add schedulers for them
         camera_optimizers = {}
         self.camera_optimizer.get_param_groups(camera_optimizers)
@@ -889,7 +903,7 @@ class Runner:
                 if not hasattr(self, 'pose_optimizers'):
                     self.pose_optimizers = []
                 self.pose_optimizers.append(optimizer)
-        
+
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
@@ -929,7 +943,7 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
-        
+
         for step, data, epoch_ctx in training_data_generator(trainloader, pbar):
             if not cfg.disable_viewer and cfg.use_viser:
                 while self.viewer.state == "paused":
@@ -1021,7 +1035,7 @@ class Runner:
                 track_domination=True,
                 extra_features=extra_features,  # Pass extra features to render
             )
-            
+
             # Extract rendered skyness mask if available
             if cfg.skysphere_enabled and "rendered_extras" in info:
                 sky_mask_rendered = info["rendered_extras"][0, :, :, 0]  # [H, W] - skyness probability
@@ -1029,17 +1043,17 @@ class Runner:
                 world_mask = 1.0 - sky_mask_rendered  # Higher values for world objects
             else:
                 world_mask = torch.ones((height, width), device=device)
-            
+
             # Add camtoworlds to info for distance computation in strategy
             info["camtoworlds"] = camtoworlds
             info["Ks"] = Ks
-            
+
             # Add skyness info if enabled
             if cfg.skysphere_enabled:
                 # Convert skyness from logit space to probability space for use in densification
                 # Gaussians with skyness > 0.75 are considered sky, < 0.25 are world objects
-                info["skyness"] = torch.sigmoid(self.splats["skyness"])
-            
+                info["skyness"] = torch.sigmoid(self.splats["skyness"]).detach()
+
             # Add AA-2DGS parameters if enabled
             if cfg.use_aa_smoothing:
                 info["aa_params"] = {
@@ -1106,7 +1120,7 @@ class Runner:
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, M, 1]
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                
+
                 # Sample world mask at the same points if skysphere is enabled
                 if cfg.skysphere_enabled and "rendered_extras" in info:
                     world_mask_sampled = F.grid_sample(
@@ -1115,7 +1129,7 @@ class Runner:
                     world_mask_sampled = world_mask_sampled.squeeze(3).squeeze(1)  # [1, M]
                 else:
                     world_mask_sampled = torch.ones_like(depths)  # No masking if skysphere disabled
-                
+
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
@@ -1150,7 +1164,7 @@ class Runner:
                 render_distort_masked = render_distort * world_mask.unsqueeze(0).unsqueeze(-1)
                 distloss = render_distort_masked.sum() / (world_mask.sum() + 1e-6)
                 loss += distloss * curr_dist_lambda
-            
+
             if cfg.opacity_entropy_loss:
                 if step > cfg.opacity_entropy_start_iter:
                     curr_opacity_entropy_lambda = cfg.opacity_entropy_lambda
@@ -1161,7 +1175,7 @@ class Runner:
                 activated_opacities = opacity_activation(self.splats["opacities"])
                 # Clamp to avoid log(0)
                 activated_opacities_clamped = torch.clamp(activated_opacities, 1e-7, 1 - 1e-7)
-                opacity_entropy = -(activated_opacities_clamped * torch.log(activated_opacities_clamped) + 
+                opacity_entropy = -(activated_opacities_clamped * torch.log(activated_opacities_clamped) +
                                    (1 - activated_opacities_clamped) * torch.log(1 - activated_opacities_clamped)).mean()
                 loss += opacity_entropy * curr_opacity_entropy_lambda
 
@@ -1173,12 +1187,13 @@ class Runner:
                 # This helps the model make clear decisions about which gaussians represent sky.
                 skyness_probs = torch.sigmoid(self.splats["skyness"])
                 skyness_clamped = torch.clamp(skyness_probs, 1e-7, 1 - 1e-7)
-                skyness_entropy = -(skyness_clamped * torch.log(skyness_clamped) + 
+                skyness_entropy = -(skyness_clamped * torch.log(skyness_clamped) +
                                    (1 - skyness_clamped) * torch.log(1 - skyness_clamped)).mean()
                 loss += skyness_entropy * cfg.skyness_reg
 
             # SKY SPHERE RADIUS REGULARIZATION:
             # Penalize sky gaussians for deviating from the skysphere radius
+            skysphere_radius_loss = None
             if cfg.skysphere_enabled and cfg.skysphere_radius_reg > 0:
                 skyness_probs = torch.sigmoid(self.splats["skyness"])
                 # Only apply to gaussians with high skyness (> 0.75 probability)
@@ -1195,14 +1210,14 @@ class Runner:
                     weighted_deviation = radius_deviation * skyness_probs[sky_mask]
                     skysphere_radius_loss = weighted_deviation.mean()
                     loss += skysphere_radius_loss * cfg.skysphere_radius_reg
-            
+
             # SKYNESS SUPERVISION FROM SKY MASKS:
             # If sky masks are available, use them as ground truth to supervise skyness learning
             # This creates a cross-entropy loss between rendered skyness and ground truth sky mask
             skyness_supervision_loss = torch.Tensor([0,])
             if cfg.skyness_supervision and cfg.skysphere_enabled and "sky_mask" in data:
                 sky_mask_gt = data["sky_mask"].to(device).float()  # [H, W] binary mask
-                
+
                 # Extract skyness from rendered_extras in info
                 # The skyness was passed as a single channel extra feature
                 if "rendered_extras" in info:
@@ -1214,7 +1229,7 @@ class Runner:
                         sky_mask_gt[0, ...] * torch.log(skyness_rendered_clamped) +
                         (1 - sky_mask_gt[0, ...]) * torch.log(1 - skyness_rendered_clamped)
                     ).mean()
-                    
+
                     loss += skyness_supervision_loss * cfg.skyness_supervision_lambda
 
             if cfg.use_bilateral_grid:
@@ -1229,26 +1244,38 @@ class Runner:
 
             assert self.splats["means"].isfinite().all()
 
-            # Debug: Check loss before backward
-            if not torch.isfinite(loss):
-                print(f"\nWARNING: Loss is NaN/Inf before backward at step {step}")
-                print(f"  l1loss: {l1loss.item()}")
-                print(f"  ssimloss: {ssimloss.item()}")
-                if cfg.depth_loss and this_pass_depth_loss:
-                    print(f"  depthloss: {depthloss.item()}")
-                if cfg.normal_loss:
-                    print(f"  normalloss: {normalloss.item()}")
-                if cfg.dist_loss:
-                    print(f"  distloss: {distloss.item()}")
-                # Check info tensors
-                if "gradient_2dgs" in info:
-                    grad_2dgs = info["gradient_2dgs"]
-                    print(f"  gradient_2dgs: min={grad_2dgs.min().item():.6f}, max={grad_2dgs.max().item():.6f}, has_nan={not grad_2dgs.isfinite().all()}")
-                if "scores_dG_sq" in info:
-                    scores = info["scores_dG_sq"]
-                    print(f"  scores_dG_sq: min={scores.min().item():.6f}, max={scores.max().item():.6f}, has_nan={not scores.isfinite().all()}")
+            # Comprehensive loss component checking
+            loss_components = {
+                "l1loss": l1loss,
+                "ssimloss": ssimloss,
+                "total_loss": loss,
+            }
+
+            if cfg.depth_loss and this_pass_depth_loss:
+                loss_components["depthloss"] = depthloss
+
+            if cfg.normal_loss and step > cfg.normal_start_iter:
+                loss_components["normalloss"] = normalloss
+
+            if cfg.dist_loss and step > cfg.dist_start_iter:
+                loss_components["distloss"] = distloss
+
+            if cfg.opacity_entropy_loss and step > cfg.opacity_entropy_start_iter:
+                loss_components["opacity_entropy"] = opacity_entropy
+
+            if cfg.skysphere_enabled:
+                if cfg.skyness_reg > 0:
+                    loss_components["skyness_entropy"] = skyness_entropy
+                if cfg.skyness_supervision and "sky_mask" in data and "rendered_extras" in info:
+                    loss_components["skyness_supervision"] = skyness_supervision_loss
+                if cfg.skysphere_radius_reg > 0 and skysphere_radius_loss is not None:
+                    loss_components["skysphere_radius"] = skysphere_radius_loss
+
+            if cfg.use_bilateral_grid:
+                loss_components["tvloss"] = tvloss
 
             loss.backward()
+
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             desc += f"epoch={epoch_ctx.i_epoch} ({100.0 * (epoch_ctx.i + 1) / epoch_ctx.epoch_len:.1f}%)| "
@@ -1338,7 +1365,7 @@ class Runner:
                     info["is_world"] = skyness_probs < 0.25
                     # Sky points should be pruned more aggressively if they're too close
                     info["skysphere_radius"] = self.scene_scale * cfg.skysphere_radius_multiplier
-                
+
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -1418,7 +1445,7 @@ class Runner:
             valloader = torch.utils.data.DataLoader(
                 self.valset, batch_size=1, shuffle=False, num_workers=1
             )
-        
+
         ellipse_time = 0
         metrics = {"psnr": [], "ssim": [], "lpips": []}
         if cfg.use_bilateral_grid:
@@ -1522,7 +1549,7 @@ class Runner:
         psnr = torch.stack(metrics["psnr"]).mean()
         ssim = torch.stack(metrics["ssim"]).mean()
         lpips = torch.stack(metrics["lpips"]).mean()
-        
+
         stats = {
             "psnr": psnr.item(),
             "ssim": ssim.item(),
@@ -1530,7 +1557,7 @@ class Runner:
             "ellipse_time": ellipse_time,
             "num_GS": len(self.splats["means"]),
         }
-        
+
         if cfg.use_bilateral_grid:
             cc_psnr = torch.stack(metrics["cc_psnr"]).mean()
             cc_ssim = torch.stack(metrics["cc_ssim"]).mean()
@@ -1552,7 +1579,7 @@ class Runner:
                 f"Time: {ellipse_time:.3f}s/image "
                 f"Number of GS: {len(self.splats['means'])}"
             )
-        
+
         # save stats as json
         with open(f"{self.stats_dir}/val_step{step:04d}.json", "w") as f:
             json.dump(stats, f)
@@ -1632,6 +1659,9 @@ class Runner:
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
+        # Create detached copy of splats for viewer rendering
+        viewer_splats = {k: v.clone().detach() for k, v in self.splats.items()}
+
         focal = float(K[0, 0] + K[1, 1])/2  # Use focal length from K matrix
         K_orig = list(self.parser.Ks_dict.values())[0]
         f_orig = float(K_orig[0, 0] + K_orig[1, 1])/2
@@ -1671,7 +1701,7 @@ class Runner:
             # Calculate smoothing sigma squared
             # изменения вблизи очень слабозаметны, хотя и применяются правильно
             sigma_smooth = torch.sqrt(calc_sigma_sq(max_sampling_rate_sq, self.cfg.aa_smoothing_reg, focal, f_orig))
-            scales = scaling_activation(self.splats["scales"])  # [N, 3]
+            scales = scaling_activation(viewer_splats["scales"])  # [N, 3]
             min_scales = scales[:, :2].min(dim=1).values  # [N]
             relative_change = sigma_smooth / min_scales  # [N]
             override_colors = scalar_to_colormap(
@@ -1697,7 +1727,7 @@ class Runner:
 
         elif render_tab_state.render_mode == "skyness":
             # Visualize skyness probability
-            skyness_probs = torch.sigmoid(self.splats["skyness"])
+            skyness_probs = torch.sigmoid(viewer_splats["skyness"])
             override_colors = skyness_to_colormap(skyness_probs).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
         (
@@ -1713,6 +1743,7 @@ class Runner:
             Ks=K[None],
             width=width,
             height=height,
+            splats=viewer_splats,
             sh_degree=min(render_tab_state.max_sh_degree, self.cfg.sh_degree),
             near_plane=render_tab_state.near_plane,
             far_plane=render_tab_state.far_plane,
@@ -1728,7 +1759,7 @@ class Runner:
             f_orig=f_orig,
             blur_mod=blur_mod,
         )  # [1, H, W, 3]
-        render_tab_state.total_gs_count = len(self.splats["means"])
+        render_tab_state.total_gs_count = len(viewer_splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
 
         if render_tab_state.render_mode in ("depth(expected)", "depth(dominating)"):

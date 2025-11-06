@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -24,6 +25,8 @@ def _get_rel_paths(path_dir: str) -> List[str]:
     paths = []
     for dp, dn, fn in os.walk(path_dir):
         for f in fn:
+            if Path(f).suffix.lower() == ".db":
+                continue
             paths.append(os.path.relpath(os.path.join(dp, f), path_dir).replace("\\", "/"))
     return paths
 
@@ -276,6 +279,7 @@ class Parser:
         self.mapx_dict = dict()
         self.mapy_dict = dict()
         self.roi_undist_dict = dict()
+       
         for camera_id in self.params_dict.keys():
             params = self.params_dict[camera_id]
             if len(params) == 0:
@@ -341,6 +345,50 @@ class Parser:
             self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
             self.mask_dict[camera_id] = mask
 
+        # Check if we need to save undistorted images
+        has_distortion = any(len(params) > 0 for params in self.params_dict.values())
+        if has_distortion:
+            # Create undistorted image directory
+            undist_dir = image_dir.rstrip('/') + '_undist'
+            if not os.path.exists(undist_dir):
+                print(f"Creating undistorted images in {undist_dir}")
+                os.makedirs(undist_dir, exist_ok=True)
+                
+                # Process and save undistorted images
+                for idx, (image_path, image_name) in enumerate(tqdm(
+                    zip(self.image_paths, self.image_names), 
+                    total=len(self.image_paths),
+                    desc="Saving undistorted images"
+                )):
+                    camera_id = self.camera_ids[idx]
+                    params = self.params_dict[camera_id]
+                    
+                    if len(params) == 0:
+                        # No distortion, just copy the image
+                        image = imageio.imread(image_path)[..., :3]
+                        undist_path = os.path.join(undist_dir, os.path.splitext(image_name)[0] + ".png")
+                        os.makedirs(os.path.dirname(undist_path), exist_ok=True)
+                        imageio.imwrite(undist_path, image)
+                    else:
+                        # Apply undistortion
+                        image = imageio.imread(image_path)[..., :3]
+                        mapx = self.mapx_dict[camera_id]
+                        mapy = self.mapy_dict[camera_id]
+                        undist_image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+                        
+                        # Crop to ROI
+                        x, y, w, h = self.roi_undist_dict[camera_id]
+                        undist_image = undist_image[y : y + h, x : x + w]
+                        
+                        # Save undistorted image
+                        undist_path = os.path.join(undist_dir, os.path.splitext(image_name)[0] + ".png")
+                        os.makedirs(os.path.dirname(undist_path), exist_ok=True)
+                        imageio.imwrite(undist_path, undist_image)
+                
+                print(f"Saved {len(self.image_paths)} undistorted images to {undist_dir}")
+            else:
+                print(f"Undistorted images already exist in {undist_dir}")
+        
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)

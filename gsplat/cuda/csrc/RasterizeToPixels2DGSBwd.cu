@@ -386,8 +386,7 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                 s = {ray_cross.x / ray_cross.z, ray_cross.y / ray_cross.z};
 
                 // Compile-time selection between antialiasing methods
-                float gauss_weight;
-                float norm_factor = 1.0f;
+                norm_factor = 1.0f;
                 
                 if constexpr (AA_METHOD == AA_2DGS) {
                     // Mip-NeRF 360 style filter with Jacobian-based covariance
@@ -400,15 +399,14 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                                                     gauss_weight, s_center,
                                                     s_samples, sample_weights);
                 } else { // DEFAULT
-                    // Original 2DGS method - minimum of ray-intersection and 2D gaussian
-                    gauss_weight_3d = s.x * s.x + s.y * s.y;
-                    
-                    d = {xy_opac.x - px, xy_opac.y - py};
-                    #define FILTER_INV_SQUARE_2DGS 2.0f
-                    gauss_weight_2d = FILTER_INV_SQUARE_2DGS * (d.x * d.x + d.y * d.y);
-                    
-                    gauss_weight = min(gauss_weight_3d, gauss_weight_2d);
-                    norm_factor = 1.0f;
+//                    // Original 2DGS method - minimum of ray-intersection and 2D gaussian
+//                    gauss_weight_3d = s.x * s.x + s.y * s.y;
+//
+//                    d = {xy_opac.x - px, xy_opac.y - py};
+//                    #define FILTER_INV_SQUARE_2DGS 2.0f
+//                    gauss_weight_2d = FILTER_INV_SQUARE_2DGS * (d.x * d.x + d.y * d.y);
+//
+//                    gauss_weight = min(gauss_weight_3d, gauss_weight_2d);
                 }
 
                 // visibility и alpha с учётом norm_factor
@@ -457,6 +455,13 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
 
             // gaussian gradient squared for densification
             float v_gauss_sq_local = 0.f;
+            
+            // Densification gradients: approximation of screen-space position gradients
+            // In 2DGS, Gaussians are defined in world space, not screen space.
+            // We use gradients of ray transform matrix elements scaled by depth
+            // as a proxy for true screen position gradients needed for densification.
+            // x,y: signed gradients for direction; z,w: absolute values for magnitude threshold
+            vec4 v_densify_local = {0.f, 0.f, 0.f, 0.f};
 
             // initialize everything to 0, only set if the lane is valid
             /**
@@ -613,44 +618,48 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                                                             px, py, u_M, v_M, w_M,
                                                             v_u_M_local, v_v_M_local, v_w_M_local);
                     } else { // DEFAULT
-                        // Градиенты для оригинального 2DGS метода
-                        const bool use_2d = gauss_weight == gauss_weight_2d;
-                        
-                        if (use_2d) {
-                            // Градиент по 2D проекции
-                            const float v_G_vis = -v_G * vis;
-                            v_xy_local.x = v_G_vis * FILTER_INV_SQUARE_2DGS * 2.0f * d.x;
-                            v_xy_local.y = v_G_vis * FILTER_INV_SQUARE_2DGS * 2.0f * d.y;
-                            
-                            if (v_means2d_abs != nullptr) {
-                                v_xy_abs_local.x = abs(v_xy_local.x);
-                                v_xy_abs_local.y = abs(v_xy_local.y);
-                            }
-                        } else {
-                            // Градиент по 3D ray-intersection
-                            const vec2 v_s = {
-                                -v_G * vis * s.x + v_depth * w_M.x,
-                                -v_G * vis * s.y + v_depth * w_M.y
-                            };
-                            
-                            // backward through the projective transform
-                            const vec3 v_z_w_M = {s.x, s.y, 1.0};
-                            const float v_sx_pz = v_s.x / ray_cross.z;
-                            const float v_sy_pz = v_s.y / ray_cross.z;
-                            const vec3 v_ray_cross = {
-                                v_sx_pz, v_sy_pz, -(v_sx_pz * s.x + v_sy_pz * s.y)
-                            };
-                            const vec3 v_h_u = glm::cross(h_v, v_ray_cross);
-                            const vec3 v_h_v = glm::cross(v_ray_cross, h_u);
-                            
-                            v_u_M_local = {-v_h_u.x, -v_h_u.y, -v_h_u.z};
-                            v_v_M_local = {-v_h_v.x, -v_h_v.y, -v_h_v.z};
-                            v_w_M_local = {
-                                px * v_h_u.x + py * v_h_v.x + v_depth * v_z_w_M.x,
-                                px * v_h_u.y + py * v_h_v.y + v_depth * v_z_w_M.y,
-                                px * v_h_u.z + py * v_h_v.z + v_depth * v_z_w_M.z
-                            };
-                        }
+//                        // Градиенты для оригинального 2DGS метода
+//                        const bool use_2d = gauss_weight == gauss_weight_2d;
+//
+//                        if (use_2d) {
+//                            // computing the derivative of G_i w.r.t. 2d projected
+//                            // gaussian parameters (trivial)
+//                            const float v_G_ddelx =
+//                                -vis * FILTER_INV_SQUARE_2DGS * d.x;
+//                            const float v_G_ddely =
+//                                -vis * FILTER_INV_SQUARE_2DGS * d.y;
+//                            v_xy_local = {v_G * v_G_ddelx, v_G * v_G_ddely};
+//                            if (v_means2d_abs != nullptr) {
+//                                v_xy_abs_local.x = abs(v_xy_local.x);
+//                                v_xy_abs_local.y = abs(v_xy_local.y);
+//                            }
+//                        } else {
+//                            // Градиент по 3D ray-intersection
+//                            const vec2 v_s = {
+//                                v_G * -vis * s.x + v_depth * w_M.x,
+//                                v_G * -vis * s.y + v_depth * w_M.y
+//                            };
+//
+//                            // backward through the projective transform
+//                            // @see rasterize_to_pixels_2dgs_fwd.cu to understand
+//                            // what is going on here
+//                            const vec3 v_z_w_M = {s.x, s.y, 1.0};
+//                            const float v_sx_pz = v_s.x / ray_cross.z;
+//                            const float v_sy_pz = v_s.y / ray_cross.z;
+//                            const vec3 v_ray_cross = {
+//                                v_sx_pz, v_sy_pz, -(v_sx_pz * s.x + v_sy_pz * s.y)
+//                            };
+//                            const vec3 v_h_u = glm::cross(h_v, v_ray_cross);
+//                            const vec3 v_h_v = glm::cross(v_ray_cross, h_u);
+//
+//                            v_u_M_local = {-v_h_u.x, -v_h_u.y, -v_h_u.z};
+//                            v_v_M_local = {-v_h_v.x, -v_h_v.y, -v_h_v.z};
+//                            v_w_M_local = {
+//                                px * v_h_u.x + py * v_h_v.x + v_depth * v_z_w_M.x,
+//                                px * v_h_u.y + py * v_h_v.y + v_depth * v_z_w_M.y,
+//                                px * v_h_u.z + py * v_h_v.z + v_depth * v_z_w_M.z
+//                            };
+//                        }
                     }
 
                     // Градиент по opacity с учётом norm_factor
@@ -685,6 +694,17 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                     buffer_normals[k] += normals_batch[t * 3 + k] * fac;
                 }
             }
+
+            /*
+            На современных GPU (compute capability >= 3.0) треды внутри варпа выполняются в lockstep - синхронно. Поэтому:
+                Явная синхронизация не нужна - все 32 треда варпа всегда выполняют одну и ту же инструкцию одновременно
+                Shuffle инструкции позволяют тредам обмениваться данными напрямую через регистры без использования shared memory
+                После warpSum все треды варпа имеют одинаковое суммарное значение в своих локальных переменных
+
+            При условных операторах происходит warp divergence:
+                Сначала все 32 треда выполняют if-ветку, но активны только те, где valid == true (остальные маскируются)
+                Затем все 32 треда выполняют else-ветку, но активны только те, где valid == false
+            */
 
             /**
              * ==================================================

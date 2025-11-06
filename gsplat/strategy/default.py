@@ -151,11 +151,13 @@ class DefaultStrategy(Strategy):
         # Postpone the initialization of the state to the first step so that we can
         # put them on the correct device.
         # - grad2d: running accum of the norm of the image plane gradients for each GS.
+        # - grad2d_abs: running accum of the norm of the absolute image plane gradients for each GS (for GCR).
         # - count: running accum of how many time each GS is visible.
         # - importance: running accum of importance scores (vG^2) for each GS.
         # - radii: the radii of the GSs (normalized by the image resolution).
         state = {
             "grad2d": None, 
+            "grad2d_abs": None,  # For GCR computation
             "count": None, 
             "importance": None,  # For importance-based pruning (vG^2)
             "scene_scale": scene_scale,
@@ -295,6 +297,7 @@ class DefaultStrategy(Strategy):
 
             # reset running stats
             state["grad2d"].zero_()
+            state["grad2d_abs"].zero_()
             state["count"].zero_()
             state["importance"].zero_()
             if self.refine_scale2d_stop_iter > 0:
@@ -346,20 +349,29 @@ class DefaultStrategy(Strategy):
             assert key in info, f"{key} is required but missing."
 
         # normalize grads to [-1, 1] screen space
-        if self.absgrad:
-            grads = info[self.key_for_gradient].absgrad.clone()
+        if self.key_for_gradient == "gradient_2dgs":
+            # For gradient_2dgs, select appropriate elements based on absgrad
+            gradient_2dgs = info[self.key_for_gradient].grad.clone()
+            # Take elements 0 and 1 if not absgrad
+            grads = gradient_2dgs[..., :2]
+            # Take elements 2 and 3 for absolute gradients
+            grads_abs = gradient_2dgs[..., 2:4]
             # Take element 4 for importance (vG^2)
             importance_grads = gradient_2dgs[..., 4:5]
         else:
-            grads = info[self.key_for_gradient].grad.clone()
+            raise NotImplementedError("inria disabled")
         grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
         grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+        grads_abs[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+        grads_abs[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
 
         # initialize state on the first run
         n_gaussian = len(list(params.values())[0])
 
         if state["grad2d"] is None:
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
+        if state["grad2d_abs"] is None:
+            state["grad2d_abs"] = torch.zeros(n_gaussian, device=grads.device)
         if state["count"] is None:
             state["count"] = torch.zeros(n_gaussian, device=grads.device)
         if state["importance"] is None:
@@ -373,14 +385,17 @@ class DefaultStrategy(Strategy):
             # grads is [nnz, 2]
             gs_ids = info["gaussian_ids"]  # [nnz]
             radii = info["radii"].max(dim=-1).values  # [nnz]
+            # grads_abs is already extracted above for packed case
         else:
             # grads is [C, N, 2]
             sel = (info["radii"] > 0.0).all(dim=-1)  # [C, N]
             gs_ids = torch.where(sel)[1]  # [nnz]
             grads = grads[sel]  # [nnz, 2]
+            grads_abs = grads_abs[sel]  # [nnz, 2]
             importance_grads = importance_grads[sel]  # [nnz, 1]
             radii = info["radii"][sel].max(dim=-1).values  # [nnz]
         state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+        state["grad2d_abs"].index_add_(0, gs_ids, grads_abs.norm(dim=-1))
         state["importance"].index_add_(0, gs_ids, importance_grads.squeeze(-1))
         state["count"].index_add_(
             0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
@@ -457,16 +472,42 @@ class DefaultStrategy(Strategy):
 
         is_certain_sky = ~is_not_sky
 
-        # is_grad_high = grads > self.grow_grad2d
-        # is_small = (
-        #     torch.exp(params["scales"]).max(dim=-1).values
-        #     <= self.grow_scale3d * state["scene_scale"]
-        # )
-        # is_dupli = is_grad_high & is_small
-        # Apply skyness filter to duplication
-        is_dupli = is_dupli & is_not_sky
-        n_dupli = is_dupli.sum().item()
+        # GDAGS: Compute GCR and dynamic weights
+        grads_abs = state["grad2d_abs"] / count.clamp_min(1)
 
+        # Compute Gradient Consistency Ratio (GCR)
+        consistency = (grads + 1e-8) / (grads_abs + 1e-8)
+        consistency = torch.clamp(consistency, 0.0, 1.0)
+
+        # Direct approach from visualization: split in "red zones" (high gradient + low GCR)
+        # Clone where gradients are consistent (high GCR)
+        # Split where gradients are inconsistent (low GCR) AND high magnitude
+        
+        # For clone: use consistent gradients (high GCR zones)
+        # Suppress cloning for inconsistent gradients
+        # grads_for_clone = grads * consistency  # Higher GCR -> more cloning
+        
+        # For split: target "red zones" - high gradient magnitude with low consistency
+        # This matches the red areas in grad2d_gcr_combined visualization
+        is_red_zone = (grads_abs > self.grow_grad2d) & (consistency < 0.5)
+        # Also include any very high gradients regardless of consistency
+        is_very_high_grad = grads_abs > (self.grow_grad2d * 3)
+
+        # # Determine which gaussians to clone (small scale + high gradient)
+        # is_grad_high_for_clone = grads_for_clone > self.grow_grad2d
+        # is_small = (
+        #         scaling_activation(params["scales"]).max(dim=-1).values
+        #         <= self.grow_scale3d * state["scene_scale"]
+        # )
+        # is_dupli = is_grad_high_for_clone & is_small
+
+        # Apply skyness filter to duplication
+        is_dupli &= is_not_sky
+
+
+        # Determine which gaussians to split (large scale + high gradient)
+        # Split in red zones OR very high gradient areas
+        is_grad_high_for_split = is_red_zone | is_very_high_grad
         # is_large = ~is_small
 
         # is_dupli |= is_grad_high_for_split

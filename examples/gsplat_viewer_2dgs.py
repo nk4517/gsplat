@@ -19,8 +19,14 @@ class GsplatRenderTabState(RenderTabState):
     blur_mod: float = 1.0
     backgrounds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     render_mode: Literal[
-        "rgb", "depth(expected)", "depth(dominating)", "normal", "alpha", "domination", "distort",
-        "max_sampling_rate", "accumulated_max_sampling_rate", "sigma_smooth", "n_cameras_visible", "skyness"
+        "rgb", "depth(expected)", "depth(dominating)", "normal", "alpha", "distort",
+        "domination", 
+        "max_sampling_rate", "accumulated_max_sampling_rate", "sigma_smooth", 
+        "n_cameras_visible", 
+        "skyness", 
+        "elongation", 
+        "effective_rank",
+        "grad2d_accum", "grad2d_count", "gcr", "gdags_weight", "grad2d_gcr_combined", 
     ] = "rgb"
     normalize_nearfar: bool = False
     inverse: bool = False
@@ -156,8 +162,15 @@ class GsplatViewer(Viewer):
 
                 render_mode_dropdown = server.gui.add_dropdown(
                     "Render Mode",
-                    ("rgb", "depth(expected)", "depth(dominating)", "normal", "alpha", "domination", "distort",
-                     "max_sampling_rate", "accumulated_max_sampling_rate", "sigma_smooth", "n_cameras_visible", "skyness"),
+                    ("rgb", "depth(expected)", "depth(dominating)", "normal", "alpha", "distort",
+                    "domination", 
+                     "max_sampling_rate", "accumulated_max_sampling_rate", "sigma_smooth", 
+                     "n_cameras_visible", 
+                     "skyness", 
+                     "elongation", 
+                     "effective_rank",
+                     "grad2d_accum", "grad2d_count", "gcr", "gdags_weight", "grad2d_gcr_combined", 
+                     ),
                     initial_value=self.render_tab_state.render_mode,
                     hint="Render mode to use.",
                 )

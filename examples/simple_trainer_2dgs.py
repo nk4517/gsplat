@@ -1667,7 +1667,7 @@ class Runner:
 
         # Prepare override colors for colormapped visualization
         override_colors = None
-        overmax_opacity = None
+        overmax_opacity = False
 
         if render_tab_state.render_mode == "max_sampling_rate" and "max_sampling_rate" in self.splats:
             max_sampling_rate = self.splats["max_sampling_rate"].detach()
@@ -1725,6 +1725,130 @@ class Runner:
             skyness_probs = torch.sigmoid(viewer_splats["skyness"])
             override_colors = skyness_to_colormap(skyness_probs).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
+        elif render_tab_state.render_mode == "grad2d_accum":
+            # Visualize accumulated gradient magnitudes
+            if "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None:
+                grad2d = self.strategy_state["grad2d_abs"].clone()
+                count = self.strategy_state["count"].clone()
+                # Average gradient per visibility count
+                avg_grad = torch.where(count > 0, grad2d / count.clamp_min(1), torch.zeros_like(grad2d))
+                override_colors = scalar_to_colormap(
+                    avg_grad,
+                    colormap=render_tab_state.colormap,
+                    inverse=render_tab_state.inverse,
+                    explicit_min=0.0,
+                    explicit_max=self.cfg.grow_grad2d * 2,  # Scale relative to grow threshold
+                ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            else:
+                # Fallback if no gradient data available
+                override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=self.device)
+        
+        elif render_tab_state.render_mode == "grad2d_count":
+            # Visualize visibility count (how many times each gaussian was visible)
+            if "count" in self.strategy_state and self.strategy_state["count"] is not None:
+                count = self.strategy_state["count"].clone()
+                override_colors = scalar_to_colormap(
+                    count,
+                    colormap=render_tab_state.colormap,
+                    inverse=render_tab_state.inverse,
+                    explicit_min=0,
+                    explicit_max=len(self.trainset),  # Max is number of training views
+                ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            else:
+                # Fallback if no count data available
+                override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=self.device)
+        
+        elif render_tab_state.render_mode == "gcr":
+            # Visualize Gradient Consistency Ratio (GCR) from GDAGS
+            if ("grad2d" in self.strategy_state and self.strategy_state["grad2d"] is not None and
+                "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None):
+                grad2d = self.strategy_state["grad2d"].clone()
+                grad2d_abs = self.strategy_state["grad2d_abs"].clone()
+                count = self.strategy_state["count"].clone()
+                # Average gradients per visibility count
+                avg_grad = torch.where(count > 0, grad2d / count.clamp_min(1), torch.zeros_like(grad2d))
+                avg_grad_abs = torch.where(count > 0, grad2d_abs / count.clamp_min(1), torch.zeros_like(grad2d_abs))
+                # Compute GCR = grad / grad_abs
+                gcr = (avg_grad + 1e-8) / (avg_grad_abs + 1e-8)
+                gcr = torch.clamp(gcr, 0.0, 1.0)  # Clamp to [0, 1]
+                override_colors = scalar_to_colormap(
+                    gcr,
+                    colormap=render_tab_state.colormap,
+                    inverse=render_tab_state.inverse,
+                    explicit_min=0.0,
+                    explicit_max=1.0,
+                ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            else:
+                # Fallback if no gradient data available
+                override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=self.device)
+        
+        elif render_tab_state.render_mode == "gdags_weight":
+            # Visualize GDAGS weight: w = 0.8 + 25 * (1 - GCR)^15
+            if ("grad2d" in self.strategy_state and self.strategy_state["grad2d"] is not None and
+                "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None):
+                grad2d = self.strategy_state["grad2d"].clone()
+                grad2d_abs = self.strategy_state["grad2d_abs"].clone()
+                count = self.strategy_state["count"].clone()
+                # Average gradients per visibility count
+                avg_grad = torch.where(count > 0, grad2d / count.clamp_min(1), torch.zeros_like(grad2d))
+                avg_grad_abs = torch.where(count > 0, grad2d_abs / count.clamp_min(1), torch.zeros_like(grad2d_abs))
+                # Compute GCR = grad / grad_abs
+                gcr = (avg_grad + 1e-8) / (avg_grad_abs + 1e-8)
+                gcr = torch.clamp(gcr, 0.0, 1.0)  # Clamp to [0, 1]
+                # Compute GDAGS weight
+                weight = 0.8 + 25 * torch.pow(1 - gcr, 15)
+                override_colors = scalar_to_colormap(
+                    weight,
+                    colormap=render_tab_state.colormap,
+                    inverse=render_tab_state.inverse,
+                    explicit_min=0.8,
+                    explicit_max=25.8,
+                ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            else:
+                # Fallback if no gradient data available
+                override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=self.device)
+        
+        elif render_tab_state.render_mode == "grad2d_gcr_combined":
+            # Combined visualization: grad2d_abs determines intensity, gcr determines hue
+            if ("grad2d" in self.strategy_state and self.strategy_state["grad2d"] is not None and
+                "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None):
+                grad2d = self.strategy_state["grad2d"].clone()
+                grad2d_abs = self.strategy_state["grad2d_abs"].clone()
+                count = self.strategy_state["count"].clone()
+                
+                # Average gradients per visibility count
+                avg_grad = torch.where(count > 0, grad2d / count.clamp_min(1), torch.zeros_like(grad2d))
+                avg_grad_abs = torch.where(count > 0, grad2d_abs / count.clamp_min(1), torch.zeros_like(grad2d_abs))
+                
+                # Compute GCR = grad / grad_abs
+                gcr = (avg_grad + 1e-8) / (avg_grad_abs + 1e-8)
+                gcr = torch.clamp(gcr, 0.0, 1.0)  # Clamp to [0, 1]
+                
+                # Normalize grad2d_abs to [0, 1]
+                grad_norm = torch.clamp(avg_grad_abs / (self.cfg.grow_grad2d * 2), 0.0, 1.0)
+                
+                # Create color mapping:
+                # Low grad_norm → pastel blue (0.7, 0.85, 1.0)
+                # High grad_norm + low gcr → pastel red (1.0, 0.7, 0.7)
+                # High grad_norm + high gcr → pastel green (0.7, 1.0, 0.7)
+                
+                # Base pastel blue
+                base_color = torch.tensor([0.3, 0.4, 1.0], device=self.device)
+                # Target colors based on gcr
+                red_color = torch.tensor([1.0, 0.3, 0.3], device=self.device)
+                green_color = torch.tensor([0.3, 1.0, 0.3], device=self.device)
+                
+                # Interpolate between red and green based on gcr
+                target_color = red_color * (1 - gcr).unsqueeze(-1) + green_color * gcr.unsqueeze(-1)
+                
+                # Interpolate between base and target based on grad_norm
+                colors = base_color * (1 - grad_norm).unsqueeze(-1) + target_color * grad_norm.unsqueeze(-1)
+                
+                override_colors = colors.unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            else:
+                # Fallback if no gradient data available
+                override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=self.device)
+        
         (
             render_colors,
             render_alphas,

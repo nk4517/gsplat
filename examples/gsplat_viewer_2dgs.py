@@ -139,7 +139,7 @@ class GsplatViewer(Viewer):
                     "Blur Modulation",
                     initial_value=self.render_tab_state.blur_mod,
                     min=0.1,
-                    max=2.0,
+                    max=10.0,
                     step=0.01,
                     hint="Blur modulation factor for AA-2DGS smoothing.",
                 )

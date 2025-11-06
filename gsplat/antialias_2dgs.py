@@ -376,11 +376,11 @@ def apply_flat_smoothing(scales: torch.Tensor, opacities: torch.Tensor, max_samp
         scales: [N, 3] - primitive scaling factors (s_uk, s_vk, unused)
                 Third component is preserved but not used in smoothing
         opacities: [N] - primitive opacities α_k
-        max_sampling_rate_sq: [N] Pre-computed max((f/d)^2) from all training cameras
-                          Represents squared maximal sampling rate
+        max_sampling_rate: [N] Pre-computed max(f/d) from all training cameras
+                           Represents maximum sampling rate
         s_reg: hyperparameter (typically 0.2 as per paper)
         focal: focal length of the current camera
-        f_orig: focal length of the training cameras
+        f_orig: focal length of the training cameras (for scaling max_sampling_rate)
         blur_mod: blur modulation factor (optional)
         threshold: threshold for relative change to skip smoothing (default 0.01)
 
@@ -399,19 +399,8 @@ def apply_flat_smoothing(scales: torch.Tensor, opacities: torch.Tensor, max_samp
         #                   This must be pre-computed based on training camera parameters
     """
 
-    sigma_smooth_sq = calc_sigma_sq(max_sampling_rate_sq, s_reg, focal, f_orig, blur_mod)
-    
-    # # Check if smoothing would be negligible
-    # # Compute relative change: sigma_smooth / min(s_u, s_v)
-    # sigma_smooth = torch.sqrt(sigma_smooth_sq)  # [N]
-    # min_scales = scales[:, :2].min(dim=1).values  # [N]
-    # relative_change = sigma_smooth / min_scales  # [N]
-    #
-    # # If all changes are below threshold, skip smoothing
-    # if (relative_change < threshold).all():
-    #     return scales, opacities
-    #
-    # print("apply scaling", torch.quantile(relative_change, 0.05), torch.quantile(relative_change, 0.95))
+    sigma_smooth_sq = calc_sigma_sq(max_sampling_rate, s_reg, focal, f_orig, blur_mod)
+
     return WorldSpaceFlatSmoothingKernel.apply(scales, opacities, sigma_smooth_sq)
 
 # # Проверка типа скомпилированной функции
@@ -451,7 +440,7 @@ def compute_max_sampling_rate_for_all_cams(
     device: torch.device | str
 ) -> torch.Tensor:
     """
-    Compute maximum sampling rate for each Gaussian across all training views.
+    Compute maximum sampling rate (f/d) for each Gaussian across all training views.
     
     Args:
         means: [N, 3] - 3D positions of Gaussians
@@ -464,18 +453,21 @@ def compute_max_sampling_rate_for_all_cams(
         device: Torch device
         
     Returns:
-        max_sampling_rate: [N] - Maximum (f/d) for each Gaussian across training views
+        max_sampling_rate: [N] - Maximum sampling rate (f/d) for each Gaussian across training views
     """
     N = means.shape[0]
     means = means.clone().detach().to(device)
 
-    # Initialize with zeros to find maximum
+    # Initialize with zero to find maximum
     max_sampling_rate = torch.zeros((N, 1), device=device)
     visibility_count = torch.zeros((N, 1), device=device)
 
     for K, width, height, viewmat in zip(Ks, widths, heights, viewmats):
         K = K.to(device)
         viewmat = viewmat.to(device)
+        
+        # Extract focal length (assuming fx ≈ fy for simplicity, or use average)
+        focal = (K[0, 0] + K[1, 1]) / 2.0
         
         # Transform points to camera space
         means_homo = torch.cat([means, torch.ones(N, 1, device=device)], dim=1)  # [N, 4]
@@ -489,31 +481,19 @@ def compute_max_sampling_rate_for_all_cams(
         )
 
         if visible.any():
-            # Compute sampling rate for visible Gaussians using real distances
-            visible_distances = distances[visible]
-
-            # Use average of fx and fy for more robust frequency estimation
-            fx = K[0, 0]
-            fy = K[1, 1]
-            focal = float((fx + fy) / 2.0)
-
-            # Compute (f/d) for each visible Gaussian
-            sampling_rate = focal / visible_distances  # [visible_count]
-            sampling_rate = sampling_rate.unsqueeze(1)  # [visible_count, 1]
+            # Compute sampling rate f/d for visible Gaussians
+            visible_sampling_rates = (focal / distances[visible]).unsqueeze(1)  # [visible_count, 1]
 
             # Update maximum sampling rate
-            max_sampling_rate[visible] = torch.maximum(max_sampling_rate[visible], sampling_rate)
+            max_sampling_rate[visible] = torch.maximum(max_sampling_rate[visible], visible_sampling_rates)
             visibility_count[visible] += 1
 
     # Handle Gaussians never visible in training views
     never_visible = visibility_count == 0
     if never_visible.any():
-        if (~never_visible).any():
-            default_sampling_rate = torch.max(max_sampling_rate[~never_visible])
-        else:
-            # Fallback if all gaussians are never visible
-            default_sampling_rate = 0
-        max_sampling_rate[never_visible] = default_sampling_rate
+        # Keep zero for never visible gaussians
+        # This will be handled in calc_sigma_sq to disable smoothing
+        pass
 
     return max_sampling_rate.squeeze(1)  # [N]
 
@@ -521,11 +501,11 @@ def compute_max_sampling_rate_for_all_cams(
 @torch.no_grad()
 def update_max_sampling_rate(
     splats: torch.nn.ParameterDict,
-    strategy_state: dict,
     trainset,
     near_plane: float,
     far_plane: float,
-    device: torch.device | str
+    device: torch.device | str,
+    strategy_state: dict = None
 ):
     """Compute maximum sampling rate for AA-2DGS smoothing.
     

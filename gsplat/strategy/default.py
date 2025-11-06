@@ -322,18 +322,18 @@ class DefaultStrategy(Strategy):
         # Reset epoch-based statistics at the start of each epoch
         n_gaussian = len(list(params.values())[0])
         device = list(params.values())[0].device
-        
+
         # Initialize epoch statistics block
         if "epoch_stats" not in state:
             state["epoch_stats"] = EpochStatistics(n_gaussian, device)
 
     @torch.no_grad()
     def _update_state(
-        self,
-        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-        state: Dict[str, Any],
-        info: Dict[str, Any],
-        packed: bool = False,
+            self,
+            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+            state: Dict[str, Any],
+            info: Dict[str, Any],
+            packed: bool = False,
     ):
         for key in [
             "width",
@@ -412,15 +412,23 @@ class DefaultStrategy(Strategy):
                 means = params["means"].unsqueeze(0)  # [1, N, 3]
                 distances = torch.norm(cam_positions - means, dim=2)  # [C, N]
                 
-                # Use imported update_depth_stats function
-                update_depth_stats(
-                    max_sampling_rate=state["epoch_stats"].max_sampling_rate,
-                    distances=distances, 
-                    radii=info["radii"], 
-                    Ks=info["Ks"], 
-                    gs_ids=gs_ids, 
-                    packed=packed
-                )
+                # Compute sampling rates f/d for each camera
+                # Extract focal lengths from camera intrinsics
+                Ks = info["Ks"]  # [C, 3, 3]
+                # Use average of fx and fy
+                focals = (Ks[:, 0, 0] + Ks[:, 1, 1]) / 2.0  # [C]
+                # Compute sampling rates f/d
+                sampling_rates = focals.unsqueeze(1) / distances  # [C, N]
+                
+                # Update max_sampling_rate tracking
+                # Use n_touched for visibility - accounts for transparency and actual pixel coverage
+                if "n_touched" in info:
+                    visible_mask = info["n_touched"] > 0  # [C, N] or [N] - gaussians that touched at least one pixel
+                else:
+                    # Fallback to radii if n_touched not available
+                    visible_mask = info["radii"][..., 0] > 0
+                state["epoch_stats"].update_max_sampling_rate(sampling_rates, visible_mask)
+
             # ========== End of epoch-based statistics block ==========
 
     @torch.no_grad()
@@ -440,7 +448,7 @@ class DefaultStrategy(Strategy):
         is_split = torch.zeros(n_before, dtype=torch.bool, device=device)
         is_split_huge = torch.zeros(n_before, dtype=torch.bool, device=device)
         is_dupli = torch.zeros(n_before, dtype=torch.bool, device=device)
-        
+
         # Filter out sky gaussians if skyness is available
         is_not_sky = torch.ones(n_before, dtype=torch.bool, device=device)
         if "skyness" in params:
@@ -460,30 +468,43 @@ class DefaultStrategy(Strategy):
         n_dupli = is_dupli.sum().item()
 
         # is_large = ~is_small
-        # is_split = is_grad_high & is_large
-        # if step < self.refine_scale2d_stop_iter:
+
+        # is_dupli |= is_grad_high_for_split
+        # if self.refine_scale2d_stop_iter > 0 and step < self.refine_scale2d_stop_iter:
         #     is_split |= state["radii"] > self.grow_scale2d
-        
+
+        # is_dupli = stoch1(is_dupli, 0.33)
+
+        n_dupli = is_dupli.sum().item()
+
         # Split gaussians that dominate too many pixels (using current epoch statistics)
         if "epoch_stats" in state and hasattr(state["epoch_stats"], "max_touchedPct"):
             # Use split_n for very large gaussians (> 2% of image)
-            is_split_huge = (state["epoch_stats"].max_touchedPct > 0.005) & is_not_sky
-            is_split_huge |= (state["epoch_stats"].max_touchedPct > 0.05) & is_certain_sky
-            
+            # is_split_huge = (state["epoch_stats"].max_touchedPct > 0.005) & is_not_sky
+            # is_split_huge |= (state["epoch_stats"].max_touchedPct > 0.05) & is_certain_sky
+
             # Use regular split for moderately large gaussians
             split_by_domination = (state["epoch_stats"].max_dominatedPct > self.split_big_dominated_pct) & ~is_split_huge
             split_by_big_touch = ((state["epoch_stats"].max_touchedPct > self.split_big_touched_pct) & ~split_by_domination) & is_not_sky
-            split_by_big_touch |= ((state["epoch_stats"].max_touchedPct > self.split_big_touched_pct*10) & ~split_by_domination) & is_certain_sky
+            split_by_big_touch |= ((state["epoch_stats"].max_touchedPct > self.split_big_touched_pct * 10) & ~split_by_domination) & is_certain_sky
 
             print("split_n by huge touch pct:", is_split_huge.sum().item())
             print("split by domination pct:", split_by_domination.sum().item())
             print("split by touch pct:", split_by_big_touch.sum().item())
             
-            is_split |= split_by_domination | split_by_big_touch
-        
+            is_split |= split_by_domination
+            is_split_huge |= split_by_big_touch
+
+            is_large = state["epoch_stats"].max_touchedPct > self.split_big_touched_pct / 5
+
+            is_split |= is_grad_high_for_split & ~is_large
+
+
         # Apply skyness filter to splitting
         # is_split = is_split & is_not_sky[:len(is_split)]
         # is_split_huge = is_split_huge & is_not_sky[:len(is_split_huge)]
+
+        # is_split = stoch1(is_split, 0.33)
         
         n_split = is_split.sum().item()
         n_split_huge = is_split_huge.sum().item()
@@ -494,39 +515,46 @@ class DefaultStrategy(Strategy):
             # Resize epoch statistics after duplication
 
         # new GSs added by duplication will not be split
-        is_split = torch.cat(
-            [
-                is_split,
-                torch.zeros(n_dupli, dtype=torch.bool, device=device),
-            ]
-        )
+
         is_split_huge = torch.cat(
             [
                 is_split_huge,
-                torch.zeros(n_dupli, dtype=torch.bool, device=device),
+                torch.zeros(len(params["opacities"]) - len(is_split_huge), dtype=torch.bool, device=device),
             ]
         )
 
         # then split_n for very large gaussians
         HUGE_SPLIN_COUNT = 16
         if n_split_huge > 0:
-            split(
+            split_n_2dgs(
                 params=params,
                 optimizers=optimizers,
                 state=state,
                 mask=is_split_huge,
                 revised_opacity=self.revised_opacity,
-                N=HUGE_SPLIN_COUNT
+                n_splits=6,
+                size_scale=0.6,
+                distribution_scale=0.8,
             )
+
+        is_split = torch.cat(
+            [
+                is_split,
+                torch.zeros(len(params["opacities"]) - len(is_split), dtype=torch.bool, device=device),
+            ]
+        )
 
         # then regular split
         if n_split > 0:
-            split(
+            split_n_2dgs(
                 params=params,
                 optimizers=optimizers,
                 state=state,
                 mask=is_split,
                 revised_opacity=self.revised_opacity,
+                n_splits=2,
+                size_scale=0.5,
+                distribution_scale=0.6,
             )
 
         n_after = len(params["opacities"])

@@ -74,13 +74,13 @@ class Config:
 
     # Path to the Mip-NeRF 360 dataset
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube05\towel"
-    data_dir: str = r"X:\_ai\_gsplat\datasets\garden"
+    # data_dir: str = r"X:\_ai\_gsplat\datasets\garden"
     # data_dir: str = r"x:\_ai\_gsplat\datasets\bicycle"
-    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\mip360\kitchen"
+    # data_dir: str = r"X:\_ai\_gsplat\datasets\kitchen"
     # data_dir: str = r"x:\_ai\_gsplat\datasets\fb_colmap_res"
     # data_dir: str = r"y:\_gopro_kv92\extracted_keyframes\GOPR6996_colmap"
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
-    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
+    data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
     # data_dir: str = r"x:\_ai\_glomap\data\south-building"
     # Downsample factor for the dataset
     data_factor: int = 4
@@ -96,7 +96,7 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # Preload all images into memory for faster training
-    preload_images: bool = False
+    preload_images: bool = True
 
     # Port for the viewer server
     port: int = 8080
@@ -138,7 +138,7 @@ class Config:
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.05
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float = 0.0008
+    grow_grad2d: float = 0.0002
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
@@ -207,13 +207,13 @@ class Config:
     # Learning rate for skyness attribute
     skyness_lr: float = 0.01
     # Regularization weight for skyness
-    skyness_reg: float = 0.01
+    skyness_reg: float = 0.1
     # Enable skyness supervision from sky masks
     skyness_supervision: bool = True
     # Weight for skyness supervision loss
-    skyness_supervision_lambda: float = 0.1
+    skyness_supervision_lambda: float = 0.5
     # Weight for skysphere deviation loss
-    skysphere_radius_reg: float = 0.05
+    skysphere_radius_reg: float = 0.5
 
     # Enable depth loss. (experimental)
     depth_loss: bool = True
@@ -242,13 +242,13 @@ class Config:
     opacity_entropy_start_iter: int = 1_000
 
     # Elongation regularization (penalizes stretched gaussians)
-    elongation_loss: bool = True
+    elongation_loss: bool = False
     # Weight for elongation loss
-    elongation_lambda: float = 1e-3
+    elongation_lambda: float = 1e-2
     # Threshold for elongation ratio (penalty starts after this ratio)
     elongation_threshold: float = 4.0
     # Iteration to start elongation regularization
-    elongation_start_iter: int = 1_000
+    elongation_start_iter: int = 0
 
     # Scale percentile regularization (penalizes extreme sizes)
     scale_percentile_loss: bool = False
@@ -297,8 +297,8 @@ class Config:
     importance_prune_ratio: float = 0.005  # Fraction to prune (0.3 = remove 30% least important)
 
     # Split parameters for gaussians that dominate or touch too many pixels
-    split_big_dominated_pct: float = 0.0005  # Split gaussians dominating more than this percentage of pixels
-    split_big_touched_pct: float = 0.001  # Split gaussians touching more than this percentage of pixels
+    split_big_dominated_pct: float = 0.001  # Split gaussians dominating more than this percentage of pixels in one view
+    split_big_touched_pct: float = 0.0025  # Split gaussians touching more than this percentage of pixels in one view
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -374,7 +374,7 @@ def create_splats_with_optimizers(
         # name, value, lr
         ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
-        ("quats", torch.nn.Parameter(quats), 1e-3),
+        ("quats", torch.nn.Parameter(quats), 5e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
         ("skyness", torch.nn.Parameter(skyness), skyness_lr),
         # max_sampling_rate doesn't need gradients or optimizer (marked with None lr)
@@ -647,11 +647,10 @@ class Runner:
         if cfg.use_aa_smoothing:
             update_max_sampling_rate(
                 self.splats,
-                self.strategy_state,
                 self.trainset,
                 self.cfg.near_plane,
                 self.cfg.far_plane,
-                self.device
+                self.device,
             )
 
         # Losses & Metrics.
@@ -958,11 +957,6 @@ class Runner:
 
             # Call batch start callback at the beginning of each epoch
             if epoch_ctx.epoch_start:
-                # # нужно до сброса. и оно до начала тренировки высчитывается
-                # # Recompute compute_min_depth_normalized_sq for AA-2DGS at the beginning of each epoch
-                # if self.cfg.use_aa_smoothing and epoch_ctx.i_epoch > 0 and epoch_ctx.i_epoch % self.cfg.aa_compute_every == 0:
-                #     self._compute_max_sampling_rate_sq()
-
                 self.cfg.strategy.step_epoch_start(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -1011,7 +1005,6 @@ class Runner:
 
             # Prepare extra features for rendering (e.g., skyness)
             extra_features = None
-            sky_mask_rendered = None
             if cfg.skysphere_enabled:
                 # Add skyness as extra feature to be rendered alongside colors
                 skyness_values = torch.sigmoid(self.splats["skyness"]).unsqueeze(-1)  # [N, 1]
@@ -1189,14 +1182,11 @@ class Runner:
                     curr_elongation_lambda = cfg.elongation_lambda
                 else:
                     curr_elongation_lambda = 0.0
-                # Calculate elongation ratio (max scale / min scale for each gaussian)
-                activated_scales = scaling_activation(self.splats["scales"])[..., :2]  # [N, 3]
-                max_scales, _ = activated_scales.max(dim=1)  # [N]
-                min_scales, _ = activated_scales.min(dim=1)  # [N]
-                elongation_ratio = max_scales / (min_scales + 1e-8)  # [N] - avoid division by zero
-                
-                # Apply quadratic penalty for ratios above threshold
-                excess_ratio = torch.clamp(elongation_ratio - cfg.elongation_threshold, min=0.0)
+                # Calculate elongation in log space (scales are stored in log form)
+                log_scales = self.splats["scales"][..., :2]  # [N, 2] - 2DGS, only x,y scales (no activation)
+                log_elongation_ratio = torch.abs(log_scales[:, 0] - log_scales[:, 1])  # [N] - abs(log_x - log_y) = log(max/min)
+
+                excess_ratio = torch.clamp(torch.exp(log_elongation_ratio) - cfg.elongation_threshold, min=0.0)
                 elongation_loss = (excess_ratio ** 2).mean()
                 loss += elongation_loss * curr_elongation_lambda
 

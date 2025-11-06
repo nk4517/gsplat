@@ -134,6 +134,12 @@ class DefaultStrategy(Strategy):
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
     split_big_dominated_pct: float = 0.0005  # Split gaussians dominating more than this percentage of pixels
     split_big_touched_pct: float = 0.001  # Split gaussians touching more than this percentage of pixels
+    # Importance-based pruning parameters (Speedy-Splat style)
+    importance_prune_enabled: bool = False  # Enable importance-based pruning
+    importance_prune_start_epoch: int = 200  # Start importance pruning after this epoch
+    importance_prune_end_epoch: int = 500  # Stop importance pruning after this epoch
+    importance_prune_every_epochs: int = 50  # Perform importance pruning every this many epochs
+    importance_prune_ratio: float = 0.3  # Fraction of gaussians to prune based on importance (0.3 = remove 30% least important)
 
     @torch.no_grad()
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
@@ -146,10 +152,12 @@ class DefaultStrategy(Strategy):
         # put them on the correct device.
         # - grad2d: running accum of the norm of the image plane gradients for each GS.
         # - count: running accum of how many time each GS is visible.
+        # - importance: running accum of importance scores (vG^2) for each GS.
         # - radii: the radii of the GSs (normalized by the image resolution).
         state = {
             "grad2d": None, 
             "count": None, 
+            "importance": None,  # For importance-based pruning (vG^2)
             "scene_scale": scene_scale,
             "last_reset_epoch": -1000,
         }
@@ -289,6 +297,7 @@ class DefaultStrategy(Strategy):
             # reset running stats
             state["grad2d"].zero_()
             state["count"].zero_()
+            state["importance"].zero_()
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
             torch.cuda.empty_cache()
@@ -334,6 +343,8 @@ class DefaultStrategy(Strategy):
         # normalize grads to [-1, 1] screen space
         if self.absgrad:
             grads = info[self.key_for_gradient].absgrad.clone()
+            # Take element 4 for importance (vG^2)
+            importance_grads = gradient_2dgs[..., 4:5]
         else:
             grads = info[self.key_for_gradient].grad.clone()
         grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
@@ -346,6 +357,8 @@ class DefaultStrategy(Strategy):
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
         if state["count"] is None:
             state["count"] = torch.zeros(n_gaussian, device=grads.device)
+        if state["importance"] is None:
+            state["importance"] = torch.zeros(n_gaussian, device=grads.device)
         if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
             assert "radii" in info, "radii is required but missing."
             state["radii"] = torch.zeros(n_gaussian, device=grads.device)
@@ -360,8 +373,10 @@ class DefaultStrategy(Strategy):
             sel = (info["radii"] > 0.0).all(dim=-1)  # [C, N]
             gs_ids = torch.where(sel)[1]  # [nnz]
             grads = grads[sel]  # [nnz, 2]
+            importance_grads = importance_grads[sel]  # [nnz, 1]
             radii = info["radii"][sel].max(dim=-1).values  # [nnz]
         state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+        state["importance"].index_add_(0, gs_ids, importance_grads.squeeze(-1))
         state["count"].index_add_(
             0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
         )
@@ -380,6 +395,7 @@ class DefaultStrategy(Strategy):
                     n_touched=info["n_touched"], n_dominated=info["n_dominated"],
                     width=info["width"], height=info["height"],
                     gs_ids=gs_ids, packed=packed)
+
 
             # Update minimum depth statistics if available
             if "camtoworlds" in info and "Ks" in info:
@@ -571,17 +587,16 @@ class DefaultStrategy(Strategy):
         if (self.importance_prune_enabled and
                 self.importance_prune_start_epoch <= epoch_ctx.i_epoch < self.importance_prune_end_epoch and
             epoch_ctx.i_epoch % self.importance_prune_every_epochs == 0 and
-            "epoch_stats" in state and
-            hasattr(epoch_stats, "scores_grad_accum")):
+            "importance" in state and state["importance"] is not None):
 
-            scores = epoch_stats.scores_grad_accum
-            n_cameras = epoch_stats.n_cameras_visible_from
+            scores = state["importance"]
+            count = state["count"]
 
             # Normalize scores by number of cameras where gaussian was visible
             # to avoid bias against gaussians visible in fewer views
             normalized_scores = torch.where(
-                n_cameras > 0,
-                scores / n_cameras.float(),
+                count > 0,
+                scores / count.clamp_min(1),
                 torch.zeros_like(scores)
             )
 

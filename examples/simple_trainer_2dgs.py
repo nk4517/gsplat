@@ -779,6 +779,10 @@ class Runner:
         scales = scaling_activation(splats["scales"])  # [N, 3]
         opacities = opacity_activation(splats["opacities"])  # [N,]
 
+        drop_rate = kwargs.pop("drop_rate", None)
+        if drop_rate is not None:
+            opacities = F.dropout(opacities, p=drop_rate, training=True)
+
         # Check for non-finite values before rasterization
         param_checks = [
             ("means", means),
@@ -853,7 +857,7 @@ class Runner:
                 width=width,
                 height=height,
                 packed=self.cfg.packed,
-                absgrad=self.cfg.absgrad,
+                # absgrad=self.cfg.absgrad, # для gsplat2dgs он всегда считается
                 sparse_grad=self.cfg.sparse_grad,
                 **kwargs,
             )
@@ -1010,6 +1014,9 @@ class Runner:
                 skyness_values = torch.sigmoid(self.splats["skyness"]).unsqueeze(-1)  # [N, 1]
                 extra_features = skyness_values
 
+            gamma = 0.2  # Scaling factor из статьи arXiv:2504.00773
+            drop_rate = gamma * (step / max_steps)
+
             # forward
             (
                 renders,
@@ -1032,6 +1039,7 @@ class Runner:
                 distloss=self.cfg.dist_loss,
                 track_domination=True,
                 extra_features=extra_features,  # Pass extra features to render
+                drop_rate=drop_rate,
             )
 
             # Extract rendered skyness mask if available

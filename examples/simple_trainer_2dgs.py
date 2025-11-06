@@ -2024,6 +2024,29 @@ class Runner:
                 # Fallback if no gradient data available
                 override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=self.device)
         
+        elif render_tab_state.render_mode == "importance":
+            # Visualize importance (vG^2) from accumulated gradients
+            if "importance" in self.strategy_state and self.strategy_state["importance"] is not None:
+                importance = self.strategy_state["importance"].clone()
+                count = self.strategy_state["count"].clone()
+                
+                # Normalize by number of cameras where gaussian was visible
+                avg_importance = torch.where(count > 0, importance / count.clamp_min(1), torch.zeros_like(importance))
+                #
+                # Use logarithmic scale for better visualization
+                log_importance = torch.log10(avg_importance + 1e-10)
+                
+                override_colors = scalar_to_colormap(
+                    avg_importance,
+                    colormap=render_tab_state.colormap,
+                    inverse=render_tab_state.inverse,
+                    # explicit_min=-6,  # 10^-6
+                    # explicit_max=-2,  # 10^-2
+                ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            else:
+                # Fallback if no importance data available
+                override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=self.device)
+        
         (
             render_colors,
             render_alphas,

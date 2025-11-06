@@ -1669,10 +1669,8 @@ class Runner:
         override_colors = None
         overmax_opacity = None
 
-        if render_tab_state.render_mode == "max_sampling_rate" and "max_sampling_rate_sq" in self.strategy_state:
-            max_sampling_rate_sq = self.strategy_state["max_sampling_rate_sq"].clone().detach()
-            # Take square root to get actual sampling rate
-            max_sampling_rate = torch.sqrt(max_sampling_rate_sq)
+        if render_tab_state.render_mode == "max_sampling_rate" and "max_sampling_rate" in self.splats:
+            max_sampling_rate = self.splats["max_sampling_rate"].detach()
             override_colors = scalar_to_colormap(
                 max_sampling_rate,
                 colormap=render_tab_state.colormap,
@@ -1682,22 +1680,22 @@ class Runner:
             ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
         elif render_tab_state.render_mode == "accumulated_max_sampling_rate":
-            # Use accumulated max sampling rate from epoch statistics if available
+            # Use accumulated max_sampling_rate from epoch statistics if available
             if "epoch_stats" in self.strategy_state and hasattr(self.strategy_state["epoch_stats"], "max_sampling_rate"):
-                accumulated_rate = self.strategy_state["epoch_stats"].max_sampling_rate.clone().detach()
+                accumulated_max_sampling = self.strategy_state["epoch_stats"].max_sampling_rate.clone().detach()
                 override_colors = scalar_to_colormap(
-                    accumulated_rate,
+                    accumulated_max_sampling,
                     colormap=render_tab_state.colormap,
                     inverse=render_tab_state.inverse,
                     explicit_min=10,
                     explicit_max=1000,
                 ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
-        elif render_tab_state.render_mode == "sigma_smooth" and "max_sampling_rate_sq" in self.strategy_state:
-            max_sampling_rate_sq = self.strategy_state["max_sampling_rate_sq"].clone().detach()
+        elif render_tab_state.render_mode == "sigma_smooth" and "max_sampling_rate" in self.splats:
+            max_sampling_rate = self.splats["max_sampling_rate"].clone().detach()
             # Calculate smoothing sigma squared
             # изменения вблизи очень слабозаметны, хотя и применяются правильно
-            sigma_smooth = torch.sqrt(calc_sigma_sq(max_sampling_rate_sq, self.cfg.aa_smoothing_reg, focal, f_orig))
+            sigma_smooth = torch.sqrt(calc_sigma_sq(max_sampling_rate, self.cfg.aa_smoothing_reg, focal, f_orig))
             scales = scaling_activation(viewer_splats["scales"])  # [N, 3]
             min_scales = scales[:, :2].min(dim=1).values  # [N]
             relative_change = sigma_smooth / min_scales  # [N]

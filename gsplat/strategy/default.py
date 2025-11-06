@@ -8,7 +8,7 @@ from .base import Strategy, EpochContext, StateWrapper
 from .ops import (
     duplicate, remove, reset_opa, split, split_n_2dgs, opacity_activation, scaling_activation
 )
-from ..antialias_2dgs import update_depth_stats, update_max_sampling_rate
+from ..antialias_2dgs import update_max_sampling_rate
 
 
 def _accumulate_by_ids(
@@ -230,17 +230,16 @@ class DefaultStrategy(Strategy):
 
 
         # нужно вызывать именно здесь. после последнего обновления статов но до opacity/refine/prune
-        # Recompute max_sampling_rate_sq for AA-2DGS at the end of epoch
         if epoch_ctx.i_epoch > 0 and "aa_params" in info:
             aa_params = info["aa_params"]
             if epoch_ctx.i_epoch % aa_params["aa_compute_every"] == 0:
                 update_max_sampling_rate(
                     params,
-                    state,
                     aa_params["trainset"],
                     aa_params["near_plane"],
                     aa_params["far_plane"],
-                    aa_params["device"]
+                    aa_params["device"],
+                    state,
                 )
 
         # Check if we should reset opacities at this epoch

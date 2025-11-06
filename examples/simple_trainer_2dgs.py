@@ -17,7 +17,7 @@ print("import 111")
 
 from examples.lib_compose import CompositingOrder, compose_renders
 
-from examples.lib_skysphere import reproject_skysphere, compute_skysphere_geometry
+from examples.lib_skysphere import compute_skysphere_geometry
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 
@@ -351,7 +351,10 @@ def create_splats_with_optimizers(
     scales = scaling_inverse_activation(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = opacity_inverse_activation(torch.full((N,), init_opacity))  # [N,]
-    
+
+    # Initialize max_sampling_rate as zero (will be computed later if AA is enabled)
+    max_sampling_rate = torch.zeros((N,))  # [N,] - maximum sampling rate for AA-2DGS
+
     # SKYNESS SYSTEM:
     # Skyness is a learnable per-gaussian attribute that indicates whether a gaussian belongs to the sky/background.
     # It's stored in logit space (before sigmoid) for stable optimization:
@@ -374,6 +377,8 @@ def create_splats_with_optimizers(
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
         ("skyness", torch.nn.Parameter(skyness), skyness_lr),
+        # max_sampling_rate doesn't need gradients or optimizer (marked with None lr)
+        ("max_sampling_rate", torch.nn.Parameter(max_sampling_rate, requires_grad=False), None),
     ]
 
     if feature_dim is None:
@@ -712,6 +717,9 @@ class Runner:
             new_sh0[:, 0, :] = rgb_to_sh(new_colors)
             new_shN = torch.zeros((N_sky, (self.cfg.sh_degree + 1) ** 2 - 1, 3), device=device)
             
+            # Initialize max_sampling_rate for new points
+            new_max_sampling_rate = torch.zeros((N_sky,), device=device)
+            
             # Update skyness for existing points to indicate they're likely world objects (25% probability)
             # when skysphere is added
             existing_skyness = self.splats["skyness"].data
@@ -738,6 +746,10 @@ class Runner:
             )
             self.splats["shN"] = torch.nn.Parameter(
                 torch.cat([self.splats["shN"], new_shN], dim=0)
+            )
+            self.splats["max_sampling_rate"] = torch.nn.Parameter(
+                torch.cat([self.splats["max_sampling_rate"], new_max_sampling_rate], dim=0),
+                requires_grad=False
             )
             
             # Update optimizers with new parameters
@@ -807,17 +819,18 @@ class Runner:
             cfg_aa = self.cfg.use_aa_smoothing
             gui_aa = rasterize_mode == "antialiased"
             not_gui = rasterize_mode is None
-            if (gui_aa or (not_gui and cfg_aa)) and "max_sampling_rate_sq" in self.strategy_state:
+            if cfg_aa:
+                if (gui_aa or (not_gui and cfg_aa)) and "max_sampling_rate" in self.splats:
 
-                # Get focal length from K matrix
-                focal = float((Ks[0, 0, 0] + Ks[0, 1, 1]) / 2.0)
-                if f_orig is None:
-                    f_orig = focal
+                    # Get focal length from K matrix
+                    focal = float((Ks[0, 0, 0] + Ks[0, 1, 1]) / 2.0)
+                    if f_orig is None:
+                        f_orig = focal
 
-                # Apply AA-2DGS smoothing
-                scales, opacities = apply_flat_smoothing(
-                    scales, opacities, self.strategy_state["max_sampling_rate_sq"],
-                    s_reg=self.cfg.aa_smoothing_reg, focal=focal, f_orig=f_orig, blur_mod=blur_mod)
+                    # Apply AA-2DGS smoothing
+                    scales, opacities = apply_flat_smoothing(
+                        scales, opacities, self.splats["max_sampling_rate"].detach(),
+                        s_reg=self.cfg.aa_smoothing_reg, focal=focal, f_orig=f_orig, blur_mod=blur_mod)
 
             if overmax_opacity:  # self._scale_modifier <= 0.02:
                 opacities = torch.full_like(opacities, fill_value=1e3)
@@ -2077,6 +2090,10 @@ def main(cfg: Config):
                 runner.splats[k].data = ckpt["splats"][k]
             elif k == "skyness" and k not in ckpt["splats"]:
                 # Initialize skyness if not in checkpoint
+                N = len(runner.splats["means"])
+                runner.splats[k].data = torch.zeros(N, device=runner.device)
+            elif k == "max_sampling_rate" and k not in ckpt["splats"]:
+                # Initialize max_sampling_rate if not in checkpoint
                 N = len(runner.splats["means"])
                 runner.splats[k].data = torch.zeros(N, device=runner.device)
         runner.eval(step=ckpt["step"])

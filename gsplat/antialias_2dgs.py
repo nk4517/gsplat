@@ -181,14 +181,10 @@ class WorldSpaceFlatSmoothingKernel(torch.autograd.Function):
 
 
 @torch.no_grad()
-def calc_sigma_sq(max_sampling_rate_sq: torch.Tensor, s_reg: float, focal: float | None = None, f_orig: float | None = None, blur_mod: float | None = None) -> torch.Tensor:
+def calc_sigma_sq(max_sampling_rate: torch.Tensor, s_reg: float, focal: float | None = None, f_orig: float | None = None, blur_mod: float | None = None) -> torch.Tensor:
     # T̂ = 1/ν̂ = d/f
     # ν̂_k = max((1_n(p_k) · f_n / d_n))
-    # σ²_smooth = s_reg / ν̂²_max = s_reg × d²_min / f²
-
-    # При использовании нескольких камер с разными фокусными расстояниями следует использовать не просто минимальное расстояние,
-    # а пару (d_min, f_corresponding), чтобы корректно вычислить максимальную частоту дискретизации,
-    # которая определяет необходимую степень сглаживания для предотвращения алиасинга.
+    # σ²_smooth = s_reg / ν̂²_max
 
     # Sampling rate = f/z в pinhole модели камеры представляет собой коэффициент масштабирования между мировым и пиксельным пространством на глубине z.
     #
@@ -202,21 +198,6 @@ def calc_sigma_sq(max_sampling_rate_sq: torch.Tensor, s_reg: float, focal: float
     # Объекты ближе к камере имеют больший sampling rate - выше детализация
     # Объекты дальше от камеры имеют меньший sampling rate - ниже детализация
     # Критичен для алгоритмов рендеринга и 3D реконструкции для определения уровня детализации (LOD)
-
-    # Sampling rate f/d:
-    # Плотность дискретизации (пикселей на единицу длины)
-    # Чем больше значение - тем выше разрешение
-    # Единицы: пиксели/мировой юнит
-    #
-    # Sampling interval T̂ = d/f:
-    # Интервал дискретизации (физический размер одного пикселя)
-    # Чем меньше значение - тем выше разрешение
-    # Единицы: мировые юниты/пиксель
-    #
-    # Физический смысл T̂:
-    # Размер "отпечатка" одного пикселя в мировом пространстве на расстоянии d
-    # Минимальное расстояние между различимыми деталями
-    # Шаг дискретизации вдоль луча для избежания алиасинга
 
     # Для широкоугольных объективов f/z и f/d существенно отличаются на краях изображения.
     #
@@ -258,36 +239,19 @@ def calc_sigma_sq(max_sampling_rate_sq: torch.Tensor, s_reg: float, focal: float
     # Физический смысл d_k - геометрическая характеристика примитива, не зависящая от параметров камеры
 
     # From AA-2DGS Eq. (8): ν̂_k = max{f_n/d_n} over training views
-    # Therefore: ν̂²_k = max_sampling_rate_sq
+    # With max_sampling_rate = max{f_n/d_n}, we have:
+    # σ²_smooth,k = s_reg / ν̂²_k = s_reg / max_sampling_rate²
 
-    # Original formula from paper: σ²_smooth,k = s_reg / ν̂²_k
-    # With max_sampling_rate_sq = ν̂²_k, we have:
-
-    # Adaptation to new camera with focal length 'focal':
-    # New sampling frequency: ν̂_k_new = focal / d_k
-    # Required filter variance: σ²_smooth,k_new = s_reg / (focal/d_k)² = s_reg * d²_k / focal²
-
-    # The max_sampling_rate_sq represents (f_orig/d_min)² from training cameras
-    # For a new camera with focal length 'focal', we need to scale appropriately:
-    # - Training: σ²_train = s_reg / (f_orig/d_min)²
-    # - New camera: σ²_new = s_reg / (focal/d_min)²
-    #
-    # Assuming max_sampling_rate_sq is normalized to unit focal length,
-    # we scale by 1/focal² to account for the new sampling frequency
-
-    # scale = 1 / (focal ** 2)
-    # mult = float(s_reg * scale)
-
-    # For gaussians never visible in training views (max_sampling_rate_sq == 0),
+    # For gaussians never visible in training views (max_sampling_rate == 0),
     # set sigma_smooth_sq = 0 to disable smoothing
-    # For visible gaussians, compute as usual: σ²_smooth,k = s_reg / ν̂²_k
+    # For visible gaussians, compute as usual: σ²_smooth,k = s_reg / max_sampling_rate²
 
     # σ²smooth,k,0 = sreg · d²/f₀²
     # σ²smooth,k,1 = sreg · d²/f₁²
     # σ²smooth,k,1 = σ²smooth,k,0 · (f₀/f₁)²
 
     if focal and f_orig:
-        mult_sq = s_reg * ((focal / f_orig) ** 2)
+        mult_sq = s_reg * (focal / f_orig)
     else:
         mult_sq = s_reg
 
@@ -295,9 +259,9 @@ def calc_sigma_sq(max_sampling_rate_sq: torch.Tensor, s_reg: float, focal: float
         mult_sq *= blur_mod ** 2
 
     sigma_smooth_sq = torch.where(
-        max_sampling_rate_sq > 0,
-        mult_sq / max_sampling_rate_sq,
-        torch.zeros_like(max_sampling_rate_sq)
+        max_sampling_rate > 0,
+        mult_sq / (max_sampling_rate ** 2),
+        torch.zeros_like(max_sampling_rate)
     )  # [N]
 
     return sigma_smooth_sq
@@ -398,73 +362,7 @@ def compute_distances_and_frustum_mask(
     return distances, visible
 
 
-@torch.no_grad()
-def update_depth_stats(
-        max_sampling_rate: torch.Tensor,
-        distances: torch.Tensor,
-        radii: torch.Tensor,
-        Ks: torch.Tensor,
-        gs_ids: torch.Tensor, 
-        packed: bool,
-):
-    """Update maximum sampling rate statistics for AA-2DGS.
-    
-    Args:
-        max_sampling_rate: [N] - Tensor to accumulate max sampling rates
-        distances: Euclidean distances from camera to gaussian centers [C, N]
-        radii: Radii of gaussians for visibility check [C, N, 2]
-        Ks: Camera intrinsic matrix [C, 3, 3] or [3, 3]
-        gs_ids: Gaussian IDs that were rendered
-        packed: Whether the data is in packed format
-    """
-    # Validation checks first
-    if packed:
-        raise NotImplementedError("Packed format not supported for update_depth_stats")
-    
-    if distances.dim() != 2:
-        raise NotImplementedError(f"distances must be [C, N], got shape {distances.shape}")
-    
-    if radii.dim() != 3 or radii.shape[-1] != 2:
-        raise NotImplementedError(f"radii must be [C, N, 2], got shape {radii.shape}")
-    
-    device = max_sampling_rate.device
-    n_gaussian = max_sampling_rate.shape[0]
-    
-    # radii is [C, N, 2]
-    visible_mask = radii[..., 0] > 0  # [C, N]
-    
-    if not visible_mask.any():
-        return
-    
-    # Extract focal length
-    if Ks.dim() == 3:  # [C, 3, 3] - one K per camera
-        focal = (Ks[:, 0, 0] + Ks[:, 1, 1]) / 2.0  # [C]
-        focal = focal.unsqueeze(1)  # [C, 1] for broadcasting
-    elif Ks.dim() == 2:  # [3, 3] - single K for all cameras
-        focal = float((Ks[0, 0] + Ks[1, 1]) / 2.0)
-    
-    # Compute sampling rate (focal / distance) for each camera
-    sampling_rate = focal / distances  # [C, N]
-    
-    # Set non-visible to 0 before taking maximum
-    sampling_rate = torch.where(
-        visible_mask,
-        sampling_rate,
-        torch.zeros_like(sampling_rate)
-    )
-    
-    # Take maximum across cameras
-    sampling_rate = sampling_rate.max(dim=0).values  # [N]
-    
-    # Update only gaussians that are visible from at least one camera
-    any_visible = visible_mask.any(dim=0)  # [N]
-    max_sampling_rate[any_visible] = torch.maximum(
-        max_sampling_rate[any_visible],
-        sampling_rate[any_visible]
-    )
-
-
-def apply_flat_smoothing(scales: torch.Tensor, opacities: torch.Tensor, max_sampling_rate_sq: torch.Tensor,
+def apply_flat_smoothing(scales: torch.Tensor, opacities: torch.Tensor, max_sampling_rate: torch.Tensor,
                          s_reg: float = 0.2, focal: float = None, f_orig: float | None = None, blur_mod: float | None = None, threshold: float = 0.01) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies world-space flat smoothing kernel to 2D Gaussian primitives.
@@ -629,26 +527,29 @@ def update_max_sampling_rate(
     far_plane: float,
     device: torch.device | str
 ):
-    """Compute maximum sampling rate squared for AA-2DGS smoothing.
+    """Compute maximum sampling rate for AA-2DGS smoothing.
     
     Args:
-        splats: ParameterDict containing gaussian parameters
-        strategy_state: Strategy state dictionary to update
+        splats: ParameterDict containing gaussian parameters (including max_sampling_rate)
         trainset: Training dataset with camera parameters
         near_plane: Near clipping plane distance
         far_plane: Far clipping plane distance
         device: Torch device
+        strategy_state: Optional strategy state dictionary (for backward compatibility)
     """
+
+    if "max_sampling_rate" not in splats:
+        return
+
     last_epoch_max_sampling_rate = None
     last_epoch_valid_mask = None
 
-    if "epoch_stats" in strategy_state:
-        assert hasattr(strategy_state["epoch_stats"], "max_sampling_rate")
-
-        last_epoch_max_sampling_rate = strategy_state["epoch_stats"].max_sampling_rate.clone().detach()
-
-        # Filter out zero values (gaussians never visible in training views)
-        last_epoch_valid_mask = last_epoch_max_sampling_rate > 0
+    # Try to get accumulated max_sampling_rate from strategy_state if provided
+    if strategy_state is not None and "epoch_stats" in strategy_state:
+        if hasattr(strategy_state["epoch_stats"], "max_sampling_rate"):
+            last_epoch_max_sampling_rate = strategy_state["epoch_stats"].max_sampling_rate.clone().detach()
+            # Filter out zero values (gaussians never visible in training views)
+            last_epoch_valid_mask = last_epoch_max_sampling_rate > 0
 
     # Extract camera parameters from trainset
     if hasattr(trainset, 'scene_info') and trainset.scene_info is not None:
@@ -690,11 +591,8 @@ def update_max_sampling_rate(
             far_plane=far_plane,
             device=device
         )
-        # Square the max_sampling_rate to get max_sampling_rate_sq
-        strategy_state["max_sampling_rate_sq"] = max_sampling_rate ** 2
+        splats["max_sampling_rate"].data = max_sampling_rate
         return
-
-    # Use accumulated max_sampling_rate from epoch statistics if available
 
     # For gaussians with zero values, compute only for invalid ones
     if not last_epoch_valid_mask.all():
@@ -718,5 +616,4 @@ def update_max_sampling_rate(
         # Update only invalid positions
         last_epoch_max_sampling_rate[invalid_mask] = uncached_max_sampling_rate
 
-    # Store in strategy state for proper handling during split/duplicate/remove
-    strategy_state["max_sampling_rate_sq"] = last_epoch_max_sampling_rate ** 2
+    splats["max_sampling_rate"].data = last_epoch_max_sampling_rate

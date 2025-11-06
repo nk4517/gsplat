@@ -132,6 +132,8 @@ class DefaultStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    split_big_dominated_pct: float = 0.0005  # Split gaussians dominating more than this percentage of pixels
+    split_big_touched_pct: float = 0.001  # Split gaussians touching more than this percentage of pixels
 
     @torch.no_grad()
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:

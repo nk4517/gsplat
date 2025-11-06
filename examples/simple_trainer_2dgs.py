@@ -250,6 +250,13 @@ class Config:
     # Iteration to start elongation regularization
     elongation_start_iter: int = 1_000
 
+    # Effective rank regularization (penalizes low-rank gaussians). from arXiv:2406.11672
+    erank_loss: bool = False
+    # Weight for effective rank loss
+    erank_lambda: float = 1e-6
+    # Iteration to start effective rank regularization
+    erank_start_iter: int = 0
+
     # Model for splatting.
     model_type: Literal["2dgs", "2dgs-inria"] = "2dgs"
 
@@ -1169,6 +1176,36 @@ class Runner:
                 elongation_loss = (excess_ratio ** 2).mean()
                 loss += elongation_loss * curr_elongation_lambda
 
+
+            if cfg.erank_loss:
+                if step > cfg.erank_start_iter:
+                    curr_erank_lambda = cfg.erank_lambda
+                else:
+                    curr_erank_lambda = 0.0
+                
+                # Calculate effective rank for 2DGS
+                activated_scales = scaling_activation(self.splats["scales"])[..., :2]  # [N, 2]
+                
+                # Square the scales (variance proportional to squared std dev)
+                scales_squared = activated_scales ** 2  # [N, 2]
+                
+                # Calculate proportions: p_i = scale_i^2 / sum(scales^2)
+                sum_scales_squared = scales_squared.sum(dim=1, keepdim=True)  # [N, 1]
+                proportions = scales_squared / (sum_scales_squared + 1e-10)  # [N, 2]
+                
+                # Calculate entropy: H = -sum(p_i * log(p_i))
+                proportions_safe = torch.clamp(proportions, min=1e-10)
+                entropy = -(proportions_safe * torch.log(proportions_safe)).sum(dim=1)  # [N]
+                
+                # Effective rank = exp(entropy)
+                erank = torch.exp(entropy)  # [N]
+                
+                # Penalty = max(-log(erank - 1), 0)
+                # Add small epsilon to avoid log(0) when erank is close to 1
+                erank_penalty = torch.clamp(-torch.log(torch.clamp(erank - 1, min=1e-10)), min=0.0)
+                erank_loss = erank_penalty.mean()
+                loss += erank_loss * curr_erank_lambda
+
             if cfg.skysphere_enabled and cfg.skyness_reg > 0:
                 # SKYNESS REGULARIZATION:
                 # This loss encourages gaussians to commit to being either sky or world objects,
@@ -1256,6 +1293,9 @@ class Runner:
             if cfg.elongation_loss and step > cfg.elongation_start_iter:
                 loss_components["elongation_loss"] = elongation_loss
 
+            if cfg.erank_loss and step > cfg.erank_start_iter:
+                loss_components["erank_loss"] = erank_loss
+
             if cfg.skysphere_enabled:
                 if cfg.skyness_reg > 0:
                     loss_components["skyness_entropy"] = skyness_entropy
@@ -1280,6 +1320,8 @@ class Runner:
                 desc += f" ent={opacity_entropy.item():.4f}"
             if cfg.elongation_loss and step > cfg.elongation_start_iter:
                 desc += f" elong={elongation_loss.item():.4f}"
+            if cfg.erank_loss and step > cfg.erank_start_iter:
+                desc += f" erank={erank_loss.item():.4f}"
             pbar.set_description(desc)
 
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
@@ -1738,6 +1780,34 @@ class Runner:
                 explicit_max=10.0,
             ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
             # overmax_opacity = True  # Use maximum opacity for better visibility
+
+        elif render_tab_state.render_mode == "effective_rank":
+            # Calculate effective rank based on scale proportions entropy
+            # For 2DGS: scales are standard deviations along axes
+            activated_scales = scaling_activation(viewer_splats["scales"])[..., :2]  # [N, 2]
+            
+            # Square the scales (variance proportional to squared std dev)
+            scales_squared = activated_scales ** 2  # [N, 3]
+            
+            # Calculate proportions: p_i = scale_i^2 / sum(scales^2)
+            sum_scales_squared = scales_squared.sum(dim=1, keepdim=True)  # [N, 1]
+            proportions = scales_squared / (sum_scales_squared + 1e-10)  # [N, 3]
+            
+            # Calculate entropy: H = -sum(p_i * log(p_i))
+            # Add small epsilon to avoid log(0)
+            proportions_safe = torch.clamp(proportions, min=1e-10)
+            entropy = -(proportions_safe * torch.log(proportions_safe)).sum(dim=1)  # [N]
+            
+            # Effective rank = exp(entropy)
+            effective_rank = torch.exp(entropy)  # [N]
+            
+            override_colors = scalar_to_colormap(
+                effective_rank,
+                colormap=render_tab_state.colormap,
+                inverse=render_tab_state.inverse,
+                explicit_min=1.0,
+                explicit_max=2.0,
+            ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
         elif render_tab_state.render_mode == "grad2d_accum":
             # Visualize accumulated gradient magnitudes

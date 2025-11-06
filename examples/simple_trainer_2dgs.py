@@ -1725,6 +1725,20 @@ class Runner:
             skyness_probs = torch.sigmoid(viewer_splats["skyness"])
             override_colors = skyness_to_colormap(skyness_probs).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
+        elif render_tab_state.render_mode == "elongation":
+            # Calculate elongation in log space (scales are stored in log form)
+            log_scales = viewer_splats["scales"][..., :2]  # [N, 2] - 2DGS, only x,y scales (no activation)
+            log_elongation_ratio = torch.abs(log_scales[:, 0] - log_scales[:, 1])  # [N] - abs(log_x - log_y) = log(max/min)
+            elongation_ratio = torch.exp(log_elongation_ratio)  # Convert from log space to actual ratio
+            override_colors = scalar_to_colormap(
+                elongation_ratio,
+                colormap=render_tab_state.colormap,
+                inverse=render_tab_state.inverse,
+                explicit_min=1.0,
+                explicit_max=10.0,
+            ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            # overmax_opacity = True  # Use maximum opacity for better visibility
+
         elif render_tab_state.render_mode == "grad2d_accum":
             # Visualize accumulated gradient magnitudes
             if "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None:

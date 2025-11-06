@@ -40,6 +40,7 @@ def reproject_skysphere(trainset, skysphere_radius, samples, device):
         # Check if sky mask is available
         sky_mask = data.get("sky_mask", None)
         if sky_mask is None:
+            print("no skymask", data.keys())
             continue
 
         # Project skysphere points to camera

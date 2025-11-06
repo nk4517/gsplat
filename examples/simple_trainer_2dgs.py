@@ -16,8 +16,7 @@ print("import 111")
 # импортировать всё, что связано c torch только после этого
 
 from examples.lib_compose import CompositingOrder, compose_renders
-
-from examples.lib_skysphere import compute_skysphere_geometry
+from examples.skysphere_model import SkysphereModel
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 
@@ -48,12 +47,10 @@ from gsplat.antialias_2dgs import apply_flat_smoothing, calc_sigma_sq, update_ma
 
 from examples.utils import (
     AppearanceOptModule,
-    CameraOptModule,
     knn,
     rgb_to_sh,
     set_random_seed,
     scalar_to_colormap,
-    skyness_to_colormap,
 )
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat import rasterization_2dgs
@@ -200,7 +197,7 @@ class Config:
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Skysphere parameters
-    skysphere_enabled: bool = False
+    skysphere_enabled: bool = True
     # Radius of skysphere as multiple of scene extent
     skysphere_radius_multiplier: float = 20.0
     # Number of points to sample on skysphere
@@ -286,7 +283,7 @@ class Config:
     )
 
     # AA-2DGS parameters
-    use_aa_smoothing: bool = True  # Enable AA-2DGS smoothing
+    use_aa_smoothing: bool = False  # Enable AA-2DGS smoothing
     aa_smoothing_reg: float = 0.1  # s_reg parameter from paper
     aa_compute_every: int = 1  # Recompute compute_min_depth_normalized_sq every N epochs
 
@@ -300,6 +297,13 @@ class Config:
     # Split parameters for gaussians that dominate or touch too many pixels
     split_big_dominated_pct: float = 0.001  # Split gaussians dominating more than this percentage of pixels in one view
     split_big_touched_pct: float = 0.0025  # Split gaussians touching more than this percentage of pixels in one view
+
+    # Alpha supervision from sky masks
+    alpha_supervision: bool = True
+    # Weight for world alpha supervision loss (alpha should be 1 where sky_mask is 0)
+    world_alpha_lambda: float = 0.1
+    # Weight for sky alpha supervision loss (alpha should be 1 where sky_mask is 1)
+    sky_alpha_lambda: float = 0.1
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -334,7 +338,6 @@ def create_splats_with_optimizers(
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
     device: str = "cuda",
-    skyness_lr: float = 0.01,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -356,28 +359,12 @@ def create_splats_with_optimizers(
     # Initialize max_sampling_rate as zero (will be computed later if AA is enabled)
     max_sampling_rate = torch.zeros((N,))  # [N,] - maximum sampling rate for AA-2DGS
 
-    # SKYNESS SYSTEM:
-    # Skyness is a learnable per-gaussian attribute that indicates whether a gaussian belongs to the sky/background.
-    # It's stored in logit space (before sigmoid) for stable optimization:
-    #   - skyness = 0 (logit) -> sigmoid(0) = 0.5 probability (uncertain)
-    #   - skyness > 0 (logit) -> sigmoid(skyness) > 0.5 (likely sky)
-    #   - skyness < 0 (logit) -> sigmoid(skyness) < 0.5 (likely world object)
-    # 
-    # The system works as follows:
-    # 1. Regular SfM points start with skyness=0 (neutral, will be learned during training)
-    # 2. Skysphere points are initialized with skyness=1.5 (high confidence they're sky)
-    # 3. During training, skyness is optimized along with other parameters
-    # 4. Densification strategy uses skyness to treat sky/world gaussians differently
-    # 5. Sky gaussians (skyness > 0.75) can have different pruning/splitting behavior
-    skyness = torch.zeros((N,))  # [N,] - logit space, 0 = 0.5 probability (neutral/uncertain)
-
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 5e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
-        ("skyness", torch.nn.Parameter(skyness), skyness_lr),
         # max_sampling_rate doesn't need gradients or optimizer (marked with None lr)
         ("max_sampling_rate", torch.nn.Parameter(max_sampling_rate, requires_grad=False), None),
     ]
@@ -548,14 +535,29 @@ class Runner:
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
             device=self.device,
-            skyness_lr=cfg.skyness_lr,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
         self.model_type = cfg.model_type
 
         # Initialize skysphere if enabled
+        self.skysphere_model = None
+        self.skysphere_optimizers = {}
         if cfg.skysphere_enabled:
-            self._initialize_skysphere()
+            self.skysphere_model = SkysphereModel(
+                trainset=self.trainset,
+                scene_scale=self.scene_scale,
+                radius_multiplier=cfg.skysphere_radius_multiplier,
+                num_points=cfg.skysphere_points,
+                init_opacity=cfg.init_opa,
+                init_scale=cfg.init_scale,
+                device=self.device,
+            )
+            if not self.skysphere_model.is_empty:
+                self.skysphere_optimizers = self.skysphere_model.create_optimizers(
+                    batch_size=cfg.batch_size,
+                    sparse_grad=cfg.sparse_grad,
+                )
+                print(f"Skysphere initialized with {self.skysphere_model.n_points} points")
 
         if self.model_type == "2dgs":
             key_for_gradient = "gradient_2dgs"
@@ -696,91 +698,6 @@ class Runner:
 
         elif not self.cfg.disable_viewer and not self.cfg.use_viser:
             self.tinyrenderr = CUDARenderer()
-
-    def _initialize_skysphere(self):
-        """Initialize skysphere points from camera views.
-        
-        SKYSPHERE INITIALIZATION:
-        The skysphere is a sphere of gaussians placed far from the scene center to represent
-        the sky/background. These gaussians are initialized by:
-        1. Creating a fibonacci sphere of points at radius = scene_scale * radius_multiplier
-        2. For each training camera, projecting these points to the image
-        3. Sampling colors from the image at projected locations
-        4. If sky masks are available, only using points that project to sky regions
-        5. Setting skyness=1.5 for these points (high confidence they're sky)
-        6. Orienting their normals to point towards the scene center
-        
-        This provides a good initialization for sky regions that can be further optimized.
-        """
-        cfg = self.cfg
-        device = self.device
-
-        # Get skysphere geometry from lib_skysphere
-        new_points, new_colors, new_quats = compute_skysphere_geometry(
-            self.trainset,
-            self.scene_scale * cfg.skysphere_radius_multiplier,
-            cfg.skysphere_points,
-            device
-        )
-
-        if new_points is not None:
-            N_sky = new_points.shape[0]
-            
-            # Create parameters for skysphere points
-            dist2_avg = (knn(new_points, min(4, N_sky))[:, 1:] ** 2).mean(dim=-1)
-            dist_avg = torch.sqrt(dist2_avg)
-            new_scales = scaling_inverse_activation(dist_avg * self.cfg.init_scale).unsqueeze(-1).repeat(1, 3)
-            
-            new_opacities = opacity_inverse_activation(torch.full((N_sky,), self.cfg.init_opa, device=device))
-            # Initialize skyness in logit space: logit(0.75) ≈ 1.1 for sky points
-            new_skyness = torch.full((N_sky,), torch.logit(torch.tensor(0.75)), device=device)  # High confidence it's sky
-            
-            # Add SH coefficients for colors
-            new_sh0 = torch.zeros((N_sky, 1, 3), device=device)
-            new_sh0[:, 0, :] = rgb_to_sh(new_colors)
-            new_shN = torch.zeros((N_sky, (self.cfg.sh_degree + 1) ** 2 - 1, 3), device=device)
-            
-            # Initialize max_sampling_rate for new points
-            new_max_sampling_rate = torch.zeros((N_sky,), device=device)
-            
-            # Update skyness for existing points to indicate they're likely world objects (25% probability)
-            # when skysphere is added
-            existing_skyness = self.splats["skyness"].data
-            existing_skyness[:] = torch.logit(torch.tensor(0.25))  # logit(0.25) ≈ -1.1
-            
-            # Concatenate with existing splats
-            self.splats["means"] = torch.nn.Parameter(
-                torch.cat([self.splats["means"], new_points], dim=0)
-            )
-            self.splats["scales"] = torch.nn.Parameter(
-                torch.cat([self.splats["scales"], new_scales], dim=0)
-            )
-            self.splats["quats"] = torch.nn.Parameter(
-                torch.cat([self.splats["quats"], new_quats], dim=0)
-            )
-            self.splats["opacities"] = torch.nn.Parameter(
-                torch.cat([self.splats["opacities"], new_opacities], dim=0)
-            )
-            self.splats["skyness"] = torch.nn.Parameter(
-                torch.cat([self.splats["skyness"], new_skyness], dim=0)
-            )
-            self.splats["sh0"] = torch.nn.Parameter(
-                torch.cat([self.splats["sh0"], new_sh0], dim=0)
-            )
-            self.splats["shN"] = torch.nn.Parameter(
-                torch.cat([self.splats["shN"], new_shN], dim=0)
-            )
-            self.splats["max_sampling_rate"] = torch.nn.Parameter(
-                torch.cat([self.splats["max_sampling_rate"], new_max_sampling_rate], dim=0),
-                requires_grad=False
-            )
-            
-            # Update optimizers with new parameters
-            for name, optimizer in self.optimizers.items():
-                param = self.splats[name]
-                optimizer.param_groups[0]["params"] = [param]
-
-            print(f"Added {N_sky} skysphere points. Total GS: {len(self.splats['means'])}")
 
     def rasterize_splats(
         self,
@@ -1031,13 +948,6 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            # Prepare extra features for rendering (e.g., skyness)
-            extra_features = None
-            if cfg.skysphere_enabled:
-                # Add skyness as extra feature to be rendered alongside colors
-                skyness_values = torch.sigmoid(self.splats["skyness"]).unsqueeze(-1)  # [N, 1]
-                extra_features = skyness_values
-
             gamma = 0.2  # Scaling factor из статьи arXiv:2504.00773
             drop_rate = gamma * (step / max_steps)
 
@@ -1062,27 +972,88 @@ class Runner:
                 render_mode="RGB+ED" if this_pass_depth_loss else "RGB+D",
                 distloss=self.cfg.dist_loss,
                 track_domination=True,
-                extra_features=extra_features,  # Pass extra features to render
                 drop_rate=drop_rate,
             )
 
-            # Extract rendered skyness mask if available
-            if cfg.skysphere_enabled and "rendered_extras" in info:
-                sky_mask_rendered = info["rendered_extras"][0, :, :, 0]  # [H, W] - skyness probability
-                # Create world mask (inverse of sky mask) for regularizations
-                world_mask = 1.0 - sky_mask_rendered  # Higher values for world objects
-            else:
-                world_mask = torch.ones((height, width), device=device)
+            # Render skysphere separately and blend if enabled
+            sky_mask_rendered = None
+            world_mask = torch.ones((height, width), device=device)
+            world_alpha_supervision_loss = torch.tensor(0.0, device=device)
+            sky_alpha_supervision_loss = torch.tensor(0.0, device=device)
+            
+            if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
+                sky_splats = self.skysphere_model.get_splats()
+
+                # Render skysphere
+                (
+                    sky_renders,
+                    sky_alphas,
+                    sky_normals,
+                    sky_normals_from_depth,
+                    sky_render_distort,
+                    sky_render_median,
+                    sky_info,
+                ) = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    splats=sky_splats,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane * 2,  # Larger far plane for sky
+                    image_ids=image_ids,
+                    render_mode="RGB+ED" if this_pass_depth_loss else "RGB+D",
+                    distloss=False,  # No distortion loss for sky
+                    track_domination=False,
+                    drop_rate=0,  # No dropout for sky
+                    override_colors = sky_splats["colors"][None, ...],
+                    sh_degree = None,
+                )
+                
+                # Alpha blend: sky_color * sky_alpha + world_color * world_alpha * (1 - sky_alpha)
+                # This puts sky behind world objects
+                sky_mask_rendered = sky_alphas[..., 0]  # [B, H, W]
+                world_mask = 1.0 - sky_mask_rendered[0]  # [H, W] for regularizations
+                
+                # Blend colors
+                renders = renders * alphas + sky_renders * sky_alphas * (1.0 - alphas)
+                # Update alpha to be combined alpha
+                alphas = alphas + sky_alphas * (1.0 - alphas)
+                
+                # Blend normals (weighted by alpha)
+                total_alpha = alphas + 1e-10
+                normals = (normals * alphas + sky_normals * sky_alphas * (1.0 - alphas)) / total_alpha
+                
+                # For depth and distortion, keep world values (sky is far away)
+                # render_distort and render_median stay from world rendering
+
+                # Alpha supervision loss if sky masks are available
+                if cfg.alpha_supervision and "sky_mask" in data:
+                    sky_mask_gt = data["sky_mask"].to(device).float()  # [B, H, W] binary mask
+                    
+                    # World alpha should be high (1) where sky_mask is low (0)
+                    world_alpha_before_blend = alphas[0, :, :, 0].clone()  # [H, W] - world opacity before blending
+                    
+                    # Binary cross-entropy for world alpha vs inverse sky mask
+                    world_mask_gt = 1.0 - sky_mask_gt[0]  # [H, W]
+                    world_alpha_clamped = torch.clamp(world_alpha_before_blend, 1e-7, 1 - 1e-7)
+                    world_alpha_supervision_loss = -(
+                        world_mask_gt * torch.log(world_alpha_clamped) +
+                        (1 - world_mask_gt) * torch.log(1 - world_alpha_clamped)
+                    ).mean()
+                    
+                    # If skysphere is rendered, compute sky alpha loss
+                    if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty and 'sky_alphas' in locals():
+                        sky_alpha = sky_alphas[0, :, :, 0]  # [H, W] - sky opacity
+                        sky_alpha_clamped = torch.clamp(sky_alpha, 1e-7, 1 - 1e-7)
+                        sky_alpha_supervision_loss = -(
+                            sky_mask_gt[0] * torch.log(sky_alpha_clamped) +
+                            (1 - sky_mask_gt[0]) * torch.log(1 - sky_alpha_clamped)
+                        ).mean()
 
             # Add camtoworlds to info for distance computation in strategy
             info["camtoworlds"] = camtoworlds
             info["Ks"] = Ks
-
-            # Add skyness info if enabled
-            if cfg.skysphere_enabled:
-                # Convert skyness from logit space to probability space for use in densification
-                # Gaussians with skyness > 0.75 are considered sky, < 0.25 are world objects
-                info["skyness"] = torch.sigmoid(self.splats["skyness"]).detach()
 
             # Add AA-2DGS parameters if enabled
             if cfg.use_aa_smoothing:
@@ -1276,58 +1247,64 @@ class Runner:
                 erank_loss = erank_penalty.mean()
                 loss += erank_loss * curr_erank_lambda
 
-            if cfg.skysphere_enabled and cfg.skyness_reg > 0:
-                # SKYNESS REGULARIZATION:
-                # This loss encourages gaussians to commit to being either sky or world objects,
-                # penalizing uncertain values near 0.5 probability.
-                # The entropy is minimized when skyness is close to 0 or 1 (after sigmoid).
-                # This helps the model make clear decisions about which gaussians represent sky.
-                skyness_probs = torch.sigmoid(self.splats["skyness"])
-                skyness_clamped = torch.clamp(skyness_probs, 1e-7, 1 - 1e-7)
-                skyness_entropy = -(skyness_clamped * torch.log(skyness_clamped) +
-                                   (1 - skyness_clamped) * torch.log(1 - skyness_clamped)).mean()
-                loss += skyness_entropy * cfg.skyness_reg
-
-            # SKY SPHERE RADIUS REGULARIZATION:
-            # Penalize sky gaussians for deviating from the skysphere radius
-            skysphere_radius_loss = None
-            if cfg.skysphere_enabled and cfg.skysphere_radius_reg > 0:
-                skyness_probs = torch.sigmoid(self.splats["skyness"])
-                # Only apply to gaussians with high skyness (> 0.75 probability)
-                sky_mask = skyness_probs > 0.75
-                if sky_mask.any():
-                    sky_positions = self.splats["means"][sky_mask]
-                    # Calculate distance from origin
-                    distances = torch.norm(sky_positions, dim=1)
-                    # Target radius for skysphere
-                    target_radius = self.scene_scale * cfg.skysphere_radius_multiplier
-                    # L2 loss for deviation from target radius
-                    radius_deviation = (distances - target_radius) ** 2
-                    # Weight by skyness probability (stronger penalty for higher skyness)
-                    weighted_deviation = radius_deviation * skyness_probs[sky_mask]
-                    skysphere_radius_loss = weighted_deviation.mean()
-                    loss += skysphere_radius_loss * cfg.skysphere_radius_reg
-
-            # SKYNESS SUPERVISION FROM SKY MASKS:
-            # If sky masks are available, use them as ground truth to supervise skyness learning
-            # This creates a cross-entropy loss between rendered skyness and ground truth sky mask
-            skyness_supervision_loss = torch.Tensor([0,])
-            if cfg.skyness_supervision and cfg.skysphere_enabled and "sky_mask" in data:
-                sky_mask_gt = data["sky_mask"].to(device).float()  # [H, W] binary mask
-
-                # Extract skyness from rendered_extras in info
-                # The skyness was passed as a single channel extra feature
-                if "rendered_extras" in info:
-                    skyness_rendered = info["rendered_extras"][0, :, :, 0]  # [H, W] - first channel contains skyness
-
-                    # Compute binary cross-entropy between rendered skyness and ground truth mask
-                    skyness_rendered_clamped = torch.clamp(skyness_rendered, 1e-7, 1 - 1e-7)
-                    skyness_supervision_loss = -(
-                        sky_mask_gt[0, ...] * torch.log(skyness_rendered_clamped) +
-                        (1 - sky_mask_gt[0, ...]) * torch.log(1 - skyness_rendered_clamped)
-                    ).mean()
-
-                    loss += skyness_supervision_loss * cfg.skyness_supervision_lambda
+            # if cfg.skysphere_enabled and cfg.skyness_reg > 0:
+            #     # SKYNESS REGULARIZATION:
+            #     # This loss encourages gaussians to commit to being either sky or world objects,
+            #     # penalizing uncertain values near 0.5 probability.
+            #     # The entropy is minimized when skyness is close to 0 or 1 (after sigmoid).
+            #     # This helps the model make clear decisions about which gaussians represent sky.
+            #     skyness_probs = torch.sigmoid(self.splats["skyness"])
+            #     skyness_clamped = torch.clamp(skyness_probs, 1e-7, 1 - 1e-7)
+            #     skyness_entropy = -(skyness_clamped * torch.log(skyness_clamped) +
+            #                        (1 - skyness_clamped) * torch.log(1 - skyness_clamped)).mean()
+            #     loss += skyness_entropy * cfg.skyness_reg
+            #
+            # # SKY SPHERE RADIUS REGULARIZATION:
+            # # Penalize sky gaussians for deviating from the skysphere radius
+            # skysphere_radius_loss = None
+            # if cfg.skysphere_enabled and cfg.skysphere_radius_reg > 0:
+            #     skyness_probs = torch.sigmoid(self.splats["skyness"])
+            #     # Only apply to gaussians with high skyness (> 0.75 probability)
+            #     sky_mask = skyness_probs > 0.75
+            #     if sky_mask.any():
+            #         sky_positions = self.splats["means"][sky_mask]
+            #         # Calculate distance from origin
+            #         distances = torch.norm(sky_positions, dim=1)
+            #         # Target radius for skysphere
+            #         target_radius = self.scene_scale * cfg.skysphere_radius_multiplier
+            #         # L2 loss for deviation from target radius
+            #         radius_deviation = (distances - target_radius) ** 2
+            #         # Weight by skyness probability (stronger penalty for higher skyness)
+            #         weighted_deviation = radius_deviation * skyness_probs[sky_mask]
+            #         skysphere_radius_loss = weighted_deviation.mean()
+            #         loss += skysphere_radius_loss * cfg.skysphere_radius_reg
+            #
+            # # SKYNESS SUPERVISION FROM SKY MASKS:
+            # # If sky masks are available, use them as ground truth to supervise skyness learning
+            # # This creates a cross-entropy loss between rendered skyness and ground truth sky mask
+            # skyness_supervision_loss = torch.Tensor([0,])
+            # if cfg.skyness_supervision and cfg.skysphere_enabled and "sky_mask" in data:
+            #     sky_mask_gt = data["sky_mask"].to(device).float()  # [H, W] binary mask
+            #
+            #     # Extract skyness from rendered_extras in info
+            #     # The skyness was passed as a single channel extra feature
+            #     if "rendered_extras" in info:
+            #         skyness_rendered = info["rendered_extras"][0, :, :, 0]  # [H, W] - first channel contains skyness
+            #
+            #         # Compute binary cross-entropy between rendered skyness and ground truth mask
+            #         skyness_rendered_clamped = torch.clamp(skyness_rendered, 1e-7, 1 - 1e-7)
+            #         skyness_supervision_loss = -(
+            #             sky_mask_gt[0, ...] * torch.log(skyness_rendered_clamped) +
+            #             (1 - sky_mask_gt[0, ...]) * torch.log(1 - skyness_rendered_clamped)
+            #         ).mean()
+            #
+            #         loss += skyness_supervision_loss * cfg.skyness_supervision_lambda
+            
+            # Add alpha supervision losses
+            if cfg.alpha_supervision and "sky_mask" in data:
+                loss += world_alpha_supervision_loss * cfg.world_alpha_lambda
+                if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
+                    loss += sky_alpha_supervision_loss * cfg.sky_alpha_lambda
 
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
@@ -1369,14 +1346,19 @@ class Runner:
             if cfg.erank_loss and step > cfg.erank_start_iter:
                 loss_components["erank_loss"] = erank_loss
 
-            if cfg.skysphere_enabled:
-                if cfg.skyness_reg > 0:
-                    loss_components["skyness_entropy"] = skyness_entropy
-                if cfg.skyness_supervision and "sky_mask" in data and "rendered_extras" in info:
-                    loss_components["skyness_supervision"] = skyness_supervision_loss
-                if cfg.skysphere_radius_reg > 0 and skysphere_radius_loss is not None:
-                    loss_components["skysphere_radius"] = skysphere_radius_loss
+            # if cfg.skysphere_enabled:
+            #     if cfg.skyness_reg > 0:
+            #         loss_components["skyness_entropy"] = skyness_entropy
+            #     if cfg.skyness_supervision and "sky_mask" in data and "rendered_extras" in info:
+            #         loss_components["skyness_supervision"] = skyness_supervision_loss
+            #     if cfg.skysphere_radius_reg > 0 and skysphere_radius_loss is not None:
+            #         loss_components["skysphere_radius"] = skysphere_radius_loss
 
+            if cfg.alpha_supervision and "sky_mask" in data:
+                loss_components["world_alpha_loss"] = world_alpha_supervision_loss
+                if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
+                    loss_components["sky_alpha_loss"] = sky_alpha_supervision_loss
+            
             if cfg.use_bilateral_grid:
                 loss_components["tvloss"] = tvloss
 
@@ -1419,11 +1401,14 @@ class Runner:
                 if cfg.scale_percentile_loss and step > cfg.scale_percentile_start_iter:
                     self.writer.add_scalar("train/scale_percentile_loss", scale_percentile_loss.item(), step)
                 if cfg.skysphere_enabled and cfg.skyness_reg > 0:
-                    skyness_probs = torch.sigmoid(self.splats["skyness"])
-                    self.writer.add_scalar("train/skyness_supervision_loss", skyness_supervision_loss.item(), step)
-                    self.writer.add_scalar("train/skyness_entropy", skyness_entropy.item(), step)
-                    self.writer.add_scalar("train/skyness_sky_count", (skyness_probs > 0.75).sum().item(), step)
-                    self.writer.add_scalar("train/skyness_world_count", (skyness_probs < 0.25).sum().item(), step)
+                #     skyness_probs = torch.sigmoid(self.splats["skyness"])
+                #     self.writer.add_scalar("train/skyness_supervision_loss", skyness_supervision_loss.item(), step)
+                #     self.writer.add_scalar("train/skyness_entropy", skyness_entropy.item(), step)
+                #     self.writer.add_scalar("train/skyness_sky_count", (skyness_probs > 0.75).sum().item(), step)
+                #     self.writer.add_scalar("train/skyness_world_count", (skyness_probs < 0.25).sum().item(), step)
+                #     if skysphere_radius_loss is not None:
+                #         self.writer.add_scalar("train/skysphere_radius_loss", skysphere_radius_loss.item(), step)
+                    self.writer.add_scalar("train/skysphere_num_GS", self.skysphere_model.n_points, step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -1465,6 +1450,10 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.bil_grid_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            # Optimize skysphere if enabled
+            for optimizer in self.skysphere_optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
@@ -1515,11 +1504,15 @@ class Runner:
                 print("Step: ", step, stats)
                 with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
                     json.dump(stats, f)
+                checkpoint_data = {
+                    "step": step,
+                    "splats": self.splats.state_dict(),
+                }
+                # Save skysphere if enabled
+                if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
+                    checkpoint_data["skysphere"] = self.skysphere_model.state_dict()
                 torch.save(
-                    {
-                        "step": step,
-                        "splats": self.splats.state_dict(),
-                    },
+                    checkpoint_data,
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
                 )
 
@@ -1659,6 +1652,28 @@ class Runner:
                 metrics["cc_psnr"].append(self.psnr(cc_colors, pixels))
                 metrics["cc_ssim"].append(self.ssim(cc_colors, pixels))
                 metrics["cc_lpips"].append(self.lpips(cc_colors, pixels))
+
+            # Render and blend skysphere if enabled
+            if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
+                sky_splats = self.skysphere_model.get_splats()
+                (
+                    sky_colors,
+                    sky_alphas,
+                    _, _, _, _, _,
+                ) = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    splats=sky_splats,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane * 2,
+                    render_mode="RGB+ED",
+                )
+                # Alpha blend sky behind world
+                colors = colors * alphas + sky_colors[..., :3] * sky_alphas * (1.0 - alphas)
+                alphas = alphas + sky_alphas * (1.0 - alphas)
 
         ellipse_time /= len(valloader)
 
@@ -1840,9 +1855,8 @@ class Runner:
                 ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
 
         elif render_tab_state.render_mode == "skyness":
-            # Visualize skyness probability
-            skyness_probs = torch.sigmoid(viewer_splats["skyness"])
-            override_colors = skyness_to_colormap(skyness_probs).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
+            # Skyness visualization not available (moved to separate skysphere model)
+            override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=self.device)
 
         elif render_tab_state.render_mode == "elongation":
             # Calculate elongation in log space (scales are stored in log form)
@@ -2042,6 +2056,37 @@ class Runner:
         render_tab_state.total_gs_count = len(viewer_splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
 
+        # Render and blend skysphere if enabled
+        if (self.cfg.skysphere_enabled and self.skysphere_model and 
+            not self.skysphere_model.is_empty and render_tab_state.render_skysphere):
+            sky_splats = self.skysphere_model.get_splats()
+            
+            # Render skysphere
+            (
+                sky_renders,
+                sky_alphas,
+                _, _, _, _, _,
+            ) = self.rasterize_splats(
+                camtoworlds=c2w[None],
+                Ks=K[None],
+                width=width,
+                height=height,
+                splats=sky_splats,
+                sh_degree=None,
+                near_plane=render_tab_state.near_plane,
+                far_plane=render_tab_state.far_plane * 2,  # Larger far plane for sky
+                render_mode="RGB+ED",
+                backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device) / 255.0,
+                rasterize_mode=render_tab_state.rasterize_mode,
+                f_orig=f_orig,
+                blur_mod=blur_mod,
+                override_colors=sky_splats["colors"][None, ...],
+            )
+            
+            # Alpha blend sky behind world
+            render_colors = render_colors[..., :3] * render_alphas + sky_renders[..., :3] * sky_alphas * (1.0 - render_alphas)
+            render_alphas = render_alphas + sky_alphas * (1.0 - render_alphas)
+
         if render_tab_state.render_mode in ("depth(expected)", "depth(dominating)"):
             if render_tab_state.render_mode == "depth(dominating)":
                 depth = info["dominating_depths"][0, ..., None]
@@ -2110,14 +2155,15 @@ def main(cfg: Config):
         for k in runner.splats.keys():
             if k in ckpt["splats"]:
                 runner.splats[k].data = ckpt["splats"][k]
-            elif k == "skyness" and k not in ckpt["splats"]:
-                # Initialize skyness if not in checkpoint
-                N = len(runner.splats["means"])
-                runner.splats[k].data = torch.zeros(N, device=runner.device)
             elif k == "max_sampling_rate" and k not in ckpt["splats"]:
                 # Initialize max_sampling_rate if not in checkpoint
                 N = len(runner.splats["means"])
                 runner.splats[k].data = torch.zeros(N, device=runner.device)
+        # Load skysphere if present in checkpoint
+        if "skysphere" in ckpt and runner.skysphere_model:
+            runner.skysphere_model.load_state_dict(ckpt["skysphere"])
+            print(f"Loaded skysphere with {runner.skysphere_model.n_points} points")
+        
         runner.eval(step=ckpt["step"])
         runner.render_traj(step=ckpt["step"])
     else:

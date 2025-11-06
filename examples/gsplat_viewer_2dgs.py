@@ -17,6 +17,7 @@ class GsplatRenderTabState(RenderTabState):
     radius_clip: float = 0.0
     eps2d: float = 0.3
     blur_mod: float = 1.0
+    render_skysphere: bool = True
     backgrounds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     render_mode: Literal[
         "rgb", "depth(expected)", "depth(dominating)", "normal", "alpha", "distort",
@@ -149,6 +150,17 @@ class GsplatViewer(Viewer):
                     self.render_tab_state.blur_mod = blur_mod_slider.value
                     self.rerender(_)
 
+                render_skysphere_checkbox = server.gui.add_checkbox(
+                    "Render Skysphere",
+                    initial_value=self.render_tab_state.render_skysphere,
+                    hint="Enable/disable skysphere rendering.",
+                )
+
+                @render_skysphere_checkbox.on_update
+                def _(_) -> None:
+                    self.render_tab_state.render_skysphere = render_skysphere_checkbox.value
+                    self.rerender(_)
+
                 backgrounds_slider = server.gui.add_rgb(
                     "Background",
                     initial_value=self.render_tab_state.backgrounds,
@@ -244,6 +256,7 @@ class GsplatViewer(Viewer):
                 "radius_clip_slider": radius_clip_slider,
                 "eps2d_slider": eps2d_slider,
                 "blur_mod_slider": blur_mod_slider,
+                "render_skysphere_checkbox": render_skysphere_checkbox,
                 "backgrounds_slider": backgrounds_slider,
                 "render_mode_dropdown": render_mode_dropdown,
                 "normalize_nearfar_checkbox": normalize_nearfar_checkbox,

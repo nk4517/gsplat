@@ -250,6 +250,17 @@ class Config:
     # Iteration to start elongation regularization
     elongation_start_iter: int = 1_000
 
+    # Scale percentile regularization (penalizes extreme sizes)
+    scale_percentile_loss: bool = False
+    # Weight for scale percentile loss
+    scale_percentile_lambda: float = 1e-5
+    # Lower percentile threshold (penalize scales below this)
+    scale_percentile_lower: float = 0.05
+    # Upper percentile threshold (penalize scales above this)
+    scale_percentile_upper: float = 99.0
+    # Iteration to start scale percentile regularization
+    scale_percentile_start_iter: int = 1_000
+
     # Effective rank regularization (penalizes low-rank gaussians). from arXiv:2406.11672
     erank_loss: bool = False
     # Weight for effective rank loss
@@ -1176,6 +1187,30 @@ class Runner:
                 elongation_loss = (excess_ratio ** 2).mean()
                 loss += elongation_loss * curr_elongation_lambda
 
+            if cfg.scale_percentile_loss:
+                if step > cfg.scale_percentile_start_iter:
+                    curr_scale_percentile_lambda = cfg.scale_percentile_lambda
+                else:
+                    curr_scale_percentile_lambda = 0.0
+                
+                # Get activated scales (real sizes, not log)
+                activated_scales = scaling_activation(self.splats["scales"])  # [N, 3]
+                # For 2DGS, use area of 1-sigma ellipse as size metric
+                # Area = π * σ_x * σ_y
+                scale_areas = torch.pi * activated_scales[:, 0] * activated_scales[:, 1]  # [N]
+                
+                # Compute percentiles
+                lower_percentile = torch.quantile(scale_areas, cfg.scale_percentile_lower / 100.0)
+                upper_percentile = torch.quantile(scale_areas, cfg.scale_percentile_upper / 100.0)
+                
+                # Penalize scales outside percentile range
+                # Quadratic penalty for being below lower percentile
+                below_penalty = torch.clamp(lower_percentile - scale_areas, min=0.0) ** 2
+                # Quadratic penalty for being above upper percentile
+                above_penalty = torch.clamp(scale_areas - upper_percentile, min=0.0) ** 2
+                
+                scale_percentile_loss = (below_penalty + above_penalty).mean()
+                loss += scale_percentile_loss * curr_scale_percentile_lambda
 
             if cfg.erank_loss:
                 if step > cfg.erank_start_iter:
@@ -1293,6 +1328,9 @@ class Runner:
             if cfg.elongation_loss and step > cfg.elongation_start_iter:
                 loss_components["elongation_loss"] = elongation_loss
 
+            if cfg.scale_percentile_loss and step > cfg.scale_percentile_start_iter:
+                loss_components["scale_percentile_loss"] = scale_percentile_loss
+
             if cfg.erank_loss and step > cfg.erank_start_iter:
                 loss_components["erank_loss"] = erank_loss
 
@@ -1320,6 +1358,8 @@ class Runner:
                 desc += f" ent={opacity_entropy.item():.4f}"
             if cfg.elongation_loss and step > cfg.elongation_start_iter:
                 desc += f" elong={elongation_loss.item():.4f}"
+            if cfg.scale_percentile_loss and step > cfg.scale_percentile_start_iter:
+                desc += f" scale_percentile={scale_percentile_loss.item():.4f}"
             if cfg.erank_loss and step > cfg.erank_start_iter:
                 desc += f" erank={erank_loss.item():.4f}"
             pbar.set_description(desc)
@@ -1341,6 +1381,8 @@ class Runner:
                     self.writer.add_scalar("train/opacity_entropy_loss", opacity_entropy.item(), step)
                 if cfg.elongation_loss and step > cfg.elongation_start_iter:
                     self.writer.add_scalar("train/elongation_loss", elongation_loss.item(), step)
+                if cfg.scale_percentile_loss and step > cfg.scale_percentile_start_iter:
+                    self.writer.add_scalar("train/scale_percentile_loss", scale_percentile_loss.item(), step)
                 if cfg.skysphere_enabled and cfg.skyness_reg > 0:
                     skyness_probs = torch.sigmoid(self.splats["skyness"])
                     self.writer.add_scalar("train/skyness_supervision_loss", skyness_supervision_loss.item(), step)

@@ -24,6 +24,7 @@ from nerfstudio.cameras.cameras import Cameras
 import imageio
 import numpy as np
 import torch
+from adan import Adan
 
 # GPU поддерживает TensorFloat32 (TF32) tensor cores для ускорения матричных умножений с float32, но PyTorch не использует их по умолчанию.
 torch.set_float32_matmul_precision('high')
@@ -399,14 +400,37 @@ def create_splats_with_optimizers(
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
-    optimizers = {
-        name: (torch.optim.SparseAdam if sparse_grad else torch.optim.Adam)(
-            [{"params": splats[name], "lr": lr * math.sqrt(batch_size)}],
-            eps=1e-15 / math.sqrt(batch_size),
-            betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)),
-        )
-        for name, _, lr in params
-    }
+
+    # Create optimizers for each parameter group
+    optimizers = {}
+    for name, _, lr in params:
+        if lr is None:  # Skip parameters without learning rate
+            continue
+
+        # Scaled learning rate and hyperparameters based on batch size
+        scaled_lr = lr * math.sqrt(batch_size)
+        scaled_eps = 1e-15 / math.sqrt(batch_size)
+        scaled_betas = (1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.99), 1 - batch_size * (1 - 0.99))
+
+        # Choose optimizer based on sparse_grad setting
+        if sparse_grad:
+            # Use SparseAdam for sparse gradients
+            optimizer = torch.optim.SparseAdam(
+                [{"params": splats[name], "lr": scaled_lr}],
+                eps=scaled_eps,
+                betas=scaled_betas,
+            )
+        else:
+            # Use Adan optimizer (drop-in replacement for Adam with better performance)
+            optimizer = Adan(
+                [{"params": splats[name], "lr": lr }],
+                eps=scaled_eps,
+                betas=scaled_betas,
+                fused=True,  # Enable fused operations for better performance
+            )
+
+        optimizers[name] = optimizer
+
     return splats, optimizers
 
 

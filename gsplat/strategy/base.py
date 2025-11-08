@@ -1,7 +1,9 @@
 from dataclasses import dataclass
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import torch
+
+from .epoch_stats import EpochContext
 
 
 @dataclass
@@ -33,9 +35,19 @@ class Strategy:
                 f"but got {len(optimizer.param_groups)}"
             )
 
+    def step_epoch_start(
+        self,
+        *args,
+        epoch_ctx: Optional[EpochContext] = None,
+        **kwargs,
+    ):
+        """Callback function to be executed before forward pass of the first camera in batch."""
+        pass
+
     def step_pre_backward(
         self,
         *args,
+        epoch_ctx: Optional[EpochContext] = None,
         **kwargs,
     ):
         """Callback function to be executed before the `loss.backward()` call."""
@@ -44,7 +56,12 @@ class Strategy:
     def step_post_backward(
         self,
         *args,
+        epoch_ctx: Optional[EpochContext] = None,
         **kwargs,
     ):
-        """Callback function to be executed after the `loss.backward()` call."""
+        """Callback function to be executed after the `loss.backward()` call.
+        
+        Args:
+            epoch_ctx: Context information about the current epoch.
+        """
         pass

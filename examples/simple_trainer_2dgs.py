@@ -44,6 +44,7 @@ from utils import (
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
 from gsplat.strategy import DefaultStrategy
+from gsplat.strategy.epoch_stats import training_data_generator
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
@@ -115,14 +116,20 @@ class Config:
     # GSs with scale above this value will be pruned.
     prune_scale3d: float = 0.1
 
-    # Start refining GSs after this iteration
-    refine_start_iter: int = 500
-    # Stop refining GSs after this iteration
-    refine_stop_iter: int = 15_000
-    # Reset opacities every this steps
-    reset_every: int = 3000
-    # Refine GSs every this steps
-    refine_every: int = 100
+    # Start refining GSs after this epoch
+    refine_start_epochs: int = 15
+    # Stop refining GSs after this epoch
+    refine_stop_epochs: int = 500
+    # Refine GSs every this many epochs
+    refine_every_epochs: int = 5
+
+    # Auto-calculate epoch parameters from legacy step-based values
+    auto_epoch_params: bool = False
+    # Legacy step-based values for auto-calculation
+    legacy_refine_start_iter: int = 500
+    legacy_refine_stop_iter: int = 15_000
+    legacy_reset_every_iter: int = 3000
+    legacy_refine_every_iter: int = 100
 
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
@@ -196,10 +203,21 @@ class Config:
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
-        self.refine_start_iter = int(self.refine_start_iter * factor)
-        self.refine_stop_iter = int(self.refine_stop_iter * factor)
+    
+    def align_steps_to_epochs(self, n_cameras_per_epoch: int):
+        """Align eval and save steps to epoch boundaries."""
+        def align_to_epoch_end(step: int) -> int:
+            """Round step to the nearest epoch end."""
+            epoch = math.ceil(step / n_cameras_per_epoch)
+            return epoch * n_cameras_per_epoch - 1  # -1 because steps are 0-indexed
+        
+        self.eval_steps = [align_to_epoch_end(step) for step in self.eval_steps]
+        self.save_steps = [align_to_epoch_end(step) for step in self.save_steps]
+        
+        # Ensure max_steps is also aligned
+        max_epochs = math.ceil(self.max_steps / n_cameras_per_epoch)
+        self.max_steps = max_epochs * n_cameras_per_epoch
         self.reset_every = int(self.reset_every * factor)
-        self.refine_every = int(self.refine_every * factor)
 
 
 def create_splats_with_optimizers(
@@ -310,6 +328,36 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
+        # Auto-calculate epoch parameters from legacy step-based values
+        n_cameras_per_epoch = len(self.trainset)
+        print(f"Cameras per epoch: {n_cameras_per_epoch}")
+        
+        # Align eval and save steps to epoch boundaries
+        cfg.align_steps_to_epochs(n_cameras_per_epoch)
+        print(f"Aligned eval_steps to epochs: {cfg.eval_steps}")
+        print(f"Aligned save_steps to epochs: {cfg.save_steps}")
+        print(f"Aligned max_steps: {cfg.max_steps} ({cfg.max_steps // n_cameras_per_epoch} epochs)")
+        
+        if cfg.auto_epoch_params:
+            # Legacy step-based defaults (from original 3DGS)
+            legacy_refine_start_iter = cfg.legacy_refine_start_iter
+            legacy_refine_stop_iter = cfg.legacy_refine_stop_iter
+            legacy_reset_every_iter = cfg.legacy_reset_every_iter
+            legacy_refine_every_iter = cfg.legacy_refine_every_iter
+            
+            # Auto-calculate epoch parameters
+            cfg.refine_start_epochs = max(1, math.ceil(legacy_refine_start_iter / n_cameras_per_epoch))
+            cfg.refine_stop_epochs = max(1, math.ceil(legacy_refine_stop_iter / n_cameras_per_epoch))
+            cfg.refine_every_epochs = max(1, math.ceil(legacy_refine_every_iter / n_cameras_per_epoch))
+            
+            print(f"Auto-calculated epoch parameters from legacy step-based values:")
+        else:
+            print(f"Using manually set epoch parameters:")
+        
+        print(f"  refine_start={cfg.refine_start_epochs} epochs, "
+              f"refine_stop={cfg.refine_stop_epochs} epochs")
+        print(f"  reset_every={cfg.reset_every_epochs} epochs, "
+              f"refine_every={cfg.refine_every_epochs} epochs")
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
@@ -547,23 +595,27 @@ class Runner:
             persistent_workers=True,
             pin_memory=True,
         )
-        trainloader_iter = iter(trainloader)
 
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
-        for step in pbar:
+        
+        for step, data, epoch_ctx in training_data_generator(trainloader, pbar):
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+            # Call batch start callback at the beginning of each epoch
+            if epoch_ctx.epoch_start:
+                self.cfg.strategy.step_epoch_start(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    epoch_ctx=epoch_ctx,
+                )
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
@@ -638,6 +690,7 @@ class Runner:
                 state=self.strategy_state,
                 step=step,
                 info=info,
+                epoch_ctx=epoch_ctx,
             )
             masks = data["mask"].to(device) if "mask" in data else None
             if masks is not None:
@@ -699,6 +752,7 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc += f"epoch={epoch_ctx.i_epoch} ({100.0 * (epoch_ctx.i + 1) / epoch_ctx.epoch_len:.1f}%)| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.dist_loss:

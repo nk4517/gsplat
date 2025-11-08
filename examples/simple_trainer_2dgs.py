@@ -184,6 +184,15 @@ class Config:
     # Camera optimizer configuration (from nerfstudio)
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
 
+    # Camera intrinsics optimization
+    optimize_intrinsics: bool = True
+    # Learning rate for intrinsics optimization
+    intrinsics_lr: float = 0.1
+    # Whether to optimize principal point (cx, cy)
+    optimize_principal_point: bool = True
+    # Whether to tie fx and fy together (single focal length)
+    tie_focal_lengths: bool = False
+
     # Enable appearance optimization. (experimental)
     app_opt: bool = False
     # Appearance embedding dimension
@@ -609,6 +618,45 @@ class Runner:
         )
         self.pose_optimizers = []  # Will be populated in train() if camera optimization is enabled
 
+        # Initialize intrinsics optimization if enabled
+        self.intrinsics_optimizers = []
+        self.optimized_Ks = None
+        if cfg.optimize_intrinsics:
+            # Create optimizable K matrices for each camera
+            Ks_list = []
+            for i in range(len(self.trainset)):
+                # Get original K matrix for this camera
+                cam_data = self.trainset[i]
+                K_orig = cam_data["K"].clone()
+                
+                # Create optimizable parameters
+                if cfg.tie_focal_lengths:
+                    # Single focal length parameter
+                    focal = (K_orig[0, 0] + K_orig[1, 1]) / 2.0
+                    focal_param = torch.nn.Parameter(torch.tensor([focal], device=self.device))
+                    if cfg.optimize_principal_point:
+                        principal_point = torch.nn.Parameter(K_orig[0:1, 2:3].clone().to(self.device))
+                        cy_param = torch.nn.Parameter(K_orig[1:2, 2:3].clone().to(self.device))
+                        Ks_list.append((focal_param, focal_param, principal_point, cy_param))
+                    else:
+                        Ks_list.append((focal_param, focal_param, None, None))
+                else:
+                    # Separate fx, fy parameters
+                    fx_param = torch.nn.Parameter(torch.tensor([K_orig[0, 0]], device=self.device))
+                    fy_param = torch.nn.Parameter(torch.tensor([K_orig[1, 1]], device=self.device))
+                    if cfg.optimize_principal_point:
+                        cx_param = torch.nn.Parameter(torch.tensor([K_orig[0, 2]], device=self.device))
+                        cy_param = torch.nn.Parameter(torch.tensor([K_orig[1, 2]], device=self.device))
+                        Ks_list.append((fx_param, fy_param, cx_param, cy_param))
+                    else:
+                        Ks_list.append((fx_param, fy_param, None, None))
+            
+            self.optimized_Ks = torch.nn.ParameterList([
+                param for params_tuple in Ks_list 
+                for param in params_tuple if param is not None
+            ])
+            self.Ks_structure = Ks_list  # Store structure for reconstruction
+
         self.app_optimizers = []
         if cfg.app_opt:
             self.app_module = AppearanceOptModule(
@@ -828,6 +876,20 @@ class Runner:
                     self.pose_optimizers = []
                 self.pose_optimizers.append(optimizer)
 
+        # Create optimizer for intrinsics if enabled
+        if cfg.optimize_intrinsics and self.optimized_Ks is not None:
+            intrinsics_optimizer = torch.optim.Adam(
+                self.optimized_Ks.parameters(),
+                lr=cfg.intrinsics_lr * math.sqrt(cfg.batch_size),
+                eps=1e-15 / math.sqrt(cfg.batch_size),
+            )
+            self.intrinsics_optimizers = [intrinsics_optimizer]
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    intrinsics_optimizer, gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
+
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
@@ -887,11 +949,29 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
+            
+            # Get image_ids early for intrinsics optimization
+            image_ids = data["image_id"].to(device)
+            
+            # Use optimized intrinsics if enabled
+            if cfg.optimize_intrinsics and self.optimized_Ks is not None:
+                # Reconstruct K matrix from optimized parameters
+                cam_idx = image_ids[0].item()
+                fx, fy, cx, cy = self.Ks_structure[cam_idx]
+                
+                K_opt = torch.zeros(3, 3, device=device)
+                K_opt[0, 0] = fx if fx is not None else Ks[0, 0, 0]
+                K_opt[1, 1] = fy if fy is not None else Ks[0, 1, 1]
+                K_opt[0, 2] = cx if cx is not None else Ks[0, 0, 2]
+                K_opt[1, 2] = cy if cy is not None else Ks[0, 1, 2]
+                K_opt[2, 2] = 1.0
+                
+                Ks = K_opt.unsqueeze(0)  # [1, 3, 3]
+            
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-            image_ids = data["image_id"].to(device)
 
             this_pass_depth_loss = cfg.depth_loss and "points" in data and "depths" in data
 
@@ -1236,6 +1316,17 @@ class Runner:
                     self.writer.add_scalar("train/opacity_l1_loss", opacity_l1_loss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                if cfg.optimize_intrinsics and self.optimized_Ks is not None:
+                    # Log first camera's intrinsics as example
+                    fx, fy, cx, cy = self.Ks_structure[0]
+                    if fx is not None:
+                        self.writer.add_scalar("train/intrinsics/fx", fx.item(), step)
+                    if fy is not None:
+                        self.writer.add_scalar("train/intrinsics/fy", fy.item(), step)
+                    if cx is not None:
+                        self.writer.add_scalar("train/intrinsics/cx", cx.item(), step)
+                    if cy is not None:
+                        self.writer.add_scalar("train/intrinsics/cy", cy.item(), step)
                 if cfg.tb_save_image:
                     canvas = (
                         torch.cat([pixels, colors[..., :3]], dim=2)
@@ -1277,6 +1368,10 @@ class Runner:
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            # Optimize intrinsics if enabled
+            for optimizer in self.intrinsics_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -1296,6 +1391,10 @@ class Runner:
                     "step": step,
                     "splats": self.splats.state_dict(),
                 }
+                # Save optimized intrinsics if enabled
+                if cfg.optimize_intrinsics and self.optimized_Ks is not None:
+                    checkpoint_data["optimized_Ks"] = self.optimized_Ks.state_dict()
+                    checkpoint_data["Ks_structure"] = self.Ks_structure
                 torch.save(
                     checkpoint_data,
                     f"{self.ckpt_dir}/ckpt_{step}.pt",

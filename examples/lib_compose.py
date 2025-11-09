@@ -10,7 +10,7 @@ class CompositingOrder(Enum):
     FRONT_TO_BACK = "front-to-back"
 
 
-@torch.compiler.compile()
+# @torch.compiler.compile()
 def compose_renders_back_to_front(
     renders_list: List[Tensor],
     alphas_list: List[Tensor],

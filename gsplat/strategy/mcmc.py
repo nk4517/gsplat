@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from .base import Strategy
-from .ops import inject_noise_to_position, relocate, sample_add, opacity_activation
+from .ops import inject_noise_to_position, relocate, sample_add, opacity_activation, scaling_activation, remove
 from .epoch_stats import EpochStatistics, EpochContext
 
 
@@ -30,6 +30,12 @@ class MCMCStrategy(Strategy):
         refine_every_epochs (int): Refine GSs every this many epochs. Default is 3.
         add_every_epochs (int): Add new GSs every this many epochs. Default is 9 (3x refine_every_epochs).
         min_opacity (float): GSs with opacity below this value will be pruned. Default to 0.005.
+        prune_scale3d (float): GSs with 3d scale (normalized by scene_scale) above this
+          value will be pruned. Default is 0.1.
+        prune_scale2d (float): GSs with 2d scale (normalized by image resolution) above
+          this value will be pruned. Default is 0.15.
+        refine_scale2d_stop_iter (int): Stop pruning GSs based on 2d scale after this
+          iteration. Default is 0. Set to a positive value to enable this feature.
         growth_factor (float): Factor for growing the number of GSs. Default to 1.05.
         verbose (bool): Whether to print verbose information. Default to False.
 
@@ -58,17 +64,19 @@ class MCMCStrategy(Strategy):
     min_opacity: float = 0.005
     growth_factor: float = 1.05
     verbose: bool = False
+    prune_scale3d: float = 0.1
+    prune_scale2d: float = 0.15
+    refine_scale2d_stop_iter: int = 0
     model_type: str | None = None
 
-    def initialize_state(self) -> Dict[str, Any]:
+    def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy."""
         n_max = 51
         binoms = torch.zeros((n_max, n_max))
         for n in range(n_max):
             for k in range(n + 1):
                 binoms[n, k] = math.comb(n, k)
-        return {"binoms": binoms}
-
+        return {"binoms": binoms, "scene_scale": scene_scale}
     def check_sanity(
         self,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -271,3 +279,36 @@ class MCMCStrategy(Strategy):
                 model_type=self.model_type,
             )
         return n_gs
+
+    @torch.no_grad()
+    def _prune_large_gs(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+    ) -> int:
+        """Prune gaussians that are too large."""
+        device = params["scales"].device
+        n_total = len(params["scales"])
+        
+        # Initialize prune mask
+        is_prune = torch.zeros(n_total, dtype=torch.bool, device=device)
+        
+        # Prune by 3D scale
+        is_too_big = (
+            scaling_activation(params["scales"]).max(dim=-1).values
+            > self.prune_scale3d * state["scene_scale"]
+        )
+        is_prune |= is_too_big
+        
+        # Prune by 2D scale if enabled
+        if self.refine_scale2d_stop_iter > 0 and step < self.refine_scale2d_stop_iter:
+            if "epoch_stats" in state and state["epoch_stats"].radii is not None:
+                is_too_big_2d = state["epoch_stats"].radii > self.prune_scale2d
+                is_prune |= is_too_big_2d
+        
+        n_prune = is_prune.sum().item()
+        if n_prune > 0:
+            remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
+        return n_prune

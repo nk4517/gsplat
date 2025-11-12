@@ -41,6 +41,8 @@ add_library(gsplat_2025 STATIC
         gsplat/cuda/csrc/RasterizeToIndices3DGS.cu
         gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu
         gsplat/cuda/csrc/RasterizeToPixels2DGSFwd.cu
+        gsplat/cuda/csrc/RasterizeToPixels2DGSWSumBwd.cu
+        gsplat/cuda/csrc/RasterizeToPixels2DGSWSumFwd.cu
         gsplat/cuda/csrc/RasterizeToPixels3DGSBwd.cu
         gsplat/cuda/csrc/RasterizeToPixels3DGSFwd.cu
         gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSBwd.cu

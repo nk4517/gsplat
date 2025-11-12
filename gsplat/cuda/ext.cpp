@@ -60,12 +60,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("projection_2dgs_packed_fwd", &gsplat::projection_2dgs_packed_fwd);
     m.def("projection_2dgs_packed_bwd", &gsplat::projection_2dgs_packed_bwd);
 
+    // 2DGS rasterization - standard version (using generic template)
     m.def(
-        "rasterize_to_pixels_2dgs_fwd", &gsplat::rasterize_to_pixels_2dgs_fwd
+        "rasterize_to_pixels_2dgs_fwd",
+        &gsplat::rasterize_to_pixels_2dgs_generic_fwd<gsplat::RenderMode2DGS::STANDARD>
     );
     m.def(
-        "rasterize_to_pixels_2dgs_bwd", &gsplat::rasterize_to_pixels_2dgs_bwd
+        "rasterize_to_pixels_2dgs_bwd",
+        &gsplat::rasterize_to_pixels_2dgs_generic_bwd<gsplat::RenderMode2DGS::STANDARD>
     );
+    
+    // 2DGS rasterization - weighted sum version
+    m.def(
+        "rasterize_to_pixels_2dgs_wsum_fwd",
+        &gsplat::rasterize_to_pixels_2dgs_generic_fwd<gsplat::RenderMode2DGS::WSUM>
+    );
+    m.def(
+        "rasterize_to_pixels_2dgs_wsum_bwd",
+        &gsplat::rasterize_to_pixels_2dgs_generic_bwd<gsplat::RenderMode2DGS::WSUM>
+    );
+    
     m.def("rasterize_to_indices_2dgs", &gsplat::rasterize_to_indices_2dgs);
 
     m.def("projection_ut_3dgs_fused", &gsplat::projection_ut_3dgs_fused);

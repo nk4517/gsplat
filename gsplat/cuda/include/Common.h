@@ -53,4 +53,10 @@ enum CameraModelType {
 #define N_THREADS_PACKED 256
 #define ALPHA_THRESHOLD (1.f / 255.f)
 
+// Enum for 2DGS rendering modes
+enum class RenderMode2DGS {
+    STANDARD = 0,
+    WSUM = 1
+};
+
 } // namespace gsplat

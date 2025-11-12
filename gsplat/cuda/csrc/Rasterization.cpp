@@ -316,6 +316,8 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs(
 // 2DGS
 ////////////////////////////////////////////////////
 
+// Template function for 2DGS forward rasterization to avoid code duplication
+template<RenderMode2DGS Mode>
 std::tuple<
     at::Tensor,
     at::Tensor,
@@ -329,7 +331,7 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor>
-rasterize_to_pixels_2dgs_fwd(
+rasterize_to_pixels_2dgs_generic_fwd(
     // Gaussian parameters
     const at::Tensor means2d,        // [..., N, 2] or [nnz, 2]
     const at::Tensor ray_transforms, // [..., N, 3, 3] or [nnz, 3, 3]
@@ -417,32 +419,61 @@ rasterize_to_pixels_2dgs_fwd(
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
-        launch_rasterize_to_pixels_2dgs_fwd_kernel<N>(                         \
-            means2d,                                                           \
-            ray_transforms,                                                    \
-            colors,                                                            \
-            opacities,                                                         \
-            normals,                                                           \
-            backgrounds,                                                       \
-            masks,                                                             \
-            image_width,                                                       \
-            image_height,                                                      \
-            tile_size,                                                         \
-            tile_offsets,                                                      \
-            flatten_ids,                                                       \
-            renders,                                                           \
-            alphas,                                                            \
-            render_normals,                                                    \
-            render_distort,                                                    \
-            render_median,                                                     \
-            last_ids,                                                          \
-            median_ids,                                                        \
-            n_touched,                                                         \
-            n_dominated,                                                       \
-            dominating_gauss_ids,                                              \
-            dominating_weights,                                                \
-            dominating_depths                                                  \
-        );                                                                     \
+        if constexpr (Mode == RenderMode2DGS::STANDARD) {                    \
+            launch_rasterize_to_pixels_2dgs_fwd_kernel<N>(                    \
+                means2d,                                                       \
+                ray_transforms,                                                \
+                colors,                                                        \
+                opacities,                                                     \
+                normals,                                                       \
+                backgrounds,                                                   \
+                masks,                                                         \
+                image_width,                                                   \
+                image_height,                                                  \
+                tile_size,                                                     \
+                tile_offsets,                                                  \
+                flatten_ids,                                                   \
+                renders,                                                       \
+                alphas,                                                        \
+                render_normals,                                                \
+                render_distort,                                                \
+                render_median,                                                 \
+                last_ids,                                                      \
+                median_ids,                                                    \
+                n_touched,                                                     \
+                n_dominated,                                                   \
+                dominating_gauss_ids,                                          \
+                dominating_weights,                                            \
+                dominating_depths                                              \
+            );                                                                 \
+        } else {                                                              \
+            launch_rasterize_to_pixels_2dgs_wsum_fwd_kernel<N>(               \
+                means2d,                                                       \
+                ray_transforms,                                                \
+                colors,                                                        \
+                opacities,                                                     \
+                normals,                                                       \
+                backgrounds,                                                   \
+                masks,                                                         \
+                image_width,                                                   \
+                image_height,                                                  \
+                tile_size,                                                     \
+                tile_offsets,                                                  \
+                flatten_ids,                                                   \
+                renders,                                                       \
+                alphas,                                                        \
+                render_normals,                                                \
+                render_distort,                                                \
+                render_median,                                                 \
+                last_ids,                                                      \
+                median_ids,                                                    \
+                n_touched,                                                     \
+                n_dominated,                                                   \
+                dominating_gauss_ids,                                          \
+                dominating_weights,                                            \
+                dominating_depths                                              \
+            );                                                                 \
+        }                                                                      \
         break;
 
     // TODO: an optimization can be done by passing the actual number of
@@ -489,6 +520,8 @@ rasterize_to_pixels_2dgs_fwd(
     );
 }
 
+// Template function for 2DGS backward rasterization to avoid code duplication
+template<RenderMode2DGS Mode>
 std::tuple<
     at::Tensor,
     at::Tensor,
@@ -497,7 +530,7 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor>
-rasterize_to_pixels_2dgs_bwd(
+rasterize_to_pixels_2dgs_generic_bwd(
     // Gaussian parameters
     const at::Tensor means2d,        // [..., N, 2] or [nnz, 2]
     const at::Tensor ray_transforms, // [..., N, 3, 3] or [nnz, 3, 3]
@@ -568,37 +601,71 @@ rasterize_to_pixels_2dgs_bwd(
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
-        launch_rasterize_to_pixels_2dgs_bwd_kernel<N>(                         \
-            means2d,                                                           \
-            ray_transforms,                                                    \
-            colors,                                                            \
-            opacities,                                                         \
-            normals,                                                           \
-            densify,                                                           \
-            backgrounds,                                                       \
-            masks,                                                             \
-            image_width,                                                       \
-            image_height,                                                      \
-            tile_size,                                                         \
-            tile_offsets,                                                      \
-            flatten_ids,                                                       \
-            render_colors,                                                     \
-            render_alphas,                                                     \
-            last_ids,                                                          \
-            median_ids,                                                        \
-            v_render_colors,                                                   \
-            v_render_alphas,                                                   \
-            v_render_normals,                                                  \
-            v_render_distort,                                                  \
-            v_render_median,                                                   \
-            absgrad ? c10::optional<at::Tensor>(v_means2d_abs) : c10::nullopt, \
-            v_means2d,                                                         \
-            v_ray_transforms,                                                  \
-            v_colors,                                                          \
-            v_opacities,                                                       \
-            v_normals,                                                         \
-            v_densify                                                          \
-        );                                                                     \
+        if constexpr (Mode == RenderMode2DGS::STANDARD) {                    \
+            launch_rasterize_to_pixels_2dgs_bwd_kernel<N>(                    \
+                means2d,                                                       \
+                ray_transforms,                                                \
+                colors,                                                        \
+                opacities,                                                     \
+                normals,                                                       \
+                densify,                                                       \
+                backgrounds,                                                   \
+                masks,                                                         \
+                image_width,                                                   \
+                image_height,                                                  \
+                tile_size,                                                     \
+                tile_offsets,                                                  \
+                flatten_ids,                                                   \
+                render_colors,                                                 \
+                render_alphas,                                                 \
+                last_ids,                                                      \
+                median_ids,                                                    \
+                v_render_colors,                                               \
+                v_render_alphas,                                               \
+                v_render_normals,                                              \
+                v_render_distort,                                              \
+                v_render_median,                                               \
+                absgrad ? c10::optional<at::Tensor>(v_means2d_abs) : c10::nullopt, \
+                v_means2d,                                                     \
+                v_ray_transforms,                                              \
+                v_colors,                                                      \
+                v_opacities,                                                   \
+                v_normals,                                                     \
+                v_densify                                                      \
+            );                                                                 \
+        } else {                                                              \
+            launch_rasterize_to_pixels_2dgs_wsum_bwd_kernel<N>(               \
+                means2d,                                                       \
+                ray_transforms,                                                \
+                colors,                                                        \
+                opacities,                                                     \
+                normals,                                                       \
+                densify,                                                       \
+                backgrounds,                                                   \
+                masks,                                                         \
+                image_width,                                                   \
+                image_height,                                                  \
+                tile_size,                                                     \
+                tile_offsets,                                                  \
+                flatten_ids,                                                   \
+                render_colors,                                                 \
+                render_alphas,                                                 \
+                last_ids,                                                      \
+                median_ids,                                                    \
+                v_render_colors,                                               \
+                v_render_alphas,                                               \
+                v_render_normals,                                              \
+                v_render_distort,                                              \
+                v_render_median,                                               \
+                absgrad ? c10::optional<at::Tensor>(v_means2d_abs) : c10::nullopt, \
+                v_means2d,                                                     \
+                v_ray_transforms,                                              \
+                v_colors,                                                      \
+                v_opacities,                                                   \
+                v_normals,                                                     \
+                v_densify                                                      \
+            );                                                                 \
+        }                                                                      \
         break;
 
     // TODO: an optimization can be done by passing the actual number of
@@ -724,6 +791,137 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_2dgs(
     }
     return std::make_tuple(gaussian_ids, pixel_ids);
 }
+
+// Explicit template instantiations for 2DGS rasterization functions
+template std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_2dgs_generic_fwd<RenderMode2DGS::STANDARD>(
+    const at::Tensor means2d,
+    const at::Tensor ray_transforms,
+    const at::Tensor colors,
+    const at::Tensor opacities,
+    const at::Tensor normals,
+    const at::optional<at::Tensor> backgrounds,
+    const at::optional<at::Tensor> masks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets,
+    const at::Tensor flatten_ids,
+    const bool track_n_touched,
+    const bool track_n_dominated,
+    const bool track_dominating
+);
+
+template std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_2dgs_generic_bwd<RenderMode2DGS::STANDARD>(
+    const at::Tensor means2d,
+    const at::Tensor ray_transforms,
+    const at::Tensor colors,
+    const at::Tensor opacities,
+    const at::Tensor normals,
+    const at::Tensor densify,
+    const at::optional<at::Tensor> backgrounds,
+    const at::optional<at::Tensor> masks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets,
+    const at::Tensor flatten_ids,
+    const at::Tensor render_colors,
+    const at::Tensor render_alphas,
+    const at::Tensor last_ids,
+    const at::Tensor median_ids,
+    const at::Tensor v_render_colors,
+    const at::Tensor v_render_alphas,
+    const at::Tensor v_render_normals,
+    const at::Tensor v_render_distort,
+    const at::Tensor v_render_median,
+    bool absgrad
+);
+
+template std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_2dgs_generic_fwd<RenderMode2DGS::WSUM>(
+    const at::Tensor means2d,
+    const at::Tensor ray_transforms,
+    const at::Tensor colors,
+    const at::Tensor opacities,
+    const at::Tensor normals,
+    const at::optional<at::Tensor> backgrounds,
+    const at::optional<at::Tensor> masks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets,
+    const at::Tensor flatten_ids,
+    const bool track_n_touched,
+    const bool track_n_dominated,
+    const bool track_dominating
+);
+
+template std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_2dgs_generic_bwd<RenderMode2DGS::WSUM>(
+    const at::Tensor means2d,
+    const at::Tensor ray_transforms,
+    const at::Tensor colors,
+    const at::Tensor opacities,
+    const at::Tensor normals,
+    const at::Tensor densify,
+    const at::optional<at::Tensor> backgrounds,
+    const at::optional<at::Tensor> masks,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets,
+    const at::Tensor flatten_ids,
+    const at::Tensor render_colors,
+    const at::Tensor render_alphas,
+    const at::Tensor last_ids,
+    const at::Tensor median_ids,
+    const at::Tensor v_render_colors,
+    const at::Tensor v_render_alphas,
+    const at::Tensor v_render_normals,
+    const at::Tensor v_render_distort,
+    const at::Tensor v_render_median,
+    bool absgrad
+);
 
 ////////////////////////////////////////////////////
 // 3DGS (from world)

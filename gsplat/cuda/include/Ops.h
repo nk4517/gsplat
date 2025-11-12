@@ -381,6 +381,8 @@ projection_2dgs_packed_bwd(
     const bool sparse_grad
 );
 
+// Generic template functions for 2DGS rasterization
+template<RenderMode2DGS Mode>
 std::tuple<
     at::Tensor,
     at::Tensor,
@@ -394,7 +396,7 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor>
-rasterize_to_pixels_2dgs_fwd(
+rasterize_to_pixels_2dgs_generic_fwd(
     // Gaussian parameters
     const at::Tensor means2d,        // [..., N, 2] or [nnz, 2]
     const at::Tensor ray_transforms, // [..., N, 3, 3] or [nnz, 3, 3]
@@ -415,6 +417,8 @@ rasterize_to_pixels_2dgs_fwd(
     const bool track_n_dominated = false,
     const bool track_dominating = false
 );
+
+template<RenderMode2DGS Mode>
 std::tuple<
     at::Tensor,
     at::Tensor,
@@ -423,7 +427,7 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor>
-rasterize_to_pixels_2dgs_bwd(
+rasterize_to_pixels_2dgs_generic_bwd(
     // Gaussian parameters
     const at::Tensor means2d,        // [..., N, 2] or [nnz, 2]
     const at::Tensor ray_transforms, // [..., N, 3, 3] or [nnz, 3, 3]

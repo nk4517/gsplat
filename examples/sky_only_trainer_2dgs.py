@@ -194,7 +194,7 @@ class SkyOnlyRunner:
         Ks: Tensor,
         width: int,
         height: int,
-    ) -> Tuple[Tensor, Tensor, Dict]:
+    ) -> Tuple[Tensor, Dict]:
         """Rasterize sky using WEIGHTED_SUM mode."""
         
         sky_splats = self.skysphere_model.get_splats()
@@ -236,7 +236,7 @@ class SkyOnlyRunner:
             sparse_grad=False,
         )
         
-        return render_colors, render_alphas, info
+        return render_colors, info
     
     def train(self):
         cfg = self.cfg
@@ -293,8 +293,8 @@ class SkyOnlyRunner:
         # Training loop
         global_tic = time.time()
         pbar = tqdm.tqdm(range(max_steps))
+
         data_iter = iter(trainloader)
-        
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -321,13 +321,15 @@ class SkyOnlyRunner:
             sky_mask = data["sky_mask"].to(device).float()  # [B, H, W]
             
             # Render sky
-            sky_colors, sky_alphas, info = self.rasterize_sky(
+            sky_colors, info = self.rasterize_sky(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
                 height=height,
             )
-            
+
+            # sky_colors = sky_colors.clamp(0, 1)
+
             # Apply bilateral grid if enabled
             if cfg.use_bilateral_grid:
                 image_ids = data["image_id"].to(device)
@@ -361,15 +363,6 @@ class SkyOnlyRunner:
             
             # Combined loss
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            
-            # Add alpha regularization to encourage sky coverage
-            # Penalize low alpha in sky regions
-            alpha_loss = F.mse_loss(sky_alphas[..., 0] * sky_mask, sky_mask)
-            loss += alpha_loss * 0.1
-            
-            # Add strong radius regularization to keep gaussians on sphere
-            radius_loss = self.skysphere_model.radius_regularization_loss()
-            loss += radius_loss * 0.001
 
             # Add total variation loss for bilateral grid
             if cfg.use_bilateral_grid:
@@ -402,7 +395,7 @@ class SkyOnlyRunner:
                 self.viewer.update(step, num_train_rays_per_step)
             
             # Logging
-            desc = f"loss={loss.item():.3f} | l1={l1loss.item():.3f} | ssim={ssimloss.item():.4f} | alpha={alpha_loss.item():.4f} | radius={radius_loss.item():.4f}"
+            desc = f"loss={loss.item():.3f} | l1={l1loss.item():.3f} | ssim={ssimloss.item():.4f}"
             if cfg.use_bilateral_grid:
                 desc += f" | tv={tvloss.item():.4f}"
             pbar.set_description(desc)
@@ -411,8 +404,6 @@ class SkyOnlyRunner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                self.writer.add_scalar("train/alpha_loss", alpha_loss.item(), step)
-                self.writer.add_scalar("train/radius_loss", radius_loss.item(), step)
                 self.writer.add_scalar("train/num_sky_GS", self.skysphere_model.n_points, step)
                 self.writer.flush()
             
@@ -469,25 +460,24 @@ class SkyOnlyRunner:
                 sky_mask = torch.ones((1, height, width), device=device)
             
             # Render sky
-            sky_colors, sky_alphas, _ = self.rasterize_sky(
+            sky_colors, _ = self.rasterize_sky(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
                 height=height,
             )
-            
-            # Composite with black background for world regions
-            composite = sky_colors * sky_alphas
+
+            sky_colors = sky_colors.clamp(0, 1)
             
             # Save rendered image
-            canvas = torch.cat([pixels, composite], dim=2).squeeze(0).cpu().numpy()
+            canvas = torch.cat([pixels, sky_colors], dim=2).squeeze(0).cpu().numpy()
             imageio.imwrite(
                 f"{self.render_dir}/val_{i:04d}_step{step}.png",
                 (canvas * 255).astype(np.uint8)
             )
             
             # Compute metrics only on sky regions
-            sky_colors_masked = composite * sky_mask.unsqueeze(-1)
+            sky_colors_masked = sky_colors * sky_mask.unsqueeze(-1)
             pixels_masked = pixels * sky_mask.unsqueeze(-1)
             
             pixels_perm = pixels_masked.permute(0, 3, 1, 2)
@@ -530,15 +520,14 @@ class SkyOnlyRunner:
         K = torch.from_numpy(K).float().to(self.device)
         
         # Render sky
-        sky_colors, sky_alphas, _ = self.rasterize_sky(
+        sky_colors, _ = self.rasterize_sky(
             camtoworlds=c2w[None],
             Ks=K[None],
             width=width,
             height=height,
         )
-        
-        # Composite with black background
-        renders = (sky_colors * sky_alphas).squeeze(0).clamp(0, 1)
+
+        renders = sky_colors.squeeze(0).clamp(0, 1)
         
         # Update render tab state
         render_tab_state.total_gs_count = self.skysphere_model.n_points

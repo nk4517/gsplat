@@ -2290,6 +2290,8 @@ def rasterize_to_pixels_2dgs(
         masks: Optional tile mask to skip rendering GS to masked tiles. [..., tile_height, tile_width]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        distloss: If True, compute distortion loss. Default: False.
+        track_domination: If True, track domination stats. Default: False.
         rasterization_mode: Mode for rasterization - either "alpha_blending" or "weighted_sum". Default: "alpha_blending".
 
     Returns:

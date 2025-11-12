@@ -93,9 +93,6 @@ def rasterization_2dgs(
         absgrad: If true, the absolute gradients of the projected 2D means
             will be computed during the backward pass, which could be accessed by
             `meta["means2d"].absgrad`. Default is False.
-        channel_chunk: The number of channels to render in one go. Default is 32.
-            If the required rendering channels are larger than this value, the rendering
-            will be done looply in chunks.
         distloss: If true, use distortion regularization to get better geometry detail.
         depth_mode: render depth mode. Choose from expected depth and median depth.
         track_domination: If true, track the number of touched and dominated Gaussians. arXiv:2403.14166

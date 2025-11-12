@@ -29,6 +29,7 @@ from .rendering import (
 )
 from .rendering_2dgs import (
     rasterization_2dgs,
+    RasterizationMode2DGS,
 )
 from .strategy import DefaultStrategy, MCMCStrategy, Strategy
 from .version import __version__
@@ -52,7 +53,8 @@ all = [
     "accumulate",
     "rasterize_to_indices_in_range",
     "fully_fused_projection_2dgs",
-    "rasterize_to_pixels_2dgs",
+    "rasterize_to_pixels_2dgs"
+    "RasterizationMode2DGS",
     "rasterize_to_indices_in_range_2dgs",
     "accumulate_2dgs",
     "rasterization_2dgs_inria_wrapper",

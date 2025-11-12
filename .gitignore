@@ -125,3 +125,7 @@ data
 results
 
 !examples/benchmarks/compression/results/
+/cmake-build-debug/
+/cmake-build-release/
+/.idea/
+/examples/output/

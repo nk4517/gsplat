@@ -384,6 +384,11 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
     at::Tensor>
 rasterize_to_pixels_2dgs_fwd(
     // Gaussian parameters
@@ -400,7 +405,11 @@ rasterize_to_pixels_2dgs_fwd(
     const uint32_t tile_size,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // options for dominating gaussian tracking
+    const bool track_n_touched = false,
+    const bool track_n_dominated = false,
+    const bool track_dominating = false
 );
 std::tuple<
     at::Tensor,

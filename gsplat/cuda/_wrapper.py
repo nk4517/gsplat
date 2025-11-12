@@ -2065,7 +2065,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
         far_plane: float,
         radius_clip: float,
         sparse_grad: bool,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         (
             indptr,
             batch_ids,
@@ -2221,6 +2221,24 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
             None,
         )
 
+@dataclass
+class DominatingInfo:
+    # Mini-Splatting: Representing Scenes with a Constrained Number of Gaussians
+    # https://arxiv.org/pdf/2403.14166.pdf
+
+    # EfficientGS: Streamlining Gaussian Splatting for Large-Scale High-Resolution Scene Representation
+    # https://arxiv.org/pdf/2404.12777.pdf
+
+    # CG-SLAM: Efficient Dense RGB-D SLAM in a Consistent Uncertainty-aware 3D Gaussian Field
+    # https://arxiv.org/pdf/2403.16095.pdf
+
+    n_touched: Tensor
+    n_dominated: Tensor
+    dominating_gauss_ids: Tensor
+    dominating_weights: Tensor
+    dominating_depthmap: Tensor
+
+
 
 def rasterize_to_pixels_2dgs(
     means2d: Tensor,  # [..., N, 2]
@@ -2239,7 +2257,8 @@ def rasterize_to_pixels_2dgs(
     packed: bool = False,
     absgrad: bool = False,
     distloss: bool = False,
-) -> Tuple[Tensor, Tensor]:
+    track_domination: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, DominatingInfo]:
     """Rasterize Gaussians to pixels.
 
     Args:
@@ -2265,6 +2284,7 @@ def rasterize_to_pixels_2dgs(
         - **Rendered normals**.     [..., image_height, image_width, 3]
         - **Rendered distortion**.  [..., image_height, image_width, 1]
         - **Rendered median depth**.[..., image_height, image_width, 1]
+        - **Dominating Info**.      [..., 1]
 
 
     """
@@ -2328,6 +2348,7 @@ def rasterize_to_pixels_2dgs(
         render_normals,
         render_distort,
         render_median,
+        dominating_info,
     ) = _RasterizeToPixels2DGS.apply(
         means2d.contiguous(),
         ray_transforms.contiguous(),
@@ -2344,6 +2365,7 @@ def rasterize_to_pixels_2dgs(
         flatten_ids.contiguous(),
         absgrad,
         distloss,
+        track_domination,
     )
 
     if padded_channels > 0:
@@ -2352,7 +2374,7 @@ def rasterize_to_pixels_2dgs(
             dim=-1,
         )
 
-    return render_colors, render_alphas, render_normals, render_distort, render_median
+    return render_colors, render_alphas, render_normals, render_distort, render_median, dominating_info
 
 
 @torch.no_grad()
@@ -2460,7 +2482,8 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         flatten_ids: Tensor,
         absgrad: bool,
         distloss: bool,
-    ) -> Tuple[Tensor, Tensor]:
+        track_domination: bool = False,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, DominatingInfo]:
         (
             render_colors,
             render_alphas,
@@ -2469,6 +2492,11 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             render_median,
             last_ids,
             median_ids,
+            n_touched,
+            n_dominated,
+            dominating_gauss_ids,
+            dominating_weights,
+            dominating_depths,
         ) = _make_lazy_cuda_func("rasterize_to_pixels_2dgs_fwd")(
             means2d,
             ray_transforms,
@@ -2482,6 +2510,9 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             tile_size,
             isect_offsets,
             flatten_ids,
+            track_domination,
+            track_domination,
+            track_domination,
         )
 
         ctx.save_for_backward(
@@ -2508,12 +2539,22 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
 
         # double to float
         render_alphas = render_alphas.float()
+        
+        dominating_info = DominatingInfo(
+            n_touched=n_touched,
+            n_dominated=n_dominated,
+            dominating_gauss_ids=dominating_gauss_ids,
+            dominating_weights=dominating_weights,
+            dominating_depthmap=dominating_depths
+        )
+
         return (
             render_colors,
             render_alphas,
             render_normals,
             render_distort,
             render_median,
+            dominating_info,
         )
 
     @staticmethod
@@ -2524,6 +2565,7 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         v_render_normals: Tensor,
         v_render_distort: Tensor,
         v_render_median: Tensor,
+        v_dominating_info: DominatingInfo, # игнорируется
     ):
 
         (
@@ -2599,6 +2641,10 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             v_normals,
             v_densify,
             v_backgrounds,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,

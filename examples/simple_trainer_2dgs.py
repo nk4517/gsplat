@@ -597,6 +597,7 @@ class Runner:
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
                 distloss=self.cfg.dist_loss,
+                track_domination=True,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -1050,6 +1051,7 @@ class Runner:
             eps2d=render_tab_state.eps2d,
             render_mode="RGB+ED",
             backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device) / 255.0,
+            track_domination=True,
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(self.splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()

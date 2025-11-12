@@ -323,6 +323,11 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
     at::Tensor>
 rasterize_to_pixels_2dgs_fwd(
     // Gaussian parameters
@@ -339,7 +344,11 @@ rasterize_to_pixels_2dgs_fwd(
     const uint32_t tile_size,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // options for dominating gaussian tracking
+    const bool track_n_touched,
+    const bool track_n_dominated,
+    const bool track_dominating
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -387,6 +396,24 @@ rasterize_to_pixels_2dgs_fwd(
     at::DimVector render_median_dims(image_dims);
     render_median_dims.append({image_height, image_width, 1});
     at::Tensor render_median = at::empty(render_median_dims, opt);
+    
+    // Additional tensors for dominating gaussian tracking
+    bool packed = means2d.dim() == 2;
+    uint32_t N = packed ? means2d.size(0) : means2d.size(-2);
+    
+    at::Tensor n_touched = track_n_touched ? 
+        at::zeros({N}, opt.dtype(at::kInt)) : at::empty({0}, opt.dtype(at::kInt));
+    at::Tensor n_dominated = track_n_dominated ? 
+        at::zeros({N}, opt.dtype(at::kInt)) : at::empty({0}, opt.dtype(at::kInt));
+    
+    at::DimVector dominating_dims(image_dims);
+    dominating_dims.append({image_height, image_width});
+    at::Tensor dominating_gauss_ids = track_dominating ? 
+        at::empty(dominating_dims, opt.dtype(at::kInt)) : at::empty({0}, opt.dtype(at::kInt));
+    at::Tensor dominating_weights = track_dominating ? 
+        at::empty(dominating_dims, opt) : at::empty({0}, opt);
+    at::Tensor dominating_depths = track_dominating ? 
+        at::empty(dominating_dims, opt) : at::empty({0}, opt);
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
@@ -409,7 +436,12 @@ rasterize_to_pixels_2dgs_fwd(
             render_distort,                                                    \
             render_median,                                                     \
             last_ids,                                                          \
-            median_ids                                                         \
+            median_ids,                                                        \
+            n_touched,                                                         \
+            n_dominated,                                                       \
+            dominating_gauss_ids,                                              \
+            dominating_weights,                                                \
+            dominating_depths                                                  \
         );                                                                     \
         break;
 
@@ -448,7 +480,12 @@ rasterize_to_pixels_2dgs_fwd(
         render_distort,
         render_median,
         last_ids,
-        median_ids
+        median_ids,
+        n_touched,
+        n_dominated,
+        dominating_gauss_ids,
+        dominating_weights,
+        dominating_depths
     );
 }
 

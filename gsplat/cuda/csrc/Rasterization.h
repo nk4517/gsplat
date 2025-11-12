@@ -123,7 +123,13 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
     at::Tensor render_distort, // [..., image_height, image_width, 1]
     at::Tensor render_median,  // [..., image_height, image_width, 1]
     at::Tensor last_ids,       // [..., image_height, image_width]
-    at::Tensor median_ids      // [..., image_height, image_width]
+    at::Tensor median_ids,     // [..., image_height, image_width]
+    // Additional outputs for dominating gaussian tracking
+    at::Tensor n_touched,      // [..., N] or [nnz]
+    at::Tensor n_dominated,    // [..., N] or [nnz]
+    at::Tensor dominating_gauss_ids,// [..., image_height, image_width]
+    at::Tensor dominating_weights,  // [..., image_height, image_width]
+    at::Tensor dominating_depths    // [..., image_height, image_width]
 );
 template <uint32_t CDIM>
 void launch_rasterize_to_pixels_2dgs_bwd_kernel(

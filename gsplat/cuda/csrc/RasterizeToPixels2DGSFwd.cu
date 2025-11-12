@@ -75,10 +75,16 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
     int32_t *__restrict__ last_ids,  // [..., image_height, image_width]     //
                                      // Stores the index of the last Gaussian
                                      // that contributed to each pixel.
-    int32_t *__restrict__ median_ids // [..., image_height, image_width]    //
+    int32_t *__restrict__ median_ids, // [..., image_height, image_width]    //
                                      // Stores the index of the Gaussian that
                                      // contributes to the median depth for each
                                      // pixel (bring over 0.5).
+    // Additional outputs for dominating gaussian tracking
+    int32_t *__restrict__ n_touched,   // [..., N] or [nnz] // Number of pixels touched by each gaussian, in each image
+    int32_t *__restrict__ n_dominated, // [..., N] or [nnz] // Number of pixels dominated by each gaussian, in each image
+    int32_t *__restrict__ dominating_gauss_ids, // [..., image_height, image_width]
+    scalar_t *__restrict__ dominating_weights,  // [..., image_height, image_width]
+    scalar_t *__restrict__ dominating_depths    // [..., image_height, image_width]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -116,6 +122,19 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
     render_distort += image_id * image_height * image_width;
     render_median += image_id * image_height * image_width;
     median_ids += image_id * image_height * image_width;
+    
+    // Additional outputs for dominating gaussian tracking
+    if (!packed && dominating_gauss_ids != nullptr) {
+        dominating_gauss_ids += image_id * image_height * image_width;
+    }
+    if (!packed && dominating_weights != nullptr) {
+        dominating_weights += image_id * image_height * image_width;
+    }
+    if (!packed && dominating_depths != nullptr) {
+        dominating_depths += image_id * image_height * image_width;
+    }
+    // n_touched and n_dominated are NOT offset - g from flatten_ids is already a global index
+    // so we use g directly to index into the full [I*N] sized arrays
 
     // get the global offset of the background and mask
     if (backgrounds != nullptr) {
@@ -210,7 +229,12 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
 
     // keep track of median depth contribution
     float median_depth = 0.f;
-    uint32_t median_idx = 0.f;
+    uint32_t median_idx = 0;
+    
+    // Variables for tracking dominating gaussian (one that consumes most transmittance)
+    float max_consumed_T = 0.f;
+    int32_t dominating_gid = -1;
+    float dominating_depth_val = 0.f;
 
     /**
      * ==============================
@@ -375,6 +399,16 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
             int32_t g = id_batch[t];
             const float vis = alpha * T;
             const float *c_ptr = colors + g * CDIM;
+            
+            // Track dominating gaussian (the one that consumes most transmittance)
+            float consumed_T = T - next_T;  // amount of transmittance consumed by this gaussian
+            if (consumed_T > max_consumed_T) {
+                max_consumed_T = consumed_T;
+                dominating_gid = g;
+                // Get depth from the last channel of colors
+                dominating_depth_val = c_ptr[CDIM - 1];
+            }
+            
 #pragma unroll
             for (uint32_t k = 0; k < CDIM; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
@@ -404,6 +438,13 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
                 median_depth = c_ptr[CDIM - 1];
                 median_idx = batch_start + t;
             }
+
+            // Track touched gaussians (only if transmittance is still significant)
+            // if (n_touched != nullptr && next_T > ALPHA_THRESHOLD) {
+            if (n_touched != nullptr) {
+                atomicAdd(&n_touched[g], 1);
+            }
+
 
             cur_idx = batch_start + t;
 
@@ -437,6 +478,22 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
         render_median[pix_id] = median_depth;
         // index in bin of gaussian that contributes to median depth
         median_ids[pix_id] = static_cast<int32_t>(median_idx);
+        
+        // Write dominating gaussian information
+        if (dominating_gauss_ids != nullptr) {
+            dominating_gauss_ids[pix_id] = dominating_gid;
+        }
+        if (dominating_weights != nullptr) {
+            dominating_weights[pix_id] = max_consumed_T;
+        }
+        if (dominating_depths != nullptr) {
+            dominating_depths[pix_id] = dominating_depth_val;
+        }
+        
+        // Update n_dominated counter for the dominating gaussian
+        if (n_dominated != nullptr && dominating_gid >= 0) {
+            atomicAdd(&n_dominated[dominating_gid], 1);
+        }
     }
 }
 
@@ -464,7 +521,13 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
     at::Tensor render_distort, // [..., image_height, image_width]
     at::Tensor render_median,  // [..., image_height, image_width]
     at::Tensor last_ids,       // [..., image_height, image_width]
-    at::Tensor median_ids      // [..., image_height, image_width]
+    at::Tensor median_ids,     // [..., image_height, image_width]
+    // Additional outputs for dominating gaussian tracking
+    at::Tensor n_touched,      // [..., N] or [nnz] // Number of pixels touched by each gaussian
+    at::Tensor n_dominated,    // [..., N] or [nnz] // Number of pixels dominated by each gaussian
+    at::Tensor dominating_gauss_ids, // [..., image_height, image_width]
+    at::Tensor dominating_weights,  // [..., image_height, image_width]
+    at::Tensor dominating_depths    // [..., image_height, image_width]
 ) {
     bool packed = means2d.dim() == 2;
 
@@ -525,7 +588,12 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
             render_distort.data_ptr<float>(),
             render_median.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
-            median_ids.data_ptr<int32_t>()
+            median_ids.data_ptr<int32_t>(),
+            n_touched.numel() > 0 ? n_touched.data_ptr<int32_t>() : nullptr,
+            n_dominated.numel() > 0 ? n_dominated.data_ptr<int32_t>() : nullptr,
+            dominating_gauss_ids.numel() > 0 ? dominating_gauss_ids.data_ptr<int32_t>() : nullptr,
+            dominating_weights.numel() > 0 ? dominating_weights.data_ptr<float>() : nullptr,
+            dominating_depths.numel() > 0 ? dominating_depths.data_ptr<float>() : nullptr
         );
 }
 
@@ -552,7 +620,12 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
         at::Tensor render_distort,                                             \
         at::Tensor render_median,                                              \
         at::Tensor last_ids,                                                   \
-        at::Tensor median_ids                                                  \
+        at::Tensor median_ids,                                                 \
+        at::Tensor n_touched,                                                  \
+        at::Tensor n_dominated,                                                \
+        at::Tensor dominating_gauss_ids,                                       \
+        at::Tensor dominating_weights,                                         \
+        at::Tensor dominating_depths                                           \
     );
 
 __INS__(1)

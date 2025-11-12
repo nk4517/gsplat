@@ -40,6 +40,7 @@ def rasterization_2dgs(
     absgrad: bool = False,
     distloss: bool = False,
     depth_mode: Literal["expected", "median"] = "expected",
+    track_domination: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
     """Rasterize a set of 2D Gaussians (N) to a batch of image planes (C).
 
@@ -87,7 +88,7 @@ def rasterization_2dgs(
             will be done looply in chunks.
         distloss: If true, use distortion regularization to get better geometry detail.
         depth_mode: render depth mode. Choose from expected depth and median depth.
-
+        track_domination: If true, track the number of touched and dominated Gaussians. arXiv:2403.14166
     Returns:
         A tuple:
 
@@ -301,6 +302,7 @@ def rasterization_2dgs(
         render_normals,
         render_distort,
         render_median,
+        domik,
     ) = rasterize_to_pixels_2dgs(
         means2d,
         ray_transforms,
@@ -317,6 +319,7 @@ def rasterization_2dgs(
         packed=packed,
         absgrad=absgrad,
         distloss=distloss,
+        track_domination=track_domination,
     )
     render_normals_from_depth = None
     if render_mode in ["ED", "RGB+ED"]:
@@ -360,6 +363,11 @@ def rasterization_2dgs(
         "n_cameras": C,
         "render_distort": render_distort,
         "gradient_2dgs": densify,  # This holds the gradient used for densification for 2dgs
+        "n_touched": domik.n_touched,
+        "n_dominated": domik.n_dominated,
+        "dominating_gauss_ids": domik.dominating_gauss_ids,
+        "dominating_weights": domik.dominating_weights,
+        "dominating_depths": domik.dominating_depthmap,
     }
 
     render_normals = torch.einsum(

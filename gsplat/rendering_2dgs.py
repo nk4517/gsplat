@@ -236,8 +236,11 @@ def rasterization_2dgs(
         camera_ids, gaussian_ids = None, None
         image_ids = None
 
-    densify = torch.zeros_like(
-        means2d, dtype=means.dtype, requires_grad=True, device="cuda"
+    # Create densify with shape [..., N, 5] or [nnz, 5]
+    densify_shape = list(means2d.shape)
+    densify_shape[-1] = 4  # Change last dimension from 2 to 4
+    densify = torch.zeros(
+        densify_shape, dtype=means.dtype, requires_grad=True, device="cuda"
     )
     # Identify intersecting tiles
     tile_width = math.ceil(width / float(tile_size))

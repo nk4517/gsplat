@@ -139,7 +139,7 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
     const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor opacities,                 // [..., N] or [nnz]
     const at::Tensor normals,                   // [..., N, 3] or [nnz, 3]
-    const at::Tensor densify,                   // [..., N, 2] or [nnz, 2]
+    const at::Tensor densify,                   // [..., N, 4] or [nnz, 4]
     const at::optional<at::Tensor> backgrounds, // [..., 3]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
@@ -167,7 +167,7 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
     at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
     at::Tensor v_opacities,                 // [..., N] or [nnz]
     at::Tensor v_normals,                   // [..., N, 3] or [nnz, 3]
-    at::Tensor v_densify                    // [..., N, 2] or [nnz, 2]
+    at::Tensor v_densify                    // [..., N, 4] or [nnz, 4]
 );
 
 /////////////////////////////////////////////////

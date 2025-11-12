@@ -87,7 +87,7 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
     scalar_t *__restrict__ v_colors,         // [..., N, CDIM] or [nnz, CDIM]
     scalar_t *__restrict__ v_opacities,      // [..., N] or [nnz]
     scalar_t *__restrict__ v_normals,        // [..., N, 3] or [nnz, 3]
-    scalar_t *__restrict__ v_densify
+    scalar_t *__restrict__ v_densify         // [..., N, 4] or [nnz, 4]
 ) {
     /**
      * ==============================
@@ -649,6 +649,16 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
 
                     // Градиент по opacity с учётом norm_factor
                     v_opacity_local = norm_factor * vis * v_alpha;  // добавлен norm_factor
+                    
+                    // Compute densification gradients from ray transform matrix gradients
+                    // u_M[2], v_M[2] are position-dependent elements that link depth to UV coords
+                    // Multiplying by depth converts to approximate screen-space scale
+                    float depth = w_M.z;
+                    v_densify_local.x = v_u_M_local.z * depth;
+                    v_densify_local.y = v_v_M_local.z * depth;
+                    // Absolute values for magnitude-based split/clone decisions
+                    v_densify_local.z = abs(v_u_M_local.z) * depth;
+                    v_densify_local.w = abs(v_v_M_local.z) * depth;
                 }
 
 /**
@@ -686,6 +696,7 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                 warpSum(v_xy_abs_local, warp);
             }
             warpSum(v_opacity_local, warp);
+            warpSum(v_densify_local, warp);
             int32_t g = id_batch[t]; // flatten index in [I * N] or [nnz]
 
             /**
@@ -729,16 +740,23 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
                 }
 
                 gpuAtomicAdd(v_opacities + g, v_opacity_local);
+                if (v_densify != nullptr) {
+                    float *v_densify_ptr = (float *)(v_densify) + 4 * g;
+                    gpuAtomicAdd(v_densify_ptr, v_densify_local.x);
+                    gpuAtomicAdd(v_densify_ptr + 1, v_densify_local.y);
+                    gpuAtomicAdd(v_densify_ptr + 2, v_densify_local.z);
+                    gpuAtomicAdd(v_densify_ptr + 3, v_densify_local.w);
+                }
             }
 
-            if (valid) {
-                float *v_densify_ptr = (float *)(v_densify) + 2 * g;
-                float *v_ray_transforms_ptr =
-                    (float *)(v_ray_transforms) + 9 * g;
-                float depth = w_M.z;
-                v_densify_ptr[0] = v_ray_transforms_ptr[2] * depth;
-                v_densify_ptr[1] = v_ray_transforms_ptr[5] * depth;
-            }
+//            if (valid) {
+//                float *v_densify_ptr = (float *)(v_densify) + 2 * g;
+//                float *v_ray_transforms_ptr =
+//                    (float *)(v_ray_transforms) + 9 * g;
+//                float depth = w_M.z;
+//                v_densify_ptr[0] = v_ray_transforms_ptr[2] * depth;
+//                v_densify_ptr[1] = v_ray_transforms_ptr[5] * depth;
+//            }
         }
     }
 }
@@ -751,7 +769,7 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
     const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
     const at::Tensor opacities,                 // [..., N] or [nnz]
     const at::Tensor normals,                   // [..., N, 3] or [nnz, 3]
-    const at::Tensor densify,                   // [..., N, 2] or [nnz, 2]
+    const at::Tensor densify,                   // [..., N, 4] or [nnz, 4]
     const at::optional<at::Tensor> backgrounds, // [..., CDIM]
     const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size

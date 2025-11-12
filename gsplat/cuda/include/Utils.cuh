@@ -91,6 +91,10 @@ inline __device__ void warpSum(float *val, WarpT &warp) {
     }
 }
 
+template <class WarpT> inline __device__ void warpSum(int32_t &val, WarpT &warp) {
+    val = cg::reduce(warp, val, cg::plus<int32_t>());
+}
+
 template <class WarpT> inline __device__ void warpSum(float &val, WarpT &warp) {
     val = cg::reduce(warp, val, cg::plus<float>());
 }

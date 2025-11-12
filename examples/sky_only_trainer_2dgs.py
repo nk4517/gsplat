@@ -18,11 +18,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 from datasets.colmap import Dataset, Parser
 from examples.skysphere_model import SkysphereModel
+from examples.skysphere_model_parametrized import SkysphereModelParametrized
 from gsplat import rasterization_2dgs, RasterizationMode2DGS
 from gsplat.strategy.ops import opacity_activation
 from gsplat_viewer_2dgs import GsplatViewer
 from nerfview import CameraState
 
+# Bilateral grid imports will be added dynamically in main()
 
 @dataclass
 class SkyOnlyConfig:
@@ -62,6 +64,14 @@ class SkyOnlyConfig:
     
     # Tensorboard
     tb_every: int = 100
+
+    # Bilateral grid parameters
+    use_bilateral_grid: bool = True
+    bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
+    use_fused_bilagrid: bool = True
+
+    # Color correction for evaluation
+    use_color_correct: bool = False
 
 
 class SkyOnlyRunner:
@@ -125,7 +135,7 @@ class SkyOnlyRunner:
         print(f"Number of validation images: {len(self.valset)}")
         
         # Initialize skysphere model
-        self.skysphere_model = SkysphereModel(
+        self.skysphere_model = SkysphereModelParametrized(
             trainset=self.trainset,
             scene_scale=self.scene_scale,
             radius_multiplier=cfg.skysphere_radius_multiplier,
@@ -146,6 +156,23 @@ class SkyOnlyRunner:
             sparse_grad=False,
         )
         
+        # Initialize bilateral grid if enabled
+        self.bil_grid_optimizers = []
+        if cfg.use_bilateral_grid:
+            self.bil_grids = BilateralGrid(
+                len(self.trainset),
+                grid_X=cfg.bilateral_grid_shape[0],
+                grid_Y=cfg.bilateral_grid_shape[1],
+                grid_W=cfg.bilateral_grid_shape[2],
+            ).to(self.device)
+            self.bil_grid_optimizers = [
+                torch.optim.Adam(
+                    self.bil_grids.parameters(),
+                    lr=2e-3,# * math.sqrt(cfg.batch_size),
+                    eps=1e-15,
+                ),
+            ]
+
         # Metrics
         from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -175,8 +202,8 @@ class SkyOnlyRunner:
         means = sky_splats["means"]  # [N, 3]
         quats = sky_splats["quats"]  # [N, 4]
         scales = sky_splats["scales"]  # [N, 3]
-        opacities = opacity_activation(sky_splats["opacities"])  # [N,]
-        colors = torch.sigmoid(sky_splats["colors"])  # [N, 3] - apply sigmoid to get RGB from logits
+        opacities = sky_splats["opacities"]  # [N,] - already 1.0 constants
+        colors = sky_splats["colors"]  # [N, 3] - direct RGB values
         
         batch_size = camtoworlds.shape[0]
         # Expand colors for batch processing
@@ -226,6 +253,24 @@ class SkyOnlyRunner:
                 )
             )
         
+        # Add schedulers for bilateral grid if enabled
+        if cfg.use_bilateral_grid:
+            # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
+            schedulers.append(
+                torch.optim.lr_scheduler.ChainedScheduler(
+                    [
+                        torch.optim.lr_scheduler.LinearLR(
+                            self.bil_grid_optimizers[0],
+                            start_factor=0.01,
+                            total_iters=1000,
+                        ),
+                        torch.optim.lr_scheduler.ExponentialLR(
+                            self.bil_grid_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                        ),
+                    ]
+                )
+            )
+
         # Create dataloader
         if cfg.preload_images:
             from datasets.preloaded_dataset import PreloadedDataLoader
@@ -283,6 +328,23 @@ class SkyOnlyRunner:
                 height=height,
             )
             
+            # Apply bilateral grid if enabled
+            if cfg.use_bilateral_grid:
+                image_ids = data["image_id"].to(device)
+                grid_y, grid_x = torch.meshgrid(
+                    (torch.arange(height, device=self.device) + 0.5) / height,
+                    (torch.arange(width, device=self.device) + 0.5) / width,
+                    indexing="ij",
+                )
+                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+                grid_xy = grid_xy.expand(batch_size_actual, -1, -1, -1)
+                sky_colors = slice(
+                    self.bil_grids,
+                    grid_xy,
+                    sky_colors,
+                    image_ids.unsqueeze(-1),
+                )["rgb"]
+
             # Apply sky mask - only compute loss where sky_mask is 1
             # Mask both rendered and ground truth
             sky_colors_masked = sky_colors * sky_mask.unsqueeze(-1)
@@ -305,6 +367,15 @@ class SkyOnlyRunner:
             alpha_loss = F.mse_loss(sky_alphas[..., 0] * sky_mask, sky_mask)
             loss += alpha_loss * 0.1
             
+            # Add strong radius regularization to keep gaussians on sphere
+            radius_loss = self.skysphere_model.radius_regularization_loss()
+            loss += radius_loss * 0.001
+
+            # Add total variation loss for bilateral grid
+            if cfg.use_bilateral_grid:
+                tvloss = 10 * total_variation_loss(self.bil_grids.grids)
+                loss += tvloss
+
             # Backward pass
             loss.backward()
             
@@ -313,6 +384,11 @@ class SkyOnlyRunner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             
+            # Optimize bilateral grid
+            for optimizer in self.bil_grid_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
             for scheduler in schedulers:
                 scheduler.step()
             
@@ -326,7 +402,9 @@ class SkyOnlyRunner:
                 self.viewer.update(step, num_train_rays_per_step)
             
             # Logging
-            desc = f"loss={loss.item():.3f} | l1={l1loss.item():.3f} | ssim={ssimloss.item():.4f} | alpha={alpha_loss.item():.4f}"
+            desc = f"loss={loss.item():.3f} | l1={l1loss.item():.3f} | ssim={ssimloss.item():.4f} | alpha={alpha_loss.item():.4f} | radius={radius_loss.item():.4f}"
+            if cfg.use_bilateral_grid:
+                desc += f" | tv={tvloss.item():.4f}"
             pbar.set_description(desc)
             
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
@@ -334,6 +412,7 @@ class SkyOnlyRunner:
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/alpha_loss", alpha_loss.item(), step)
+                self.writer.add_scalar("train/radius_loss", radius_loss.item(), step)
                 self.writer.add_scalar("train/num_sky_GS", self.skysphere_model.n_points, step)
                 self.writer.flush()
             
@@ -469,6 +548,24 @@ class SkyOnlyRunner:
 
 
 def main(cfg: SkyOnlyConfig):
+    # Import BilateralGrid and related functions based on configuration
+    global BilateralGrid, slice, total_variation_loss, color_correct
+    if cfg.use_bilateral_grid:
+        if cfg.use_fused_bilagrid:
+            from fused_bilagrid import (
+                BilateralGrid,
+                color_correct,
+                slice,
+                total_variation_loss,
+            )
+        else:
+            from lib_bilagrid import (
+                BilateralGrid,
+                color_correct,
+                slice,
+                total_variation_loss,
+            )
+
     runner = SkyOnlyRunner(cfg)
     runner.train()
     print("Training completed!")

@@ -1,5 +1,6 @@
 import math
 from typing import Dict, Optional, Tuple
+from enum import Enum
 
 import torch
 import torch.distributed
@@ -14,6 +15,12 @@ from .cuda._wrapper import (
     spherical_harmonics,
 )
 from .utils import depth_to_normal
+
+
+class RasterizationMode2DGS(Enum):
+    """Mode for 2DGS rasterization."""
+    ALPHA_BLENDING = "alpha_blending"
+    WEIGHTED_SUM = "weighted_sum"
 
 
 ###### 2DGS ######
@@ -42,10 +49,12 @@ def rasterization_2dgs(
     depth_mode: Literal["expected", "median"] = "expected",
     track_domination: bool = False,
     extra_features: Optional[Tensor] = None,  # [..., N, F] additional features to render
+    rasterization_mode: RasterizationMode2DGS = RasterizationMode2DGS.ALPHA_BLENDING,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
     """Rasterize a set of 2D Gaussians (N) to a batch of image planes (C).
 
     This function supports a handful of features, similar to the :func:`rasterization` function.
+    Can use either alpha blending or weighted sum formulation based on rasterization_mode parameter.
 
     .. warning::
         This function is currently not differentiable w.r.t. the camera intrinsics `Ks`.
@@ -92,6 +101,7 @@ def rasterization_2dgs(
         track_domination: If true, track the number of touched and dominated Gaussians. arXiv:2403.14166
         extra_features: Optional extra features to render alongside colors. [..., N, F] where F is the
             number of extra feature channels. These will be rendered and returned in meta["rendered_extras"].
+        rasterization_mode: Mode for rasterization - either ALPHA_BLENDING or WEIGHTED_SUM. Default is ALPHA_BLENDING.
     Returns:
         A tuple:
 
@@ -353,6 +363,7 @@ def rasterization_2dgs(
         absgrad=absgrad,
         distloss=distloss,
         track_domination=track_domination,
+        rasterization_mode=rasterization_mode.value,
     )
     
     # Extract extra features from rendered colors if they were provided

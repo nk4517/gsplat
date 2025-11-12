@@ -2273,9 +2273,9 @@ def rasterize_to_pixels_2dgs(
     absgrad: bool = False,
     distloss: bool = False,
     track_domination: bool = False,
+    rasterization_mode: Literal["alpha_blending", "weighted_sum"] = "alpha_blending",
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, DominatingInfo]:
-    """Rasterize Gaussians to pixels.
-
+    """Rasterize Gaussians to pixels using alpha blending or weighted sum.
     Args:
         means2d: Projected Gaussian means. [..., N, 2] if packed is False, [nnz, 2] if packed is True.
         ray_transforms: transformation matrices that transforms xy-planes in pixel spaces into splat coordinates. [..., N, 3, 3] if packed is False, [nnz, channels] if packed is True.
@@ -2290,6 +2290,7 @@ def rasterize_to_pixels_2dgs(
         masks: Optional tile mask to skip rendering GS to masked tiles. [..., tile_height, tile_width]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        rasterization_mode: Mode for rasterization - either "alpha_blending" or "weighted_sum". Default: "alpha_blending".
 
     Returns:
         A tuple:
@@ -2381,6 +2382,7 @@ def rasterize_to_pixels_2dgs(
         absgrad,
         distloss,
         track_domination,
+        rasterization_mode,
     )
 
     if padded_channels > 0:
@@ -2477,7 +2479,7 @@ def rasterize_to_indices_in_range_2dgs(
 
 
 class _RasterizeToPixels2DGS(torch.autograd.Function):
-    """Rasterize gaussians 2DGS"""
+    """Rasterize gaussians 2DGS with alpha blending or weighted sum"""
 
     @staticmethod
     def forward(
@@ -2498,7 +2500,14 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         absgrad: bool,
         distloss: bool,
         track_domination: bool = False,
+        rasterization_mode: str = "alpha_blending",
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, DominatingInfo]:
+        # Choose the appropriate CUDA function based on rasterization mode
+        if rasterization_mode == "weighted_sum":
+            cuda_func_name = "rasterize_to_pixels_2dgs_wsum_fwd"
+        else:
+            cuda_func_name = "rasterize_to_pixels_2dgs_fwd"
+        
         (
             render_colors,
             render_alphas,
@@ -2512,7 +2521,7 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             dominating_gauss_ids,
             dominating_weights,
             dominating_depths,
-        ) = _make_lazy_cuda_func("rasterize_to_pixels_2dgs_fwd")(
+        ) = _make_lazy_cuda_func(cuda_func_name)(
             means2d,
             ray_transforms,
             colors,
@@ -2551,6 +2560,7 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         ctx.tile_size = tile_size
         ctx.absgrad = absgrad
         ctx.distloss = distloss
+        ctx.rasterization_mode = rasterization_mode
 
         # double to float
         render_alphas = render_alphas.float()
@@ -2603,6 +2613,13 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
         height = ctx.height
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
+        rasterization_mode = ctx.rasterization_mode
+
+        # Choose the appropriate CUDA function based on rasterization mode
+        if rasterization_mode == "weighted_sum":
+            cuda_func_name = "rasterize_to_pixels_2dgs_wsum_bwd"
+        else:
+            cuda_func_name = "rasterize_to_pixels_2dgs_bwd"
 
         (
             v_means2d_abs,
@@ -2612,7 +2629,7 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             v_opacities,
             v_normals,
             v_densify,
-        ) = _make_lazy_cuda_func("rasterize_to_pixels_2dgs_bwd")(
+        ) = _make_lazy_cuda_func(cuda_func_name)(
             means2d,
             ray_transforms,
             colors,

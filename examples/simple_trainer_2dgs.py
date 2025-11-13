@@ -6,10 +6,21 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple
 from pathlib import Path
 
+from examples.vs_env import set_vc_envs; set_vc_envs()
+
+
+print("import 111")
+
+
+
 import imageio
 import nerfview
 import numpy as np
 import torch
+
+# GPU поддерживает TensorFloat32 (TF32) tensor cores для ускорения матричных умножений с float32, но PyTorch не использует их по умолчанию.
+torch.set_float32_matmul_precision('high')
+
 import torch.nn.functional as F
 import tqdm
 import tyro

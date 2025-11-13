@@ -16,7 +16,6 @@ print("import 111")
 # импортировать всё, что связано c torch только после этого
 
 from examples.lib_compose import CompositingOrder, compose_renders
-from examples.skysphere_model import SkysphereModel
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 
@@ -199,23 +198,6 @@ class Config:
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
-    # Skysphere parameters
-    skysphere_enabled: bool = True
-    # Radius of skysphere as multiple of scene extent
-    skysphere_radius_multiplier: float = 20.0
-    # Number of points to sample on skysphere
-    skysphere_points: int = 50_000
-    # Learning rate for skyness attribute
-    skyness_lr: float = 0.01
-    # Regularization weight for skyness
-    skyness_reg: float = 0.1
-    # Enable skyness supervision from sky masks
-    skyness_supervision: bool = True
-    # Weight for skyness supervision loss
-    skyness_supervision_lambda: float = 0.5
-    # Weight for skysphere deviation loss
-    skysphere_radius_reg: float = 0.5
-
     # Enable depth loss. (experimental)
     depth_loss: bool = True
     # Weight for depth loss
@@ -307,13 +289,6 @@ class Config:
     # Split parameters for gaussians that dominate or touch too many pixels
     split_big_dominated_pct: float = 0.001  # Split gaussians dominating more than this percentage of pixels in one view
     split_big_touched_pct: float = 0.0025  # Split gaussians touching more than this percentage of pixels in one view
-
-    # Alpha supervision from sky masks
-    alpha_supervision: bool = True
-    # Weight for world alpha supervision loss (alpha should be 1 where sky_mask is 0)
-    world_alpha_lambda: float = 0.1
-    # Weight for sky alpha supervision loss (alpha should be 1 where sky_mask is 1)
-    sky_alpha_lambda: float = 0.1
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -555,26 +530,6 @@ class Runner:
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
         self.model_type = cfg.model_type
-
-        # Initialize skysphere if enabled
-        self.skysphere_model = None
-        self.skysphere_optimizers = {}
-        if cfg.skysphere_enabled:
-            self.skysphere_model = SkysphereModel(
-                trainset=self.trainset,
-                scene_scale=self.scene_scale,
-                radius_multiplier=cfg.skysphere_radius_multiplier,
-                num_points=cfg.skysphere_points,
-                init_opacity=cfg.init_opa,
-                init_scale=cfg.init_scale,
-                device=self.device,
-            )
-            if not self.skysphere_model.is_empty:
-                self.skysphere_optimizers = self.skysphere_model.create_optimizers(
-                    batch_size=cfg.batch_size,
-                    sparse_grad=cfg.sparse_grad,
-                )
-                print(f"Skysphere initialized with {self.skysphere_model.n_points} points")
 
         if self.model_type == "2dgs":
             key_for_gradient = "gradient_2dgs"
@@ -995,85 +950,9 @@ class Runner:
                 drop_rate=drop_rate,
             )
 
-            # Render skysphere separately and blend if enabled
-            sky_mask_rendered = None
-            world_mask = torch.ones((height, width), device=device)
-            world_alpha_supervision_loss = torch.tensor(0.0, device=device)
-            sky_alpha_supervision_loss = torch.tensor(0.0, device=device)
-            
-            if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
-                sky_splats = self.skysphere_model.get_splats()
-
-                # Render skysphere
-                (
-                    sky_renders,
-                    sky_alphas,
-                    sky_normals,
-                    sky_normals_from_depth,
-                    sky_render_distort,
-                    sky_render_median,
-                    sky_info,
-                ) = self.rasterize_splats(
-                    camtoworlds=camtoworlds.clone().detach(), # не тренировать на далёком небе
-                    Ks=Ks.clone().detach(),
-                    width=width,
-                    height=height,
-                    splats=sky_splats,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane * 2,  # Larger far plane for sky
-                    image_ids=image_ids,
-                    render_mode="RGB+ED" if this_pass_depth_loss else "RGB+D",
-                    distloss=False,  # No distortion loss for sky
-                    track_domination=False,
-                    drop_rate=0,  # No dropout for sky
-                    override_colors = sky_splats["colors"][None, ...],
-                    sh_degree = None,
-                )
-                
-                # Alpha blend: sky_color * sky_alpha + world_color * world_alpha * (1 - sky_alpha)
-                # This puts sky behind world objects
-                sky_mask_rendered = sky_alphas[..., 0]  # [B, H, W]
-                world_mask = 1.0 - sky_mask_rendered[0]  # [H, W] for regularizations
-                
-                # Blend colors
-                renders = renders * alphas + sky_renders * sky_alphas * (1.0 - alphas)
-                # Update alpha to be combined alpha
-                alphas = alphas + sky_alphas * (1.0 - alphas)
-                
-                # Blend normals (weighted by alpha)
-                total_alpha = alphas + 1e-10
-                normals = (normals * alphas + sky_normals * sky_alphas * (1.0 - alphas)) / total_alpha
-                
-                # For depth and distortion, keep world values (sky is far away)
-                # render_distort and render_median stay from world rendering
-
-                # Alpha supervision loss if sky masks are available
-                if cfg.alpha_supervision and "sky_mask" in data:
-                    sky_mask_gt = data["sky_mask"].to(device).float()  # [B, H, W] binary mask
-                    
-                    # World alpha should be high (1) where sky_mask is low (0)
-                    world_alpha_before_blend = world_alphas[0, :, :, 0].clone()  # [H, W] - world opacity before blending
-                    
-                    # Binary cross-entropy for world alpha vs inverse sky mask
-                    world_mask_gt = 1.0 - sky_mask_gt[0]  # [H, W]
-                    world_alpha_clamped = torch.clamp(world_alpha_before_blend, 1e-7, 1 - 1e-7)
-                    world_alpha_supervision_loss = -(
-                        world_mask_gt * torch.log(world_alpha_clamped) +
-                        (1 - world_mask_gt) * torch.log(1 - world_alpha_clamped)
-                    ).mean()
-                    
-                    # If skysphere is rendered, compute sky alpha loss
-                    if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty and 'sky_alphas' in locals():
-                        sky_alpha = sky_alphas[0, :, :, 0]  # [H, W] - sky opacity
-                        sky_alpha_clamped = torch.clamp(sky_alpha, 1e-7, 1 - 1e-7)
-                        sky_alpha_supervision_loss = -(
-                            sky_mask_gt[0] * torch.log(sky_alpha_clamped) +
-                            (1 - sky_mask_gt[0]) * torch.log(1 - sky_alpha_clamped)
-                        ).mean()
-
-            else:
-                render_alphas = world_alphas
-                render_colors = world_renders
+            # Use world renders directly
+            render_alphas = world_alphas
+            render_colors = world_renders
 
             # Add camtoworlds to info for distance computation in strategy
             info["camtoworlds"] = camtoworlds
@@ -1146,20 +1025,10 @@ class Runner:
                 )  # [1, 1, M, 1]
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
 
-                # Sample world mask at the same points if skysphere is enabled
-                if cfg.skysphere_enabled and "rendered_extras" in info:
-                    world_mask_sampled = F.grid_sample(
-                        world_mask.unsqueeze(0).unsqueeze(0), grid, align_corners=True
-                    )  # [1, 1, M, 1]
-                    world_mask_sampled = world_mask_sampled.squeeze(3).squeeze(1)  # [1, M]
-                else:
-                    world_mask_sampled = torch.ones_like(depths)  # No masking if skysphere disabled
-
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
-                # Apply world mask to depth loss - only compute loss for world objects
-                depthloss = (torch.abs(disp - disp_gt) * world_mask_sampled).sum() / (world_mask_sampled.sum() + 1e-6)
+                depthloss = torch.abs(disp - disp_gt).mean()
                 depthloss = depthloss * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
 
@@ -1175,9 +1044,7 @@ class Runner:
                     normals_from_depth = normals_from_depth.squeeze(0)
                 normals_from_depth = normals_from_depth.permute((2, 0, 1))
                 normal_error = (1 - (normals * normals_from_depth).sum(dim=0))[None]
-                # Apply world mask to normal loss - only compute loss for world objects
-                normal_error_masked = normal_error * world_mask.unsqueeze(0)
-                normalloss = curr_normal_lambda * normal_error_masked.sum() / (world_mask.sum() + 1e-6)
+                normalloss = curr_normal_lambda * normal_error.mean()
                 loss += normalloss
 
             if cfg.dist_loss:
@@ -1185,9 +1052,7 @@ class Runner:
                     curr_dist_lambda = cfg.dist_lambda
                 else:
                     curr_dist_lambda = 0.0
-                # Apply world mask to distortion loss - only compute loss for world objects
-                render_distort_masked = render_distort * world_mask.unsqueeze(0).unsqueeze(-1)
-                distloss = render_distort_masked.sum() / (world_mask.sum() + 1e-6)
+                distloss = render_distort.mean()
                 loss += distloss * curr_dist_lambda
 
             if cfg.opacity_entropy_loss:
@@ -1281,65 +1146,6 @@ class Runner:
                 erank_loss = erank_penalty.mean()
                 loss += erank_loss * curr_erank_lambda
 
-            # if cfg.skysphere_enabled and cfg.skyness_reg > 0:
-            #     # SKYNESS REGULARIZATION:
-            #     # This loss encourages gaussians to commit to being either sky or world objects,
-            #     # penalizing uncertain values near 0.5 probability.
-            #     # The entropy is minimized when skyness is close to 0 or 1 (after sigmoid).
-            #     # This helps the model make clear decisions about which gaussians represent sky.
-            #     skyness_probs = torch.sigmoid(self.splats["skyness"])
-            #     skyness_clamped = torch.clamp(skyness_probs, 1e-7, 1 - 1e-7)
-            #     skyness_entropy = -(skyness_clamped * torch.log(skyness_clamped) +
-            #                        (1 - skyness_clamped) * torch.log(1 - skyness_clamped)).mean()
-            #     loss += skyness_entropy * cfg.skyness_reg
-            #
-            # # SKY SPHERE RADIUS REGULARIZATION:
-            # # Penalize sky gaussians for deviating from the skysphere radius
-            # skysphere_radius_loss = None
-            # if cfg.skysphere_enabled and cfg.skysphere_radius_reg > 0:
-            #     skyness_probs = torch.sigmoid(self.splats["skyness"])
-            #     # Only apply to gaussians with high skyness (> 0.75 probability)
-            #     sky_mask = skyness_probs > 0.75
-            #     if sky_mask.any():
-            #         sky_positions = self.splats["means"][sky_mask]
-            #         # Calculate distance from origin
-            #         distances = torch.norm(sky_positions, dim=1)
-            #         # Target radius for skysphere
-            #         target_radius = self.scene_scale * cfg.skysphere_radius_multiplier
-            #         # L2 loss for deviation from target radius
-            #         radius_deviation = (distances - target_radius) ** 2
-            #         # Weight by skyness probability (stronger penalty for higher skyness)
-            #         weighted_deviation = radius_deviation * skyness_probs[sky_mask]
-            #         skysphere_radius_loss = weighted_deviation.mean()
-            #         loss += skysphere_radius_loss * cfg.skysphere_radius_reg
-            #
-            # # SKYNESS SUPERVISION FROM SKY MASKS:
-            # # If sky masks are available, use them as ground truth to supervise skyness learning
-            # # This creates a cross-entropy loss between rendered skyness and ground truth sky mask
-            # skyness_supervision_loss = torch.Tensor([0,])
-            # if cfg.skyness_supervision and cfg.skysphere_enabled and "sky_mask" in data:
-            #     sky_mask_gt = data["sky_mask"].to(device).float()  # [H, W] binary mask
-            #
-            #     # Extract skyness from rendered_extras in info
-            #     # The skyness was passed as a single channel extra feature
-            #     if "rendered_extras" in info:
-            #         skyness_rendered = info["rendered_extras"][0, :, :, 0]  # [H, W] - first channel contains skyness
-            #
-            #         # Compute binary cross-entropy between rendered skyness and ground truth mask
-            #         skyness_rendered_clamped = torch.clamp(skyness_rendered, 1e-7, 1 - 1e-7)
-            #         skyness_supervision_loss = -(
-            #             sky_mask_gt[0, ...] * torch.log(skyness_rendered_clamped) +
-            #             (1 - sky_mask_gt[0, ...]) * torch.log(1 - skyness_rendered_clamped)
-            #         ).mean()
-            #
-            #         loss += skyness_supervision_loss * cfg.skyness_supervision_lambda
-            
-            # Add alpha supervision losses
-            if cfg.alpha_supervision and "sky_mask" in data:
-                loss += world_alpha_supervision_loss * cfg.world_alpha_lambda
-                if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
-                    loss += sky_alpha_supervision_loss * cfg.sky_alpha_lambda
-
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -1383,19 +1189,6 @@ class Runner:
             if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
                 loss_components["opacity_l1_loss"] = opacity_l1_loss
 
-            # if cfg.skysphere_enabled:
-            #     if cfg.skyness_reg > 0:
-            #         loss_components["skyness_entropy"] = skyness_entropy
-            #     if cfg.skyness_supervision and "sky_mask" in data and "rendered_extras" in info:
-            #         loss_components["skyness_supervision"] = skyness_supervision_loss
-            #     if cfg.skysphere_radius_reg > 0 and skysphere_radius_loss is not None:
-            #         loss_components["skysphere_radius"] = skysphere_radius_loss
-
-            if cfg.alpha_supervision and "sky_mask" in data:
-                loss_components["world_alpha_loss"] = world_alpha_supervision_loss
-                if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
-                    loss_components["sky_alpha_loss"] = sky_alpha_supervision_loss
-            
             if cfg.use_bilateral_grid:
                 loss_components["tvloss"] = tvloss
 
@@ -1441,15 +1234,6 @@ class Runner:
                     self.writer.add_scalar("train/scale_percentile_loss", scale_percentile_loss.item(), step)
                 if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
                     self.writer.add_scalar("train/opacity_l1_loss", opacity_l1_loss.item(), step)
-                if cfg.skysphere_enabled and cfg.skyness_reg > 0:
-                #     skyness_probs = torch.sigmoid(self.splats["skyness"])
-                #     self.writer.add_scalar("train/skyness_supervision_loss", skyness_supervision_loss.item(), step)
-                #     self.writer.add_scalar("train/skyness_entropy", skyness_entropy.item(), step)
-                #     self.writer.add_scalar("train/skyness_sky_count", (skyness_probs > 0.75).sum().item(), step)
-                #     self.writer.add_scalar("train/skyness_world_count", (skyness_probs < 0.25).sum().item(), step)
-                #     if skysphere_radius_loss is not None:
-                #         self.writer.add_scalar("train/skysphere_radius_loss", skysphere_radius_loss.item(), step)
-                    self.writer.add_scalar("train/skysphere_num_GS", self.skysphere_model.n_points, step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -1493,46 +1277,9 @@ class Runner:
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            # Optimize skysphere if enabled
-            for optimizer in self.skysphere_optimizers.values():
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
-
-            # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                # Add skyness-aware densification parameters
-                if cfg.skysphere_enabled and "skyness" in info:
-                    # Sky points (skyness > 0.75) should have different densification behavior
-                    skyness_probs = info["skyness"]
-                    info["is_sky"] = skyness_probs > 0.75
-                    info["is_world"] = skyness_probs < 0.25
-                    # Sky points should be pruned more aggressively if they're too close
-                    info["skysphere_radius"] = self.scene_scale * cfg.skysphere_radius_multiplier
-
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    epoch_ctx=epoch_ctx,
-                    packed=cfg.packed,
-                )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                    epoch_ctx=epoch_ctx,
-                )
-            else:
-                assert_never(self.cfg.strategy)
 
             # save checkpoint
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
@@ -1549,9 +1296,6 @@ class Runner:
                     "step": step,
                     "splats": self.splats.state_dict(),
                 }
-                # Save skysphere if enabled
-                if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
-                    checkpoint_data["skysphere"] = self.skysphere_model.state_dict()
                 torch.save(
                     checkpoint_data,
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
@@ -1628,37 +1372,6 @@ class Runner:
             )  # [1, H, W, 3]
             colors = torch.clamp(colors, 0.0, 1.0)
             colors = colors[..., :3]  # Take RGB channels
-
-            # Render and blend skysphere if enabled
-            if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
-                sky_splats = self.skysphere_model.get_splats()
-                (
-                    sky_colors,
-                    sky_alphas,
-                    _, _, _, _, _,
-                ) = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                    splats=sky_splats,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane * 2,  # Larger far plane for sky
-                    render_mode="RGB+ED",
-                    distloss=False,  # No distortion loss for sky
-                    track_domination=False,
-                    drop_rate=0,  # No dropout for sky
-                    override_colors = sky_splats["colors"][None, ...],
-                    sh_degree = None,
-                )
-                # Use compose_renders for proper alpha blending
-                # World is in front, sky is behind
-                combined, alphas = compose_renders(
-                    renders_list=[colors, sky_colors[..., :3]],
-                    alphas_list=[alphas, sky_alphas],
-                    compositing_order=CompositingOrder.FRONT_TO_BACK
-                )
-                colors = torch.clamp(combined[..., :3], 0.0, 1.0)
 
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
@@ -1803,36 +1516,6 @@ class Runner:
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
-
-            # Render and blend skysphere if enabled
-            if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
-                sky_splats = self.skysphere_model.get_splats()
-                (
-                    sky_renders,
-                    sky_alphas,
-                    _, _, _, _, _,
-                ) = self.rasterize_splats(
-                    camtoworlds=camtoworlds[i : i + 1],
-                    Ks=K[None],
-                    width=width,
-                    height=height,
-                    splats=sky_splats,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane * 2,  # Larger far plane for sky
-                    render_mode="RGB+ED",
-                    distloss=False,  # No distortion loss for sky
-                    track_domination=False,
-                    drop_rate=0,  # No dropout for sky
-                    override_colors = sky_splats["colors"][None, ...],
-                    sh_degree = None,
-                )
-                # Use compose_renders for proper alpha blending
-                # World is in front, sky is behind
-                renders, alphas = compose_renders(
-                    renders_list=[renders, sky_renders],
-                    alphas_list=[alphas, sky_alphas],
-                    compositing_order=CompositingOrder.FRONT_TO_BACK
-                )
 
             colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
             depths = renders[0, ..., 3:4]  # [H, W, 1]
@@ -2267,10 +1950,6 @@ def main(cfg: Config):
                 # Initialize max_sampling_rate if not in checkpoint
                 N = len(runner.splats["means"])
                 runner.splats[k].data = torch.zeros(N, device=runner.device)
-        # Load skysphere if present in checkpoint
-        if "skysphere" in ckpt and runner.skysphere_model:
-            runner.skysphere_model.load_state_dict(ckpt["skysphere"])
-            print(f"Loaded skysphere with {runner.skysphere_model.n_points} points")
         
         runner.eval(step=ckpt["step"])
         runner.render_traj(step=ckpt["step"])

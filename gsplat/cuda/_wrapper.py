@@ -2252,6 +2252,7 @@ class DominatingInfo:
     dominating_gauss_ids: Tensor
     dominating_weights: Tensor
     dominating_depthmap: Tensor
+    median_ids: Tensor
 
 
 
@@ -2572,7 +2573,8 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             n_dominated=n_dominated,
             dominating_gauss_ids=dominating_gauss_ids,
             dominating_weights=dominating_weights,
-            dominating_depthmap=dominating_depths
+            dominating_depthmap=dominating_depths,
+            median_ids=median_ids.detach().clone(),
         )
 
         return (

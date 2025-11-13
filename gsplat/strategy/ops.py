@@ -146,7 +146,7 @@ def duplicate(
     # update the extra running state
     wrapped_state = StateWrapper(state)
     for k, v in wrapped_state.items():
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor) and len(v) == len(mask):
             wrapped_state[k] = torch.cat((v, v[sel]))
 
 
@@ -206,7 +206,7 @@ def split(
     # update the extra running state
     wrapped_state = StateWrapper(state)
     for k, v in wrapped_state.items():
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor) and len(v) == len(mask):
             repeats = [N] + [1] * (v.dim() - 1)
             v_new = v[sel].repeat(repeats)
             wrapped_state[k] = torch.cat((v[rest], v_new))
@@ -323,7 +323,7 @@ def split_n_2dgs(
     # update the extra running state
     wrapped_state = StateWrapper(state)
     for k, v in wrapped_state.items():
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor) and len(v) == len(mask):
             repeats = [n_splits] + [1] * (v.dim() - 1)
             v_new = v[sel].repeat(repeats)
             wrapped_state[k] = torch.cat((v[rest], v_new))
@@ -357,7 +357,7 @@ def remove(
     # update the extra running state
     wrapped_state = StateWrapper(state)
     for k, v in wrapped_state.items():
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor) and len(v) == len(mask):
             wrapped_state[k] = v[sel]
 
 
@@ -410,6 +410,36 @@ def reset_opa(
     )
 
 
+@torch.no_grad()
+def normalize_quats(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+):
+    """Inplace normalize quaternions to unit length.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        state: A dictionary of extra state tensors.
+    """
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "quats":
+            quats = F.normalize(p, dim=-1)
+            return torch.nn.Parameter(quats, requires_grad=p.requires_grad)
+        else:
+            raise ValueError(f"Unexpected parameter name: {name}")
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return torch.zeros_like(v)
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(
+        param_fn, optimizer_fn, params, optimizers, names=["quats"]
+    )
+
+
 LOG_TINY_SCALE = math.log(1e-16)
 
 @torch.no_grad()
@@ -421,6 +451,7 @@ def relocate(
     binoms: Tensor,
     min_opacity: float = 0.005,
     model_type: str | None = None,
+    probs: Optional[Tensor] = None,
 ):
     """Inplace relocate some dead Gaussians to the lives ones.
 
@@ -428,6 +459,7 @@ def relocate(
         params: A dictionary of parameters.
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
         mask: A boolean mask to indicates which Gaussians are dead.
+        probs: Optional probability weights for sampling alive gaussians. If None, uses opacities.
     """
     # support "opacities" with shape [N,] or [N, 1]
     opacities = opacity_activation(params["opacities"])
@@ -438,7 +470,10 @@ def relocate(
 
     # Sample for new GSs
     eps = torch.finfo(torch.float32).eps
-    probs = opacities[alive_indices].flatten()  # ensure its shape is [N,]
+    if probs is None:
+        probs = opacities[alive_indices].flatten()  # ensure its shape is [N,]
+    else:
+        probs = probs[alive_indices].flatten()
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
     sampled_idxs = alive_indices[sampled_idxs]
     new_opacities, new_scales = compute_relocation(
@@ -482,11 +517,27 @@ def sample_add(
     binoms: Tensor,
     min_opacity: float = 0.005,
     model_type: str | None = None,
+    probs: Optional[Tensor] = None,
 ):
+    """Add new Gaussians by sampling from existing ones.
+    
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        state: A dictionary of extra state tensors.
+        n: Number of new Gaussians to add.
+        binoms: Precomputed lookup table for binomial coefficients.
+        min_opacity: Minimum opacity for new Gaussians.
+        model_type: Type of model (e.g., "2dgs").
+        probs: Optional probability weights for sampling. If None, uses opacities.
+    """
     opacities = opacity_activation(params["opacities"])
 
     eps = torch.finfo(torch.float32).eps
-    probs = opacities.flatten()
+    if probs is None:
+        probs = opacities.flatten()
+    else:
+        probs = probs.flatten()
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
@@ -548,3 +599,79 @@ def inject_noise_to_position(
     )
     noise = torch.einsum("bij,bj->bi", covars, noise)
     params["means"].add_(noise)
+
+
+@torch.no_grad()
+def inject_noise_to_quats(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    noise_multipliers: Tensor,
+    base_angle: float = 1e-4,
+):
+    """Inject noise to quaternions for MCMC exploration.
+    
+    Args:
+        params: Dictionary of parameters including "quats"
+        optimizers: Dictionary of optimizers
+        state: State dictionary
+        noise_multipliers: Tensor of per-gaussian noise multipliers [N]
+        base_angle: Base rotation angle in radians (default 1e-4)
+    """
+    quats = params["quats"]  # [N, 4]
+    n_gaussians = quats.shape[0]
+    device = quats.device
+    
+    # Create mask for non-zero noise multipliers
+    noise_mask = noise_multipliers > 0
+    if not noise_mask.any():
+        # No noise to apply
+        return
+    
+    # Get indices where noise should be applied
+    noise_indices = torch.where(noise_mask)[0]
+    n_noisy = len(noise_indices)
+    
+    # Random axis (normalized)
+    random_axis = torch.randn(n_noisy, 3, device=device)
+    random_axis = F.normalize(random_axis, dim=-1)
+    
+    # Fixed small angle scaled by per-gaussian multipliers
+    angle = base_angle * noise_multipliers[noise_mask]
+    
+    # Convert axis-angle to quaternion perturbation
+    # q = [cos(θ/2), sin(θ/2) * axis]
+    half_angle = angle * 0.5
+    cos_half = torch.cos(half_angle)
+    sin_half = torch.sin(half_angle)
+    
+    noise_quat = torch.zeros(n_noisy, 4, device=device)
+    noise_quat[:, 0] = cos_half
+    noise_quat[:, 1:] = sin_half.unsqueeze(-1) * random_axis
+    
+    # Apply perturbation by quaternion multiplication
+    # q_new = q_noise * q_original
+    q_w = quats[noise_mask, 0]
+    q_x = quats[noise_mask, 1]
+    q_y = quats[noise_mask, 2]
+    q_z = quats[noise_mask, 3]
+    
+    n_w = noise_quat[:, 0]
+    n_x = noise_quat[:, 1]
+    n_y = noise_quat[:, 2]
+    n_z = noise_quat[:, 3]
+    
+    # Quaternion multiplication formula
+    new_w = n_w * q_w - n_x * q_x - n_y * q_y - n_z * q_z
+    new_x = n_w * q_x + n_x * q_w + n_y * q_z - n_z * q_y
+    new_y = n_w * q_y - n_x * q_z + n_y * q_w + n_z * q_x
+    new_z = n_w * q_z + n_x * q_y - n_y * q_x + n_z * q_w
+    
+    # Update quaternions
+    params["quats"][noise_mask, 0] = new_w
+    params["quats"][noise_mask, 1] = new_x
+    params["quats"][noise_mask, 2] = new_y
+    params["quats"][noise_mask, 3] = new_z
+    
+    # Normalize only modified quaternions to maintain unit length
+    params["quats"][noise_mask] = F.normalize(params["quats"][noise_mask], dim=-1)

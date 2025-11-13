@@ -219,12 +219,7 @@ class DefaultStrategy(Strategy):
                        epoch_ctx.i_epoch <= self.reset_end_epochs)
         
         if should_reset:
-            # Create mask for non-sky gaussians if skyness is available
             reset_mask = None
-            # if "skyness" in params:
-            #     skyness_probs = torch.sigmoid(params["skyness"])
-            #     reset_mask = skyness_probs < 0.66  # Only reset gaussians with skyness < 66%
-            #
             reset_opa(
                 params=params,
                 optimizers=optimizers,
@@ -338,14 +333,6 @@ class DefaultStrategy(Strategy):
         is_split_huge = torch.zeros(n_before, dtype=torch.bool, device=device)
         is_dupli = torch.zeros(n_before, dtype=torch.bool, device=device)
 
-        # Filter out sky gaussians if skyness is available
-        is_not_sky = torch.ones(n_before, dtype=torch.bool, device=device)
-        if "skyness" in params:
-            skyness_probs = torch.sigmoid(params["skyness"].detach())
-            is_not_sky = skyness_probs < 0.66  # Only process gaussians with skyness < 66%
-
-        is_certain_sky = ~is_not_sky
-
         # GDAGS: Compute GCR and dynamic weights
         grads_abs = epoch_stats.grad2d_abs / count.clamp_min(1)
 
@@ -375,9 +362,6 @@ class DefaultStrategy(Strategy):
         # )
         # is_dupli = is_grad_high_for_clone & is_small
 
-        # Apply skyness filter to duplication
-        is_dupli &= is_not_sky
-
 
         # Determine which gaussians to split (large scale + high gradient)
         # Split in red zones OR very high gradient areas
@@ -400,8 +384,7 @@ class DefaultStrategy(Strategy):
 
             # Use regular split for moderately large gaussians
             split_by_domination = (epoch_stats.max_dominatedPct > self.split_big_dominated_pct) & ~is_split_huge
-            split_by_big_touch = ((epoch_stats.max_touchedPct > self.split_big_touched_pct) & ~split_by_domination) & is_not_sky
-            split_by_big_touch |= ((epoch_stats.max_touchedPct > self.split_big_touched_pct * 10) & ~split_by_domination) & is_certain_sky
+            split_by_big_touch = ((epoch_stats.max_touchedPct > self.split_big_touched_pct) & ~split_by_domination)
 
             print("split_n by huge touch pct:", is_split_huge.sum().item())
             print("split by domination pct:", split_by_domination.sum().item())
@@ -493,19 +476,10 @@ class DefaultStrategy(Strategy):
         # Initialize prune mask for all gaussians
         is_prune = torch.zeros(n_total, dtype=torch.bool, device=device)
 
-        # Filter out sky gaussians if skyness is available
-        is_not_sky = torch.ones(n_total, dtype=torch.bool, device=device)
-        if "skyness" in params:
-            skyness_probs = torch.sigmoid(params["skyness"].detach())
-            is_not_sky = skyness_probs < 0.66  # Only process gaussians with skyness < 66%
-
         # Apply pruning criteria only to old gaussians
 
         # Opacity-based pruning for old gaussians
         is_prune |= opacity_activation(params["opacities"].detach().flatten()) < self.prune_opa
-        
-        # Apply skyness filter - sky gaussians should not be pruned
-        # is_prune = is_prune & is_not_sky
 
         # Only prune by size after first reset epoch
         if (epoch_ctx.i_epoch - state.get("last_reset_epoch", -1000)) > 0:
@@ -562,8 +536,7 @@ class DefaultStrategy(Strategy):
                 is_low_importance = normalized_scores <= threshold
 
                 # Combine with existing prune mask (only for old gaussians)
-                # Apply skyness filter to importance-based pruning
-                is_prune |= is_low_importance & is_not_sky
+                is_prune |= is_low_importance
 
                 if self.verbose:
                     print(f"Importance pruning: marking {is_low_importance.sum().item()} gaussians "

@@ -462,7 +462,7 @@ __global__ void rasterize_to_pixels_2dgs_wsum_fwd_kernel(
     }
     if (inside) {
         // For weighted sum, alpha is not meaningful - set to 1 if any contribution
-        render_alphas[pix_id] = (cur_idx > 0) ? 1.0f : 0.0f;
+        render_alphas[pix_id] = (max_weight > 0.f) ? 1.0f : 0.0f;
 #pragma unroll
         for (uint32_t k = 0; k < CDIM; ++k) {
             render_colors[pix_id * CDIM + k] = pix_out[k];

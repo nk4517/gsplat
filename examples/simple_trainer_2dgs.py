@@ -78,8 +78,10 @@ class Config:
     # data_dir: str = r"X:\_ai\_gsplat\datasets\kitchen"
     # data_dir: str = r"x:\_ai\_gsplat\datasets\fb_colmap_res"
     # data_dir: str = r"y:\_gopro_kv92\extracted_keyframes\GOPR6996_colmap"
+    # data_dir: str = r"y:\_gopro_kv92\calib_charuco\video\extracted_keyframes\GOPR7015\colmap_db"
+    data_dir: str = r"y:\_gopro_kv92\2025-10-06-1\3-statue"
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
-    data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
+    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
     # data_dir: str = r"x:\_ai\_glomap\data\south-building"
     # Downsample factor for the dataset
     data_factor: int = 4
@@ -103,19 +105,19 @@ class Config:
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
     # A global factor to scale the number of training steps
-    steps_scaler: float = 1.0
+    steps_scaler: float = 4.0
 
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [500, 7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
     # Initialization strategy
-    init_type: str = "sfm" # "random" # "sfm"
+    init_type: str = "random" # "random" # "sfm"
     # Initial number of GSs. Ignored if using sfm
-    init_num_pts: int = 100_000
+    init_num_pts: int = 200_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
@@ -137,7 +139,7 @@ class Config:
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.05
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float = 0.0002
+    grow_grad2d: float = 0.0001
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
@@ -228,7 +230,7 @@ class Config:
     dist_start_iter: int = 3_000
 
     # Opacity entropy regularization (penalizes partial transparency)
-    opacity_entropy_loss: bool = True
+    opacity_entropy_loss: bool = False
     # Weight for opacity entropy loss
     opacity_entropy_lambda: float = 1e-3
     # Iteration to start opacity entropy regularization
@@ -262,7 +264,7 @@ class Config:
     scale_percentile_start_iter: int = 1_000
 
     # Effective rank regularization (penalizes low-rank gaussians). from arXiv:2406.11672
-    erank_loss: bool = False
+    erank_loss: bool = True
     # Weight for effective rank loss
     erank_lambda: float = 1e-3
     # Iteration to start effective rank regularization
@@ -297,8 +299,8 @@ class Config:
     importance_prune_ratio: float = 0.005  # Fraction to prune (0.3 = remove 30% least important)
 
     # Split parameters for gaussians that dominate or touch too many pixels
-    split_big_dominated_pct: float = 0.001  # Split gaussians dominating more than this percentage of pixels in one view
-    split_big_touched_pct: float = 0.0025  # Split gaussians touching more than this percentage of pixels in one view
+    split_big_dominated_pct: float = 0.005  # Split gaussians dominating more than this percentage of pixels in one view
+    split_big_touched_pct: float = 0.025  # Split gaussians touching more than this percentage of pixels in one view
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -394,6 +396,13 @@ def create_splats_with_optimizers(
         scaled_eps = 1e-15 / math.sqrt(batch_size)
         scaled_betas = (1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.99))#, 1 - batch_size * (1 - 0.99))
 
+        adan111 = False
+
+        if adan111:
+            scaled_betas = (0.98, 0.92, 0.99)
+            # scaled_betas = (1 - batch_size * (1 - 0.98), 1 - batch_size * (1 - 0.99), 1 - batch_size * (1 - 0.99))
+
+
         # Choose optimizer based on sparse_grad setting
         if sparse_grad:
             # Use SparseAdam for sparse gradients
@@ -403,8 +412,9 @@ def create_splats_with_optimizers(
                 betas=scaled_betas,
             )
         else:
+
             # Use Adan optimizer (drop-in replacement for Adam with better performance)
-            optimizer = torch.optim.Adam(
+            optimizer = (Adan if adan111 else torch.optim.Adam)(
                 [{"params": splats[name], "lr": lr }],
                 eps=scaled_eps,
                 betas=scaled_betas,
@@ -864,7 +874,7 @@ class Runner:
         self.camera_optimizer.get_param_groups(camera_optimizers)
         for opt_name, opt_params in camera_optimizers.items():
             if opt_params:  # Only if there are parameters to optimize
-                optimizer = torch.optim.Adam(
+                optimizer = Adan(
                     opt_params,
                     lr=1e-5 * math.sqrt(cfg.batch_size),  # Default lr, can be adjusted
                     weight_decay=1e-6,
@@ -881,7 +891,7 @@ class Runner:
 
         # Create optimizer for intrinsics if enabled
         if cfg.optimize_intrinsics and self.optimized_Ks is not None:
-            intrinsics_optimizer = torch.optim.Adam(
+            intrinsics_optimizer = Adan(
                 self.optimized_Ks.parameters(),
                 lr=cfg.intrinsics_lr * math.sqrt(cfg.batch_size),
                 eps=1e-15 / math.sqrt(cfg.batch_size),
@@ -1320,16 +1330,41 @@ class Runner:
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.optimize_intrinsics and self.optimized_Ks is not None:
-                    # Log first camera's intrinsics as example
-                    fx, fy, cx, cy = self.Ks_structure[0]
-                    if fx is not None:
-                        self.writer.add_scalar("train/intrinsics/fx", fx.item(), step)
-                    if fy is not None:
-                        self.writer.add_scalar("train/intrinsics/fy", fy.item(), step)
-                    if cx is not None:
-                        self.writer.add_scalar("train/intrinsics/cx", cx.item(), step)
-                    if cy is not None:
-                        self.writer.add_scalar("train/intrinsics/cy", cy.item(), step)
+                    # Log relative intrinsics changes for first camera as example
+                    cam_data = self.trainset[0]
+                    K_orig = cam_data["K"]
+                    width = cam_data["image"].shape[1]  # [H, W, 3]
+                    
+                    fx_orig = K_orig[0, 0].item()
+                    fy_orig = K_orig[1, 1].item()
+                    cx_orig = K_orig[0, 2].item()
+                    cy_orig = K_orig[1, 2].item()
+                    
+                    fx_opt, fy_opt, cx_opt, cy_opt = self.Ks_structure[0]
+                    
+                    # Calculate center shift as percentage of image width
+                    if cx_opt is not None and cy_opt is not None:
+                        self.writer.add_scalar("train/intrinsics/cx", cx_opt.item(), step)
+                        self.writer.add_scalar("train/intrinsics/cy", cy_opt.item(), step)
+                        cx_shift = (cx_opt.item() - cx_orig)
+                        cy_shift = (cy_opt.item() - cy_orig)
+                        center_shift = math.sqrt(cx_shift**2 + cy_shift**2)
+                        self.writer.add_scalar("train/intrinsics/center_shift", center_shift, step)
+                        self.writer.add_scalar("train/intrinsics/center_shift_rel", center_shift / width, step)
+                    
+                    # Calculate focal length change ratio
+                    if fx_opt is not None and fy_opt is not None:
+                        focal_orig = (fx_orig + fy_orig) / 2.0
+                        focal_opt = (fx_opt.item() + fy_opt.item()) / 2.0
+                        focal_ratio = focal_opt / focal_orig
+                        self.writer.add_scalar("train/intrinsics/focal_ratio", focal_ratio, step)
+                    
+                    # Calculate aspect ratio change
+                    if fx_opt is not None and fy_opt is not None:
+                        aspect_orig = fx_orig / fy_orig
+                        aspect_opt = fx_opt.item() / fy_opt.item()
+                        aspect_ratio_change = aspect_opt / aspect_orig
+                        self.writer.add_scalar("train/intrinsics/aspect_ratio_change", aspect_ratio_change, step)
                 if cfg.tb_save_image:
                     canvas = (
                         torch.cat([pixels, colors[..., :3]], dim=2)
@@ -1407,6 +1442,31 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
                 self.render_traj(step)
+
+            # запускать нужно тут, иначе перед eval оно может сделать prune и всё будет некрасиво до конца следующей эпохи
+            # Run post-backward steps after backward and optimizer
+            if isinstance(self.cfg.strategy, DefaultStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    epoch_ctx=epoch_ctx,
+                    packed=cfg.packed,
+                )
+            elif isinstance(self.cfg.strategy, MCMCStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    lr=schedulers[0].get_last_lr()[0],
+                    epoch_ctx=epoch_ctx,
+                )
+            else:
+                assert_never(self.cfg.strategy)
 
             if not cfg.disable_viewer and cfg.use_viser:
                 self.viewer.lock.release()

@@ -398,29 +398,32 @@ rasterize_to_pixels_2dgs_generic_fwd(
     at::DimVector render_median_dims(image_dims);
     render_median_dims.append({image_height, image_width, 1});
     at::Tensor render_median = at::empty(render_median_dims, opt);
-    
+
     // Additional tensors for dominating gaussian tracking
     bool packed = means2d.dim() == 2;
-    uint32_t N = packed ? means2d.size(0) : means2d.size(-2);
-    
-    at::Tensor n_touched = track_n_touched ? 
-        at::zeros({N}, opt.dtype(at::kInt)) : at::empty({0}, opt.dtype(at::kInt));
-    at::Tensor n_dominated = track_n_dominated ? 
-        at::zeros({N}, opt.dtype(at::kInt)) : at::empty({0}, opt.dtype(at::kInt));
-    
-    at::DimVector dominating_dims(image_dims);
-    dominating_dims.append({image_height, image_width});
-    at::Tensor dominating_gauss_ids = track_dominating ? 
-        at::empty(dominating_dims, opt.dtype(at::kInt)) : at::empty({0}, opt.dtype(at::kInt));
-    at::Tensor dominating_weights = track_dominating ? 
-        at::empty(dominating_dims, opt) : at::empty({0}, opt);
+    uint32_t N = packed ? 0 : means2d.size(-2); // number of gaussians
+
+    at::DimVector n_touched_dims(opacities.sizes());
+
+    at::Tensor n_touched = track_n_touched
+                               ? at::zeros(n_touched_dims, opt.dtype(at::kInt))
+                               : at::empty({0}, opt.dtype(at::kInt));
+    at::Tensor n_dominated = track_n_dominated
+                                 ? at::zeros(n_touched_dims, opt.dtype(at::kInt))
+                                 : at::empty({0}, opt.dtype(at::kInt));
+
+    at::Tensor dominating_gauss_ids =
+        track_dominating ? at::empty(median_ids_dims, opt.dtype(at::kInt))
+                         : at::empty({0}, opt.dtype(at::kInt));
+    at::Tensor dominating_weights = track_dominating ?
+        at::empty(median_ids_dims, opt) : at::empty({0}, opt);
     at::Tensor dominating_depths = track_dominating ? 
-        at::empty(dominating_dims, opt) : at::empty({0}, opt);
+        at::empty(median_ids_dims, opt) : at::empty({0}, opt);
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
-        if constexpr (Mode == RenderMode2DGS::STANDARD) {                    \
-            launch_rasterize_to_pixels_2dgs_fwd_kernel<N>(                    \
+        if constexpr (Mode == RenderMode2DGS::STANDARD) {                      \
+            launch_rasterize_to_pixels_2dgs_fwd_kernel<N>(                     \
                 means2d,                                                       \
                 ray_transforms,                                                \
                 colors,                                                        \

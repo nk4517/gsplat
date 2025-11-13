@@ -10,6 +10,25 @@ from .ops import inject_noise_to_position, relocate, sample_add, opacity_activat
 from .epoch_stats import EpochStatistics, EpochContext
 
 
+def _calc_prob1(params, state):
+    opacities = opacity_activation(params["opacities"].flatten())
+    probs = opacities.clone()
+    # Can modify probs here based on other criteria
+    # For example, using importance scores from epoch_stats
+    if "epoch_stats" in state and hasattr(state["epoch_stats"], "importance"):
+        importance = state["epoch_stats"].importance
+        count = state["epoch_stats"].count
+        # Weight by normalized importance
+        normalized_importance = torch.where(
+            count > 0,
+            importance / count.clamp_min(1),
+            torch.zeros_like(importance)
+        )
+        # Combine opacity with importance
+        probs = normalized_importance
+    return probs
+
+
 @dataclass
 class MCMCStrategy(Strategy):
     """Strategy that follows the paper:
@@ -170,6 +189,14 @@ class MCMCStrategy(Strategy):
             if not epoch_ctx.epoch_end:
                 return
 
+            # # Prune large gaussians after adding new ones
+            # n_pruned = self._prune_large_gs(params, optimizers, state, step)
+            # if n_pruned > 0 and self.verbose:
+            #     print(
+            #         f"Epoch {epoch_ctx.i_epoch} (Step {step}): Pruned {n_pruned} large GSs. "
+            #         f"Now having {len(params['means'])} GSs."
+            #     )
+
             state["binoms"] = state["binoms"].to(device)
 
             binoms = state["binoms"]
@@ -219,12 +246,35 @@ class MCMCStrategy(Strategy):
         state: Dict[str, Any],
     ) -> int:
         opacities = opacity_activation(params["opacities"].flatten())
+        device = params["scales"].device
+        
+        # Start with dead splats (low opacity)
         dead_mask = opacities <= self.min_opacity
+        
+        # Add large splats for relocation instead of pruning
+        # Check 3D scale
+        is_too_big = (
+            scaling_activation(params["scales"]).max(dim=-1).values
+            > self.prune_scale3d * state["scene_scale"]
+        )
+        dead_mask |= is_too_big
+
+        if "epoch_stats" in state and hasattr(state["epoch_stats"], "max_touchedPct"):
+            # Prune gaussians that touch too many pixels (e.g., > 1% of image)
+            is_too_big_2d = state["epoch_stats"].max_touchedPct > 0.9
+            dead_mask |= is_too_big_2d
+        
         if "epoch_stats" in state:
             # Use n_touched from epoch to determine dead splats
             dead_mask |= state["epoch_stats"].n_touched_accum == 0
             
-            # Relocate 10% of splats with lowest importance scores
+            # Check 2D scale if enabled
+            if hasattr(state["epoch_stats"], "max_touchedPct"):
+                # Relocate gaussians that touch too many pixels (e.g., > 90% of image)
+                is_too_big_2d = state["epoch_stats"].max_touchedPct > 0.9
+                dead_mask |= is_too_big_2d
+            
+            # Also relocate 10% of splats with lowest importance scores
             epoch_stats = state["epoch_stats"]
             if hasattr(epoch_stats, "importance") and hasattr(epoch_stats, "count"):
                 scores = epoch_stats.importance
@@ -235,17 +285,23 @@ class MCMCStrategy(Strategy):
                     scores / count.clamp_min(1),
                     torch.zeros_like(scores)
                 )
-                
-                # Find threshold for relocating 10% with lowest importance
+
+                pct = 0.2
+
+                # Find threshold for relocating N% with lowest importance
                 if normalized_scores.numel() > 0:
                     # Use quantile to find 10th percentile threshold
-                    threshold = torch.quantile(normalized_scores, 0.1)
+                    threshold = torch.quantile(normalized_scores, pct)
                     # Mark gaussians below threshold for relocation
                     is_low_importance = normalized_scores <= threshold
                     dead_mask |= is_low_importance
                         
         n_gs = dead_mask.sum().item()
         if n_gs > 0:
+            # Compute sampling probabilities
+            # probs = _calc_prob1(params, state)
+            probs = None
+
             relocate(
                 params=params,
                 optimizers=optimizers,
@@ -254,6 +310,7 @@ class MCMCStrategy(Strategy):
                 binoms=binoms,
                 min_opacity=self.min_opacity,
                 model_type=self.model_type,
+                probs=probs,
             )
         return n_gs
 
@@ -269,6 +326,10 @@ class MCMCStrategy(Strategy):
         n_target = min(self.cap_max, int(self.growth_factor * current_n_points))
         n_gs = max(0, n_target - current_n_points)
         if n_gs > 0:
+            # Compute sampling probabilities
+            # probs = _calc_prob1(params, state)
+            probs=None
+
             sample_add(
                 params=params,
                 optimizers=optimizers,
@@ -277,6 +338,7 @@ class MCMCStrategy(Strategy):
                 binoms=binoms,
                 min_opacity=self.min_opacity,
                 model_type=self.model_type,
+                probs=probs,
             )
         return n_gs
 
@@ -302,10 +364,11 @@ class MCMCStrategy(Strategy):
         )
         is_prune |= is_too_big
         
-        # Prune by 2D scale if enabled
+        # Prune by max touched percentage if enabled
         if self.refine_scale2d_stop_iter > 0 and step < self.refine_scale2d_stop_iter:
-            if "epoch_stats" in state and state["epoch_stats"].radii is not None:
-                is_too_big_2d = state["epoch_stats"].radii > self.prune_scale2d
+            if "epoch_stats" in state and hasattr(state["epoch_stats"], "max_touchedPct"):
+                # Prune gaussians that touch too many pixels (e.g., > 1% of image)
+                is_too_big_2d = state["epoch_stats"].max_touchedPct > 0.9
                 is_prune |= is_too_big_2d
         
         n_prune = is_prune.sum().item()

@@ -420,6 +420,7 @@ def rasterization_2dgs(
         "dominating_gauss_ids": domik.dominating_gauss_ids,
         "dominating_weights": domik.dominating_weights,
         "dominating_depths": domik.dominating_depthmap,
+        "median_ids": domik.median_ids,
     }
     
     if rendered_extras is not None:

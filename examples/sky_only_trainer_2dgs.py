@@ -7,6 +7,7 @@ from functools import wraps
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
+from examples.sky_only_trainer_2dgs_viewer import skysphere_renderer
 from examples.vs_env import set_vc_envs; set_vc_envs()
 
 import torch

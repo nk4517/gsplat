@@ -138,7 +138,10 @@ class SkysphereModelParametrized(nn.Module):
         # Register parameters - NO means, only quaternions
         self.scales = nn.Parameter(scales)
         self.quats = nn.Parameter(quats)
-        self.colors = nn.Parameter(colors)
+        # Store colors as logits for unconstrained optimization
+        colors_clamped = colors.clamp(1e-5, 1 - 1e-5)  # Avoid inf in logit
+        colors_logit = torch.logit(colors_clamped)
+        self.colors = nn.Parameter(colors_logit)
         
         # Update radius buffer if needed
         self.radius_buffer = torch.tensor(self.radius, device=self.device)
@@ -157,7 +160,7 @@ class SkysphereModelParametrized(nn.Module):
             "scales": self.scales,
             "quats": self.quats,
             "opacities": self.opacities,
-            "colors": self.colors,
+            "colors": torch.sigmoid(self.colors),  # Convert from logit to RGB
         }
     
     def create_optimizers(self, batch_size: int = 1, sparse_grad: bool = False) -> Dict[str, torch.optim.Optimizer]:
@@ -166,12 +169,13 @@ class SkysphereModelParametrized(nn.Module):
             return {}
         
         from adan import Adan
+        from torch.optim import Adam
         
         # Learning rates for skysphere (no means to optimize)
         lr_config = {
-            "scales": 1e-2,
+            "scales": 5e-2,
             "quats": 5e-4,  # Quaternions control both orientation AND position
-            "colors": 2.5e-3,
+            "colors": 2.5e-2,
         }
         
         optimizers = {}

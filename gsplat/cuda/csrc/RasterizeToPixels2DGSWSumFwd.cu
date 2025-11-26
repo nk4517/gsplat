@@ -267,6 +267,8 @@ __global__ void rasterize_to_pixels_2dgs_wsum_fwd_kernel(
     // designated pixel
     uint32_t tr = block.thread_rank();
 
+    float weighted_alpha = 0.f;  // For weighted sum of alphas
+
     // Variables for tracking dominating gaussian
     float max_weight = 0.f;
     int32_t dominating_gid = -1;
@@ -451,6 +453,9 @@ __global__ void rasterize_to_pixels_2dgs_wsum_fwd_kernel(
             // Accumulate weighted depth
             weighted_depth += depth_at_pixel * vis;
 
+            // Accumulate weighted sum of alphas
+            weighted_alpha += alpha;
+
             // Track touched gaussians
             if (n_touched != nullptr) {
                 atomicAdd(&n_touched[g], 1);
@@ -461,8 +466,8 @@ __global__ void rasterize_to_pixels_2dgs_wsum_fwd_kernel(
         }
     }
     if (inside) {
-        // For weighted sum, alpha is not meaningful - set to 1 if any contribution
-        render_alphas[pix_id] = (max_weight > 0.f) ? 1.0f : 0.0f;
+        // Store weighted sum of alphas
+        render_alphas[pix_id] = weighted_alpha;
 #pragma unroll
         for (uint32_t k = 0; k < CDIM; ++k) {
             render_colors[pix_id * CDIM + k] = pix_out[k];

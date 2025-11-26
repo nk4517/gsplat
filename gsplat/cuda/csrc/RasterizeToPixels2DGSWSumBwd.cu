@@ -131,6 +131,7 @@ __global__ void rasterize_to_pixels_2dgs_wsum_bwd_kernel(
     // Fetch gradients for this pixel
     float v_render_c[CDIM];
     float v_render_n[3];
+    float v_render_a = 0.f;
 
     if (inside) {
 #pragma unroll
@@ -141,6 +142,7 @@ __global__ void rasterize_to_pixels_2dgs_wsum_bwd_kernel(
         for (uint32_t k = 0; k < 3; ++k) {
             v_render_n[k] = v_render_normals[pix_id * 3 + k];
         }
+        v_render_a = v_render_alphas[pix_id];
     }
 
     const uint32_t tr = block.thread_rank();
@@ -261,6 +263,9 @@ __global__ void rasterize_to_pixels_2dgs_wsum_bwd_kernel(
                         for (uint32_t k = 0; k < 3; ++k) {
                             v_alpha += normals_batch[t * 3 + k] * v_render_n[k];
                         }
+
+                        // Gradient from weighted sum of alphas: ∂(Σ alpha_i)/∂alpha_i = 1
+                        v_alpha += v_render_a;
 
                         // Gradient through gaussian weight
                         float v_G = opac * v_alpha;

@@ -13,12 +13,11 @@ namespace gsplat {
 
 namespace cg = cooperative_groups;
 
-template <typename scalar_t>
+template <uint32_t K, typename scalar_t>
 __global__ void sh_background_fwd_kernel(
     const uint32_t B,           // batch size
     const uint32_t H,           // image height
     const uint32_t W,           // image width
-    const uint32_t K,           // number of SH coefficients
     const uint32_t degree,      // SH degree
     const scalar_t *__restrict__ camtoworlds,  // [B, 4, 4]
     const scalar_t *__restrict__ Ks,           // [B, 3, 3]
@@ -96,13 +95,11 @@ __global__ void sh_background_fwd_kernel(
         out[c] = fminf(fmaxf(out[c], 0.0f), 1.0f);
     }
 }
-
-template <typename scalar_t>
+template <uint32_t K, typename scalar_t>
 __global__ void sh_background_bwd_kernel(
     const uint32_t B,
     const uint32_t H,
     const uint32_t W,
-    const uint32_t K,
     const uint32_t degree,
     const scalar_t *__restrict__ camtoworlds,
     const scalar_t *__restrict__ Ks,
@@ -166,7 +163,7 @@ __global__ void sh_background_bwd_kernel(
     const scalar_t *v_color = v_colors + idx * 3;
     
     // Local gradient accumulators for all coefficients and channels
-    scalar_t v_coeffs_local[25 * 3] = {0.f};  // Max degree 4 -> 25 coeffs, 3 channels
+    scalar_t v_coeffs_local[K * 3] = {0.f};
     
     if (valid) {
         // Compute gradients for all color channels
@@ -191,6 +188,7 @@ __global__ void sh_background_bwd_kernel(
         return;
     }
     
+#pragma unroll
     for (uint32_t k = 0; k < K; ++k) {
 #pragma unroll
         for (uint32_t c = 0; c < 3; ++c) {
@@ -205,6 +203,7 @@ __global__ void sh_background_bwd_kernel(
     
     // Only first thread in warp writes to global memory
     if (warp.thread_rank() == 0) {
+#pragma unroll
         for (uint32_t k = 0; k < K; ++k) {
 #pragma unroll
             for (uint32_t c = 0; c < 3; ++c) {
@@ -236,20 +235,37 @@ void launch_sh_background_fwd_kernel(
         return;
     }
     
-    AT_DISPATCH_FLOATING_TYPES(
-        sh_coeffs.scalar_type(),
-        "sh_background_fwd_kernel",
-        [&]() {
-            sh_background_fwd_kernel<scalar_t>
-                <<<grid, threads, K * 3 * sizeof(scalar_t), at::cuda::getCurrentCUDAStream()>>>(
-                    B, H, W, K, degree,
-                    camtoworlds.data_ptr<scalar_t>(),
-                    Ks.data_ptr<scalar_t>(),
-                    sh_coeffs.data_ptr<scalar_t>(),
-                    colors.data_ptr<scalar_t>()
-                );
-        }
-    );
+#define __LAUNCH_KERNEL__(K_VAL)                                               \
+    case K_VAL:                                                                \
+        AT_DISPATCH_FLOATING_TYPES(                                            \
+            sh_coeffs.scalar_type(),                                           \
+            "sh_background_fwd_kernel",                                        \
+            [&]() {                                                            \
+                sh_background_fwd_kernel<K_VAL, scalar_t>                      \
+                    <<<grid, threads, K * 3 * sizeof(scalar_t),                \
+                       at::cuda::getCurrentCUDAStream()>>>(                    \
+                        B, H, W, degree,                                       \
+                        camtoworlds.data_ptr<scalar_t>(),                      \
+                        Ks.data_ptr<scalar_t>(),                               \
+                        sh_coeffs.data_ptr<scalar_t>(),                        \
+                        colors.data_ptr<scalar_t>()                            \
+                    );                                                         \
+            }                                                                  \
+        );                                                                     \
+        break;
+
+    switch (K) {
+        __LAUNCH_KERNEL__(1)
+        __LAUNCH_KERNEL__(4)
+        __LAUNCH_KERNEL__(9)
+        __LAUNCH_KERNEL__(16)
+        __LAUNCH_KERNEL__(25)
+        __LAUNCH_KERNEL__(36)
+        __LAUNCH_KERNEL__(49)
+    default:
+        AT_ERROR("Unsupported number of SH coefficients: ", K);
+    }
+#undef __LAUNCH_KERNEL__
 }
 
 void launch_sh_background_bwd_kernel(
@@ -275,21 +291,38 @@ void launch_sh_background_bwd_kernel(
         return;
     }
     
-    AT_DISPATCH_FLOATING_TYPES(
-        sh_coeffs.scalar_type(),
-        "sh_background_bwd_kernel",
-        [&]() {
-            sh_background_bwd_kernel<scalar_t>
-                <<<grid, threads, K * 3 * sizeof(scalar_t), at::cuda::getCurrentCUDAStream()>>>(
-                    B, H, W, K, degree,
-                    camtoworlds.data_ptr<scalar_t>(),
-                    Ks.data_ptr<scalar_t>(),
-                    sh_coeffs.data_ptr<scalar_t>(),
-                    v_colors.data_ptr<scalar_t>(),
-                    v_sh_coeffs.data_ptr<scalar_t>()
-                );
-        }
-    );
+#define __LAUNCH_KERNEL__(K_VAL)                                               \
+    case K_VAL:                                                                \
+        AT_DISPATCH_FLOATING_TYPES(                                            \
+            sh_coeffs.scalar_type(),                                           \
+            "sh_background_bwd_kernel",                                        \
+            [&]() {                                                            \
+                sh_background_bwd_kernel<K_VAL, scalar_t>                      \
+                    <<<grid, threads, K * 3 * sizeof(scalar_t),                \
+                       at::cuda::getCurrentCUDAStream()>>>(                    \
+                        B, H, W, degree,                                       \
+                        camtoworlds.data_ptr<scalar_t>(),                      \
+                        Ks.data_ptr<scalar_t>(),                               \
+                        sh_coeffs.data_ptr<scalar_t>(),                        \
+                        v_colors.data_ptr<scalar_t>(),                         \
+                        v_sh_coeffs.data_ptr<scalar_t>()                       \
+                    );                                                         \
+            }                                                                  \
+        );                                                                     \
+        break;
+
+    switch (K) {
+        __LAUNCH_KERNEL__(1)
+        __LAUNCH_KERNEL__(4)
+        __LAUNCH_KERNEL__(9)
+        __LAUNCH_KERNEL__(16)
+        __LAUNCH_KERNEL__(25)
+        __LAUNCH_KERNEL__(36)
+        __LAUNCH_KERNEL__(49)
+    default:
+        AT_ERROR("Unsupported number of SH coefficients: ", K);
+    }
+#undef __LAUNCH_KERNEL__
 }
 
 } // namespace gsplat

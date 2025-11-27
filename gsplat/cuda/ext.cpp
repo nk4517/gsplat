@@ -24,6 +24,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("spherical_harmonics_fwd", &gsplat::spherical_harmonics_fwd);
     m.def("spherical_harmonics_bwd", &gsplat::spherical_harmonics_bwd);
 
+    m.def("sh_background_fwd", &gsplat::sh_background_fwd);
+    m.def("sh_background_bwd", &gsplat::sh_background_bwd);
+
     m.def("adam", &gsplat::adam);
     m.def("relocation", &gsplat::relocation);
 

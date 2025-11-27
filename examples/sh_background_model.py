@@ -45,6 +45,27 @@ class SHBackgroundModel(nn.Module):
         Returns:
             RGB image [B, H, W, 3]
         """
+        from gsplat import sh_background
+        
+        # Use CUDA implementation
+        colors = sh_background(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            sh_coeffs=self.sh_coeffs,
+            width=width,
+            height=height,
+            degree=self.sh_degree,
+        )  # [B, H, W, 3]
+
+        return torch.clamp(colors, 0.0, 1.0)
+
+    def _renderer_old(
+            self,
+            camtoworlds: torch.Tensor,  # [B, 4, 4]
+            Ks: torch.Tensor,  # [B, 3, 3]
+            width: int,
+            height: int,
+    ):
         from gsplat.cuda._wrapper import spherical_harmonics
 
         batch_size = camtoworlds.shape[0]

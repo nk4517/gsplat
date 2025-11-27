@@ -181,6 +181,44 @@ def spherical_harmonics(
     )
 
 
+def sh_background(
+    camtoworlds: Tensor,  # [B, 4, 4]
+    Ks: Tensor,  # [B, 3, 3]
+    sh_coeffs: Tensor,  # [K, 3]
+    width: int,
+    height: int,
+    degree: int,
+) -> Tensor:
+    """Renders spherical harmonics background.
+
+    For each pixel, computes ray direction in world space and evaluates
+    spherical harmonics to obtain background color.
+
+    Args:
+        camtoworlds: Camera-to-world transformation matrices. [B, 4, 4]
+        Ks: Camera intrinsics. [B, 3, 3]
+        sh_coeffs: Spherical harmonics coefficients. [K, 3]
+        width: Image width.
+        height: Image height.
+        degree: SH degree to use.
+
+    Returns:
+        Background colors. [B, height, width, 3]
+    """
+    B = camtoworlds.shape[0]
+    assert camtoworlds.shape == (B, 4, 4), camtoworlds.shape
+    assert Ks.shape == (B, 3, 3), Ks.shape
+    K = sh_coeffs.shape[0]
+    assert sh_coeffs.shape == (K, 3), sh_coeffs.shape
+    assert (degree + 1) ** 2 <= K, f"degree {degree} requires {(degree + 1) ** 2} coeffs, got {K}"
+    
+    camtoworlds = camtoworlds.contiguous()
+    Ks = Ks.contiguous()
+    sh_coeffs = sh_coeffs.contiguous()
+    
+    return _SHBackground.apply(camtoworlds, Ks, sh_coeffs, width, height, degree)
+
+
 def quat_scale_to_covar_preci(
     quats: Tensor,  # [..., 4],
     scales: Tensor,  # [..., 3],
@@ -1843,6 +1881,53 @@ class _SphericalHarmonics(torch.autograd.Function):
         if not compute_v_dirs:
             v_dirs = None
         return None, v_dirs, v_coeffs, None
+
+
+class _SHBackground(torch.autograd.Function):
+    """Spherical Harmonics Background Rendering.
+    
+    Renders environment background using spherical harmonics. For each pixel,
+    computes ray direction in world space (via camera intrinsics and extrinsics)
+    and evaluates SH coefficients to obtain background color.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        camtoworlds: Tensor,  # [B, 4, 4]
+        Ks: Tensor,  # [B, 3, 3]
+        sh_coeffs: Tensor,  # [K, 3]
+        width: int,
+        height: int,
+        degree: int,
+    ) -> Tensor:
+        colors = _make_lazy_cuda_func("sh_background_fwd")(
+            camtoworlds, Ks, sh_coeffs, width, height, degree
+        )
+        ctx.save_for_backward(camtoworlds, Ks, sh_coeffs)
+        ctx.width = width
+        ctx.height = height
+        ctx.degree = degree
+        return colors
+
+    @staticmethod
+    def backward(ctx, v_colors: Tensor):
+        camtoworlds, Ks, sh_coeffs = ctx.saved_tensors
+        width = ctx.width
+        height = ctx.height
+        degree = ctx.degree
+        
+        v_sh_coeffs = _make_lazy_cuda_func("sh_background_bwd")(
+            camtoworlds,
+            Ks,
+            sh_coeffs,
+            width,
+            height,
+            degree,
+            v_colors.contiguous(),
+        )
+        
+        return None, None, v_sh_coeffs, None, None, None
 
 
 ###### 2DGS ######

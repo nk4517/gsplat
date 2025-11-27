@@ -168,6 +168,25 @@ std::tuple<at::Tensor, at::Tensor> spherical_harmonics_bwd(
     bool compute_v_dirs
 );
 
+// SH Background rendering
+at::Tensor sh_background_fwd(
+    const at::Tensor camtoworlds,  // [B, 4, 4]
+    const at::Tensor Ks,           // [B, 3, 3]
+    const at::Tensor sh_coeffs,    // [K, 3]
+    const uint32_t width,
+    const uint32_t height,
+    const uint32_t degree
+);
+at::Tensor sh_background_bwd(
+    const at::Tensor camtoworlds,
+    const at::Tensor Ks,
+    const at::Tensor sh_coeffs,
+    const uint32_t width,
+    const uint32_t height,
+    const uint32_t degree,
+    const at::Tensor v_colors
+);
+
 // Fused Adam that supports a valid mask to skip updating certain parameters.
 // Note skipping is not equivalent with zeroing out the gradients, which will
 // still update parameters with momentum.

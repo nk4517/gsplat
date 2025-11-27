@@ -18,6 +18,7 @@ from .cuda._wrapper import (
     rasterize_to_pixels_2dgs,
     rasterize_to_pixels_eval3d,
     spherical_harmonics,
+    sh_background,
     world_to_cam,
 )
 from .exporter import export_splats

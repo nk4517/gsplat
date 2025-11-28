@@ -17,7 +17,32 @@
   - `scales` - масштабы сплатов
   - `colors` - RGB цвета
 
-### 2. Per-Camera 2D Splats (Gaussian2D from LIG)
+
+### 2. SH Background (SHBackgroundModel)
+- Глобальная модель фона на основе сферических гармоник
+- Заполняет области с низким покрытием skysphere (низкий wsum)
+- Параметры:
+  - `sh_coeffs` - обучаемые коэффициенты SH [K, 3], где K = (degree+1)²
+  - `sh_degree` - степень SH (обычно 2-4)
+  - `bg_base_weight` - базовый вес для блендинга
+  - `bg_threshold` - порог wsum, выше которого SH background не виден
+
+#### Блендинг неба
+```
+bg_weight = bg_base_weight * clamp((bg_threshold - sky_wsum) / transition_range, 0, inf)
+final_colors = (sky_colors + sh_bg * bg_weight) / (sky_wsum + bg_weight + eps)
+```
+- Плавный переход между skysphere и SH background
+- В областях с высоким wsum доминирует skysphere
+- В областях с низким wsum проявляется SH background
+
+#### Рендеринг SH Background
+- Вычисляетcя направление луча для каждого пикселя
+- Направление преобразуется из camera space в world space
+- Рассчитываются RGB цвета для этого направления
+- Результат клампируется в диапазон [0, 1]
+
+### 3. Per-Camera 2D Splats (Gaussian2D from LIG)
 - Индивидуальные 2D гауссианы для каждой камеры
 - Рендерят передний план (мир, объекты) и артефакты
 - Параметры хранятся в embedding:
@@ -26,7 +51,7 @@
   - `rgbs` - цвета
   - `uncertainty` - маска блендинга (active uncertainty)
 
-### 3. Blending
+### 4. Blending (в процессе)
 ```
 final_render = r_2d + (1 - uncertainty_mask) * r_sphere
 ```

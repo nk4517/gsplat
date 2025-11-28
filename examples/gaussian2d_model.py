@@ -43,8 +43,7 @@ class Gaussian2D(nn.Module):
         self.means = nn.Parameter(torch.cat((w_init, h_init), dim=1))
         
         self.cov2d = nn.Parameter(torch.rand(self.init_num_points, 3, device=self.device))
-        d = 3
-        self.rgbs = nn.Parameter(torch.zeros(self.init_num_points, d, device=self.device))
+        self.rgbs = nn.Parameter(torch.zeros(self.init_num_points, 3, device=self.device))
         
         self.means.requires_grad = True
         self.cov2d.requires_grad = True
@@ -79,7 +78,7 @@ class Gaussian2D(nn.Module):
             self.W,
             self.B_SIZE,
         )
-        out_img, dx, dy, dxy = rasterize_gaussians(
+        out_img, dx, dy, dxy, alpha = rasterize_gaussians(
                 xys,
                 radii,
                 conics,
@@ -103,7 +102,7 @@ class Gaussian2D(nn.Module):
         dxy = dxy[..., :3]
         dxy = dxy.view(-1, self.H, self.W, 3).permute(0, 3, 1, 2).contiguous()
         
-        return {"render": out_img, "dx": dx, "dy": dy, "dxy": dxy}
+        return {"render": out_img, "dx": dx, "dy": dy, "dxy": dxy, "alpha": alpha}
     
     def train_iter(self, gt_image):
         render_pkg = self.forward()

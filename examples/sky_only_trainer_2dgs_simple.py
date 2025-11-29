@@ -366,7 +366,7 @@ class SkyOnlySimpleRunner:
             image_ids = data["image_id"].to(device)  # [B]
             
             # Render sky
-            sky_colors, info = self.rasterize_sky(
+            sky_colors, sky_wsum, info = self.rasterize_sky(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -534,7 +534,7 @@ class SkyOnlySimpleRunner:
                 sky_mask = torch.ones((1, height, width), device=device)
             
             # Render sky
-            sky_colors, _ = self.rasterize_sky(
+            sky_colors, _, _ = self.rasterize_sky(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,

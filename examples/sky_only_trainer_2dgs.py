@@ -65,6 +65,7 @@ class SkyOnlyConfig:
     skysphere_points: int = 50_000
     init_opacity: float = 0.1
     init_scale: float = 1.0
+    trainable_opacities: bool = True
 
     # 2D Gaussian parameters
     gaussian2d_points: int = 10000
@@ -183,7 +184,10 @@ class SkyOnlyRunner:
         print(f"Number of validation images: {len(self.valset)}")
 
 
-        self.skysphere_model = SkysphereModelParametrized(self.parser.scene_scale)
+        self.skysphere_model = SkysphereModelParametrized(
+            self.parser.scene_scale,
+            trainable_opacities=cfg.trainable_opacities,
+        )
 
         # Initialize skysphere from trainset
         self.skysphere_model.initialize_from_trainset(

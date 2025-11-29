@@ -89,6 +89,7 @@ class SkysphereModelParametrized(nn.Module):
         self,
         scene_scale: float,
         radius_multiplier: float = 20.0,
+        trainable_opacities: bool = False,
         device: str = "cuda",
     ):
         super().__init__()
@@ -97,6 +98,7 @@ class SkysphereModelParametrized(nn.Module):
         self.radius_multiplier = radius_multiplier
         self.radius = scene_scale * radius_multiplier
         self.device = device
+        self.trainable_opacities = trainable_opacities
         
         # Initialize as empty by default
         self.n_points = 0
@@ -153,8 +155,12 @@ class SkysphereModelParametrized(nn.Module):
         # Update radius buffer if needed
         self.radius_buffer = torch.tensor(self.radius, device=self.device)
         
-        # Opacities are constant 1.0 for WEIGHTED_SUM mode
-        self.register_buffer('opacities', torch.ones((self.n_points,), device=self.device))
+        # Opacities - trainable or constant based on configuration
+        opacities_init = torch.ones((self.n_points,), device=self.device)
+        if self.trainable_opacities:
+            self.opacities = nn.Parameter(opacities_init)
+        else:
+            self.register_buffer('opacities', opacities_init)
         
     
     def get_splats(self) -> Dict[str, torch.Tensor]:
@@ -180,10 +186,14 @@ class SkysphereModelParametrized(nn.Module):
         
         # Learning rates for skysphere (no means to optimize)
         lr_config = {
-            "scales": 5e-2,
+            "scales": 5e-3,
             "quats": 5e-4,  # Quaternions control both orientation AND position
             "colors": 2.5e-2,
         }
+        
+        # Add opacities if trainable
+        if self.trainable_opacities:
+            lr_config["opacities"] = 1e-3
         
         optimizers = {}
         for name, lr in lr_config.items():
@@ -219,12 +229,14 @@ class SkysphereModelParametrized(nn.Module):
                 'is_empty': True,
                 'scene_scale': self.scene_scale,
                 'radius_multiplier': self.radius_multiplier,
+                'trainable_opacities': self.trainable_opacities,
             }
         else:
             checkpoint = {
                 'is_empty': False,
                 'scene_scale': self.scene_scale,
                 'radius_multiplier': self.radius_multiplier,
+                'trainable_opacities': self.trainable_opacities,
                 'n_points': self.n_points,
                 'state_dict': self.state_dict(),
             }
@@ -238,6 +250,7 @@ class SkysphereModelParametrized(nn.Module):
         self.radius_multiplier = checkpoint['radius_multiplier']
         self.radius = self.scene_scale * self.radius_multiplier
         self.is_empty = checkpoint['is_empty']
+        self.trainable_opacities = checkpoint.get('trainable_opacities', False)
         
         # Create SH background BEFORE load_state_dict (it's a submodule, its state is in state_dict)
         if checkpoint.get('has_sh_background', False):

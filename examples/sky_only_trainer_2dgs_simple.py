@@ -237,8 +237,8 @@ class SkyOnlySimpleRunner:
         
         means = sky_splats["means"]  # [N, 3]
         quats = sky_splats["quats"]  # [N, 4]
-        scales = sky_splats["scales"]  # [N, 3]
-        opacities = sky_splats["opacities"]  # [N,] - already 1.0 constants
+        scales = scaling_activation(sky_splats["scales"])  # [N, 3]
+        opacities = opacity_activation(sky_splats["opacities"])  # [N,] - already 1.0 constants
         
         # Use override colors if provided, otherwise use sky colors
         if override_colors is not None:

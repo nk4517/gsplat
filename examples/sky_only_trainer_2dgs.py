@@ -270,8 +270,9 @@ class SkyOnlyRunner:
 
         means = sky_splats["means"]  # [N, 3]
         quats = sky_splats["quats"]  # [N, 4]
-        scales = sky_splats["scales"]  # [N, 3]
-        opacities = sky_splats["opacities"]  # [N,] - already 1.0 constants
+
+        scales = scaling_activation(sky_splats["scales"])  # [N, 3]
+        opacities = opacity_activation(sky_splats["opacities"])  # [N,]
 
         drop_rate = kwargs.pop("drop_rate", None)
         if drop_rate is not None:
@@ -281,7 +282,7 @@ class SkyOnlyRunner:
         if override_colors is not None:
             colors = override_colors
         else:
-            colors = sky_splats["colors"]  # [N, 3] - direct RGB values
+            colors = opacity_activation(sky_splats["colors"])  # [N, 3] - RGB
 
         batch_size = camtoworlds.shape[0]
         # Expand colors for batch processing
@@ -471,14 +472,10 @@ class SkyOnlyRunner:
                 info["Ks"] = Ks
                 info["n_cameras"] = n_cameras
 
-                # Create dummy params dict with skysphere parameters
-                # sky_params = self.skysphere_model.get_splats()
-                sky_params = None
-
                 # Update statistics
                 self.epoch_stats.update_from_info(
                     info=info,
-                    params=sky_params,
+                    params=self.skysphere_model.params,
                     key_for_gradient="gradient_2dgs",
                     packed=info.get("packed", False)
                 )

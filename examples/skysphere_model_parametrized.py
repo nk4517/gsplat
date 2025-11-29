@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from typing import Dict
-from gsplat.strategy.ops import scaling_inverse_activation
+from gsplat.strategy.ops import scaling_inverse_activation, opacity_inverse_activation, opacity_activation, scaling_activation, rotation_activation
 from examples.utils import knn
 from examples.lib_skysphere import compute_skysphere_geometry, compute_skysphere_geometry_dog
 from examples.sh_background_model import SHBackgroundModel
@@ -115,6 +115,9 @@ class SkysphereModelParametrized(nn.Module):
         # Store radius as buffer
         self.register_buffer('radius_buffer', torch.tensor(self.radius, device=device))
         
+        # Initialize params as ParameterDict for direct passing to strategy
+        self.params = nn.ParameterDict()
+        
         # Initialize SH background if enabled
         if use_sh_background:
             self.sh_background = SHBackgroundModel(
@@ -162,36 +165,35 @@ class SkysphereModelParametrized(nn.Module):
         
         # Use simple RGB colors (no view-dependent effects for distant sky)
         
-        # Register parameters - NO means, only quaternions
-        self.scales = nn.Parameter(scales)
-        self.quats = nn.Parameter(quats)
+        # Register parameters in params dict - NO means, only quaternions
+        self.params['scales'] = nn.Parameter(scales)
+        self.params['quats'] = nn.Parameter(quats)
         # Store colors as logits for unconstrained optimization
         colors_clamped = colors.clamp(1e-5, 1 - 1e-5)  # Avoid inf in logit
-        colors_logit = torch.logit(colors_clamped)
-        self.colors = nn.Parameter(colors_logit)
+        colors_logit = opacity_inverse_activation(colors_clamped)
+        self.params['colors'] = nn.Parameter(colors_logit)
         
         # Update radius buffer if needed
         self.radius_buffer = torch.tensor(self.radius, device=self.device)
         
         opacities_init = torch.ones((self.n_points,), device=self.device)
-        if self.trainable_opacities:
-            self.opacities = nn.Parameter(opacities_init)
-        else:
-            self.register_buffer('opacities', opacities_init)
+        opacities = opacity_inverse_activation(opacities_init.clamp(1e-5, 1 - 1e-5))
+        # Always store opacities in params dict, trainable_opacities controls requires_grad
+        self.params['opacities'] = nn.Parameter(opacities, requires_grad=self.trainable_opacities)
         
-    
     def get_splats(self) -> Dict[str, torch.Tensor]:
         """Get splat parameters in format compatible with rasterization."""
         if self.is_empty:
             return {}
         
-        return {
-            "means": compute_means_from_quats(self.quats, self.radius_buffer),
-            "scales": self.scales,
-            "quats": self.quats,
-            "opacities": self.opacities,
-            "colors": torch.sigmoid(self.colors),  # Convert from logit to RGB
+        rs = {
+            "scales": self.params['scales'],
+            "quats": self.params['quats'],
+            "opacities": self.params['opacities'],
+            "colors": self.params['colors'],  # Convert from logit to RGB
         }
+        rs["means"] = compute_means_from_quats(rotation_activation(rs["quats"]), self.radius_buffer)
+        return rs
     
     def compose_with_background(
         self,
@@ -258,7 +260,7 @@ class SkysphereModelParametrized(nn.Module):
         
         optimizers = {}
         for name, lr in lr_config.items():
-            param = getattr(self, name)
+            param = self.params[name]
             
             # Scale learning rate based on batch size
             scaled_lr = lr * math.sqrt(batch_size)

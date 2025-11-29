@@ -24,9 +24,11 @@ from .exporter import export_splats
 from .optimizers import SelectiveAdam
 from .rendering import (
     rasterization,
-    rasterization_2dgs,
     rasterization_2dgs_inria_wrapper,
     rasterization_inria_wrapper,
+)
+from .rendering_2dgs import (
+    rasterization_2dgs,
 )
 from .strategy import DefaultStrategy, MCMCStrategy, Strategy
 from .version import __version__

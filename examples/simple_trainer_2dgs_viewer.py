@@ -25,7 +25,9 @@ def render_inner(
         cfg: "Config",
         n_cameras: int,
         rasterize_splats_fn,
-        epoch_stats: Optional["EpochStatistics"]):
+        epoch_stats: Optional["EpochStatistics"],
+        skysphere_model=None,
+        rasterize_sky_fn=None):
 
 
     if render_tab_state.preview_render:
@@ -378,5 +380,17 @@ def render_inner(
         )
     else:
         render_colors = render_colors[0, ..., 0:3].clamp(0, 1)
+
+        # Composite with skysphere if enabled
+        if skysphere_model is not None and rasterize_sky_fn is not None:
+            sky_colors, sky_alphas, _ = rasterize_sky_fn(
+                camtoworlds=c2w[None],
+                Ks=K[None],
+                width=width,
+                height=height,
+            )
+            if sky_colors is not None:
+                render_colors = render_colors * render_alphas[0] + sky_colors[0] * (1 - render_alphas[0])
+
         renders = render_colors.cpu().numpy()
     return renders

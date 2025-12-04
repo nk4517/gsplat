@@ -15,7 +15,7 @@ print("import 111")
 
 # импортировать всё, что связано c torch только после этого
 
-from examples.lib_compose import CompositingOrder, compose_renders
+from examples.lib_compose import CompositingOrder, compose_renders, compose_renders_back_to_front
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 
@@ -79,8 +79,8 @@ class Config:
     # data_dir: str = r"x:\_ai\_gsplat\datasets\fb_colmap_res"
     # data_dir: str = r"y:\_gopro_kv92\extracted_keyframes\GOPR6996_colmap"
     # data_dir: str = r"y:\_gopro_kv92\calib_charuco\video\extracted_keyframes\GOPR7015\colmap_db"
-    data_dir: str = r"y:\_gopro_kv92\2025-10-06-1\3-statue"
-    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
+    # data_dir: str = r"y:\_gopro_kv92\2025-10-06-1\3-statue"
+    data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
     # data_dir: str = r"x:\_ai\_glomap\data\south-building"
     # Downsample factor for the dataset
@@ -115,7 +115,7 @@ class Config:
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
     # Initialization strategy
-    init_type: str = "random" # "random" # "sfm"
+    init_type: str = "sfm" # "random" # "sfm"
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 200_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
@@ -302,6 +302,22 @@ class Config:
     split_big_dominated_pct: float = 0.005  # Split gaussians dominating more than this percentage of pixels in one view
     split_big_touched_pct: float = 0.025  # Split gaussians touching more than this percentage of pixels in one view
 
+    # Skysphere parameters for joint sky training
+    enable_skysphere: bool = True  # Enable joint skysphere training
+    skysphere_radius_multiplier: float = 20.0  # Radius = scene_scale * multiplier
+    skysphere_num_points: int = 100_000  # Number of sky gaussians
+    skysphere_init_opacity: float = 0.1
+    skysphere_init_scale: float = 1.0
+    skysphere_loss_lambda: float = 1.0  # Weight for sky loss
+    # Sky mask: 1 = sky, 0 = world (after inversion if invert_sky_mask=True in dataset)
+    require_sky_mask: bool = True  # Require sky masks in dataset
+    invert_sky_mask: bool = True  # Invert sky mask (if mask marks non-sky as 1)
+    
+    # Sky alpha regularization (penalizes world splats rendering in sky regions)
+    sky_alpha_loss: bool = True  # Enable sky alpha regularization
+    sky_alpha_lambda: float = 0.1  # Weight for sky alpha loss
+    sky_alpha_start_iter: int = 0  # Iteration to start sky alpha regularization
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -460,6 +476,8 @@ class Runner:
         # Choose between preloaded and regular dataset
         if cfg.preload_images:
             from datasets.preloaded_dataset import PreloadedDataset
+            sky_mask_params = {"require_sky_mask": cfg.require_sky_mask or cfg.enable_skysphere,
+                               "invert_sky_mask": cfg.invert_sky_mask} if (cfg.require_sky_mask or cfg.enable_skysphere) else {}
             self.trainset = PreloadedDataset(
                 self.parser,
                 split="train",
@@ -467,6 +485,16 @@ class Runner:
                 load_depths=cfg.depth_loss,
                 device=self.device,
                 to_gpu=True,  # Store directly on GPU for fastest access
+                **sky_mask_params,
+            )
+            self.valset = PreloadedDataset(
+                self.parser,
+                split="val",
+                patch_size=None,
+                load_depths=False,
+                device=self.device,
+                to_gpu=False, # Store directly on GPU for fastest access
+                **sky_mask_params,
             )
             self.valset = PreloadedDataset(
                 self.parser,
@@ -706,6 +734,26 @@ class Runner:
                 ),
             ]
 
+        # Initialize skysphere model if enabled
+        self.skysphere_model = None
+        self.skysphere_optimizers = {}
+        if cfg.enable_skysphere:
+            from examples.skysphere_model_parametrized import SkysphereModelParametrized
+            self.skysphere_model = SkysphereModelParametrized(self.scene_scale)
+            self.skysphere_model.initialize_from_trainset(
+                trainset=self.trainset,
+                num_points=cfg.skysphere_num_points,
+                init_opacity=cfg.skysphere_init_opacity,
+                init_scale=cfg.skysphere_init_scale,
+            )
+            if self.skysphere_model.is_empty:
+                print("WARNING: No sky masks found, disabling skysphere")
+                self.skysphere_model = None
+            else:
+                print(f"Skysphere initialized with {self.skysphere_model.n_points} points")
+                self.skysphere_optimizers = self.skysphere_model.create_optimizers(
+                    batch_size=cfg.batch_size, sparse_grad=cfg.sparse_grad)
+
         if cfg.use_aa_smoothing:
             update_max_sampling_rate(
                 self.splats,
@@ -851,6 +899,46 @@ class Runner:
             info,
         )
 
+    def rasterize_sky(
+        self,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+    ) -> Tuple[Tensor, Tensor, Dict]:
+        """Rasterize skysphere using WEIGHTED_SUM mode."""
+        if self.skysphere_model is None or self.skysphere_model.is_empty:
+            return None, None, {}
+        
+        from gsplat import rasterization_2dgs, RasterizationMode2DGS
+        
+        sky_splats = self.skysphere_model.get_splats()
+        means = sky_splats["means"]
+        quats = sky_splats["quats"]
+        scales = scaling_activation(sky_splats["scales"])
+        opacities = opacity_activation(sky_splats["opacities"])
+        colors = sky_splats["colors"]  # [N, 3] direct RGB
+        
+        batch_size = camtoworlds.shape[0]
+        colors_batch = colors.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        render_colors, render_alphas, _, _, _, _, info = rasterization_2dgs(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors_batch,
+            viewmats=torch.linalg.inv(camtoworlds),
+            Ks=Ks,
+            width=width,
+            height=height,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            render_mode="RGB",
+            rasterization_mode=RasterizationMode2DGS.WEIGHTED_SUM,
+        )
+        return render_colors, render_alphas, info
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -888,6 +976,15 @@ class Runner:
                 if not hasattr(self, 'pose_optimizers'):
                     self.pose_optimizers = []
                 self.pose_optimizers.append(optimizer)
+
+        # Add schedulers for skysphere optimizers
+        if self.skysphere_model is not None:
+            for opt_name, optimizer in self.skysphere_optimizers.items():
+                schedulers.append(
+                    torch.optim.lr_scheduler.ExponentialLR(
+                        optimizer, gamma=0.01 ** (1.0 / max_steps)
+                    )
+                )
 
         # Create optimizer for intrinsics if enabled
         if cfg.optimize_intrinsics and self.optimized_Ks is not None:
@@ -1046,6 +1143,26 @@ class Runner:
             # Use world renders directly
             render_alphas = world_alphas
             render_colors = world_renders
+            
+            # Render and composite skysphere if enabled
+            sky_colors = None
+            if self.skysphere_model is not None:
+                sky_colors, sky_alphas, sky_info = self.rasterize_sky(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                )
+                if sky_colors is not None:
+                    # Composite: world over sky
+                    world_rgb = world_renders[..., :3]
+                    sky_colors = sky_colors.clamp(0, 1)
+                    sky_alpha = sky_alphas.clamp(0, 1)  # sky_alphas is wsum
+                    composed_rgb, render_alphas = compose_renders_back_to_front(
+                        renders_list=[world_rgb, sky_colors, ],
+                        alphas_list=[world_alphas, torch.ones_like(sky_alpha), ],
+                    )
+                    render_colors = torch.cat([composed_rgb, world_renders[..., 3:]], dim=-1)
 
             # Add camtoworlds to info for distance computation in strategy
             info["camtoworlds"] = camtoworlds
@@ -1239,6 +1356,32 @@ class Runner:
                 erank_loss = erank_penalty.mean()
                 loss += erank_loss * curr_erank_lambda
 
+            # Sky-specific loss (on sky mask regions)
+            skyloss = torch.tensor(0.0, device=device)
+            if self.skysphere_model is not None and sky_colors is not None and "sky_mask" in data:
+                sky_mask = data["sky_mask"].to(device).float()  # [B, H, W], 1=sky, 0=world
+                # Compute loss only on sky regions
+                sky_mask_expanded = sky_mask.unsqueeze(-1)  # [B, H, W, 1]
+                # Use the composited colors vs ground truth on sky regions
+                sky_region_rendered = colors * sky_mask_expanded
+                sky_region_gt = pixels * sky_mask_expanded
+                # L1 loss on sky regions
+                sky_pixel_count = sky_mask.sum() + 1e-8
+                skyloss = F.l1_loss(sky_region_rendered, sky_region_gt, reduction='sum') / sky_pixel_count
+                loss += skyloss * cfg.skysphere_loss_lambda
+
+            # Sky alpha regularization - penalize world splats in sky regions
+            sky_alpha_loss_val = torch.tensor(0.0, device=device)
+            if cfg.sky_alpha_loss and "sky_mask" in data:
+                if step > cfg.sky_alpha_start_iter:
+                    curr_sky_alpha_lambda = cfg.sky_alpha_lambda
+                else:
+                    curr_sky_alpha_lambda = 0.0
+                sky_mask = data["sky_mask"].to(device).float()  # [B, H, W], 1=sky
+                # Penalize world alpha in sky regions
+                sky_alpha_loss_val = (world_alphas.squeeze(-1) * sky_mask).mean()
+                loss += sky_alpha_loss_val * curr_sky_alpha_lambda
+
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -1282,8 +1425,14 @@ class Runner:
             if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
                 loss_components["opacity_l1_loss"] = opacity_l1_loss
 
+            if self.skysphere_model is not None and sky_colors is not None:
+                loss_components["skyloss"] = skyloss
+
             if cfg.use_bilateral_grid:
                 loss_components["tvloss"] = tvloss
+
+            if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:
+                loss_components["sky_alpha_loss"] = sky_alpha_loss_val
 
             loss.backward()
 
@@ -1302,6 +1451,8 @@ class Runner:
                 desc += f" scale_percentile={scale_percentile_loss.item():.4f}"
             if cfg.erank_loss and step > cfg.erank_start_iter:
                 desc += f" erank={erank_loss.item():.4f}"
+            if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:
+                desc += f" sky_a={sky_alpha_loss_val.item():.4f}"
             if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
                 desc += f" op_l1={opacity_l1_loss.item():.4f}"
             pbar.set_description(desc)
@@ -1325,6 +1476,8 @@ class Runner:
                     self.writer.add_scalar("train/elongation_loss", elongation_loss.item(), step)
                 if cfg.scale_percentile_loss and step > cfg.scale_percentile_start_iter:
                     self.writer.add_scalar("train/scale_percentile_loss", scale_percentile_loss.item(), step)
+                if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:
+                    self.writer.add_scalar("train/sky_alpha_loss", sky_alpha_loss_val.item(), step)
                 if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
                     self.writer.add_scalar("train/opacity_l1_loss", opacity_l1_loss.item(), step)
                 if cfg.use_bilateral_grid:
@@ -1406,6 +1559,9 @@ class Runner:
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            # Optimize skysphere
+            for optimizer in self.skysphere_optimizers.values():
+                optimizer.step()
             # Optimize intrinsics if enabled
             for optimizer in self.intrinsics_optimizers:
                 optimizer.step()
@@ -1534,6 +1690,25 @@ class Runner:
             )  # [1, H, W, 3]
             colors = torch.clamp(colors, 0.0, 1.0)
             colors = colors[..., :3]  # Take RGB channels
+
+            # Composite with skysphere if enabled
+            if self.skysphere_model is not None:
+                sky_colors, sky_alphas, _ = self.rasterize_sky(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                )
+                if sky_colors is not None:
+                    # Composite: world over sky (same as in train)
+                    sky_colors = sky_colors.clamp(0, 1)
+                    sky_alpha = sky_alphas.clamp(0, 1)  # sky_alphas is wsum
+                    colors, alphas = compose_renders_back_to_front(
+                        renders_list=[colors, sky_colors],
+                        alphas_list=[alphas, torch.ones_like(sky_alpha)],
+                    )
+
+            colors = colors.clamp(0, 1)
 
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
@@ -1680,6 +1855,24 @@ class Runner:
             )  # [1, H, W, 4]
 
             colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
+
+            # Composite with skysphere if enabled
+            if self.skysphere_model is not None:
+                sky_colors, sky_alphas, _ = self.rasterize_sky(
+                    camtoworlds=camtoworlds[i : i + 1],
+                    Ks=K[None],
+                    width=width,
+                    height=height,
+                )
+                if sky_colors is not None:
+                    # Composite: world over sky (same as in train)
+                    sky_colors = sky_colors[0].clamp(0, 1)
+                    sky_alpha = sky_alphas[0].clamp(0, 1)  # sky_alphas is wsum
+                    colors, _ = compose_renders_back_to_front(
+                        renders_list=[colors, sky_colors],
+                        alphas_list=[alphas[0], torch.ones_like(sky_alpha)],
+                    )
+
             depths = renders[0, ..., 3:4]  # [H, W, 1]
             depths = normalize_robust(depths)
             surf_normals = normalize_robust(surf_normals)
@@ -1717,11 +1910,15 @@ class Runner:
         epoch_stats = strategy_state.get("epoch_stats", None) if strategy_state else None
 
         n_cameras = len(trainset)
+        skysphere_model = self.skysphere_model
+        rasterize_sky_fn = self.rasterize_sky
         
         return render_inner(camera_state=camera_state, render_tab_state=render_tab_state, device=device,
                             splats=splats, parser_Ks_dict=parser_Ks_dict, cfg=cfg, n_cameras=n_cameras,
                             rasterize_splats_fn=rasterize_splats_fn,
-                            epoch_stats=epoch_stats)
+                            epoch_stats=epoch_stats,
+                            skysphere_model=skysphere_model,
+                            rasterize_sky_fn=rasterize_sky_fn)
 
 
 def main(cfg: Config):

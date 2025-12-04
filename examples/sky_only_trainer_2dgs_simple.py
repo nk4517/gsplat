@@ -91,6 +91,55 @@ def with_lock(lock_name):
     return decorator
 
 
+@torch.no_grad()
+def simple_relocate_quaternion(
+    params: torch.nn.ParameterDict,
+    optimizers: dict,
+    dead_mask: torch.Tensor,
+    min_opacity: float = 0.005,
+):
+    """Simple relocation for quaternion-parametrized skysphere.
+    
+    Copies parameters from alive gaussians to dead ones.
+    Averages opacities of sampled gaussians.
+    
+    Args:
+        params: ParameterDict with 'quats', 'scales', 'opacities', 'colors'
+        optimizers: Dict of optimizers
+        dead_mask: Boolean mask indicating dead gaussians (n_touched == 0)
+        min_opacity: Minimum opacity threshold
+    """
+    dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+    alive_indices = (~dead_mask).nonzero(as_tuple=True)[0]
+    n_dead = len(dead_indices)
+    
+    if n_dead == 0 or len(alive_indices) == 0:
+        return 0
+    
+    # Sample alive gaussians uniformly
+    sample_indices = alive_indices[torch.randint(len(alive_indices), (n_dead,), device=dead_mask.device)]
+    
+    # Copy parameters from sampled to dead positions
+    for name, param in params.items():
+        if name == 'opacities':
+            # Average opacity: divide by 2 for both source and target
+            new_opacity = opacity_activation(param[sample_indices]) / 2.0
+            new_opacity = torch.clamp(new_opacity, min=min_opacity, max=1.0 - 1e-5)
+            param.data[sample_indices] = opacity_inverse_activation(new_opacity)
+            param.data[dead_indices] = param.data[sample_indices]
+        else:
+            param.data[dead_indices] = param.data[sample_indices]
+        
+        # Reset optimizer state for affected indices
+        if name in optimizers:
+            for state in optimizers[name].state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor) and v.shape[0] == param.shape[0]:
+                        v[sample_indices] = 0
+    
+    return n_dead
+
+
 class SkyOnlySimpleRunner:
     """Simplified trainer for sky-only training without 2D gaussians."""
     

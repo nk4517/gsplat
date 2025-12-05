@@ -362,6 +362,26 @@ class SkyOnlySimpleRunner:
                 )
             )
         
+        # Get camera optimizer's optimizers and add schedulers for them
+        camera_optimizers = {}
+        self.camera_optimizer.get_param_groups(camera_optimizers)
+        for opt_name, opt_params in camera_optimizers.items():
+            if opt_params:  # Only if there are parameters to optimize
+                optimizer = Adan(
+                    opt_params,
+                    lr=1e-5 * math.sqrt(cfg.batch_size),  # Default lr, can be adjusted
+                    weight_decay=1e-6,
+                )
+                schedulers.append(
+                    torch.optim.lr_scheduler.ExponentialLR(
+                        optimizer, gamma=0.01 ** (1.0 / max_steps)
+                    )
+                )
+                # Store optimizer for later use
+                if not hasattr(self, 'pose_optimizers'):
+                    self.pose_optimizers = []
+                self.pose_optimizers.append(optimizer)
+
         # Create dataloader
         if cfg.preload_images:
             from datasets.preloaded_dataset import PreloadedDataLoader
@@ -406,6 +426,32 @@ class SkyOnlySimpleRunner:
             batch_size_actual = pixels.shape[0]
             height, width = pixels.shape[1:3]
             
+            # Get image IDs for camera optimization
+            image_ids = data["image_id"].to(device)  # [B]
+
+            # Apply camera optimization
+            if self.camera_optimizer.config.mode != "off":
+                # Create a Cameras object for nerfstudio camera optimizer
+                camera = Cameras(
+                    camera_to_worlds=camtoworlds,
+                    fx=Ks[:, 0, 0],
+                    fy=Ks[:, 1, 1],
+                    cx=Ks[:, 0, 2],
+                    cy=Ks[:, 1, 2],
+                    width=torch.tensor([width], device=device),
+                    height=torch.tensor([height], device=device),
+                    metadata={"cam_idx": image_ids[0].item()} if image_ids.numel() == 1 else None,
+                )
+                optimized_c2w = self.camera_optimizer.apply_to_camera(camera)
+                # apply_to_camera returns [B, 3, 4], need to convert to [B, 4, 4]
+                # оно ебанутое. если батч больше одного, оно внутри само применяет, а если 1 - возвращает 3х4
+                if optimized_c2w.shape[0] == 1:
+                    # Add the homogeneous row [0, 0, 0, 1]
+                    bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], device=device)
+                    camtoworlds = torch.cat([optimized_c2w, bottom_row], dim=1)
+                else:
+                    camtoworlds = optimized_c2w
+
             # Get sky mask (1 = sky, 0 = world)
             if "sky_mask" not in data:
                 raise ValueError("Sky mask not found in data!")
@@ -491,7 +537,12 @@ class SkyOnlySimpleRunner:
             for optimizer in self.skysphere_optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            
+
+            # Optimize pose parameters
+            for optimizer in self.pose_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
             # Optimize bilateral grid
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()

@@ -1255,12 +1255,11 @@ class Runner:
                 else:
                     curr_normal_lambda = 0.0
                 # normal consistency loss
-                normals = normals.squeeze(0).permute((2, 0, 1))
-                normals_from_depth *= world_alphas.squeeze(0).detach()
-                if len(normals_from_depth.shape) == 4:
-                    normals_from_depth = normals_from_depth.squeeze(0)
-                normals_from_depth = normals_from_depth.permute((2, 0, 1))
-                normal_error = (1 - (normals * normals_from_depth).sum(dim=0))[None]
+                # normals: [B, H, W, 3], normals_from_depth: [B, H, W, 3], world_alphas: [B, H, W, 1]
+                normals_p = normals.permute(0, 3, 1, 2)  # [B, 3, H, W]
+                normals_from_depth_p = normals_from_depth * world_alphas.detach()  # [B, H, W, 3]
+                normals_from_depth_p = normals_from_depth_p.permute(0, 3, 1, 2)  # [B, 3, H, W]
+                normal_error = 1 - (normals_p * normals_from_depth_p).sum(dim=1)  # [B, H, W]
                 normalloss = curr_normal_lambda * normal_error.mean()
                 loss += normalloss
 

@@ -1107,11 +1107,15 @@ class Runner:
                     height=torch.tensor([height], device=device),
                     metadata={"cam_idx": image_ids[0].item()} if image_ids.numel() == 1 else None,
                 )
-                # apply_to_camera returns [1, 3, 4], need to convert to [1, 4, 4]
+                # apply_to_camera returns [B, 3, 4], need to convert to [B, 4, 4]
                 optimized_c2w = self.camera_optimizer.apply_to_camera(camera)
-                # Add the homogeneous row [0, 0, 0, 1]
-                bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], device=device)
-                camtoworlds = torch.cat([optimized_c2w, bottom_row], dim=1)
+                # оно ебанутое. если батч >1, оно возвращает N,4,4 а если 1 - возвращает 1,3,4
+                if optimized_c2w.shape[0] == 1:
+                    # Add the homogeneous row [0, 0, 0, 1]
+                    bottom_row = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], device=device)
+                    camtoworlds = torch.cat([optimized_c2w, bottom_row], dim=1)
+                else:
+                    camtoworlds = optimized_c2w
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)

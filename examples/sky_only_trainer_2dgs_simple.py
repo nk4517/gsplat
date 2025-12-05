@@ -553,6 +553,25 @@ class SkyOnlySimpleRunner:
             
             # Reset epoch statistics at the end of epoch
             if epoch_ctx.epoch_end and self.epoch_stats is not None:
+                # Simple relocation of dead splats (n_touched == 0)
+                should_relocate = (
+                    epoch_ctx.i_epoch >= cfg.relocation_start_epoch and
+                    epoch_ctx.i_epoch % cfg.relocation_every_epochs == 0
+                )
+                if should_relocate:
+                    # Consider splats dead if they were never touched OR have zero importance (no gradients)
+                    dead_mask = (self.epoch_stats.n_touched_accum == 0) | (self.epoch_stats.importance < 1e-12)
+                    if self.skysphere_model.trainable_opacities:
+                        dead_mask |= (opacity_activation(self.skysphere_model.params["opacities"]) < 0.01)
+
+                    n_relocated = simple_relocate_quaternion(
+                        params=self.skysphere_model.params,
+                        optimizers=self.skysphere_optimizers,
+                        dead_mask=dead_mask,
+                        min_opacity=cfg.relocation_min_opacity,
+                    )
+                    print(f"Epoch {epoch_ctx.i_epoch}: Relocated {n_relocated} dead splats")
+
                 self.epoch_stats.reset()
             
             # Update viewer

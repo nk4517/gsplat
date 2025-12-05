@@ -1065,18 +1065,21 @@ class Runner:
             
             # Use optimized intrinsics if enabled
             if cfg.optimize_intrinsics and self.optimized_Ks is not None:
-                # Reconstruct K matrix from optimized parameters
-                cam_idx = image_ids[0].item()
-                fx, fy, cx, cy = self.Ks_structure[cam_idx]
+                # Reconstruct K matrices from optimized parameters for each camera in batch
+                batch_size = image_ids.shape[0]
+                Ks_opt = torch.zeros(batch_size, 3, 3, device=device)
                 
-                K_opt = torch.zeros(3, 3, device=device)
-                K_opt[0, 0] = fx if fx is not None else Ks[0, 0, 0]
-                K_opt[1, 1] = fy if fy is not None else Ks[0, 1, 1]
-                K_opt[0, 2] = cx if cx is not None else Ks[0, 0, 2]
-                K_opt[1, 2] = cy if cy is not None else Ks[0, 1, 2]
-                K_opt[2, 2] = 1.0
+                for b_idx in range(batch_size):
+                    cam_idx = image_ids[b_idx].item()
+                    fx, fy, cx, cy = self.Ks_structure[cam_idx]
+                    
+                    Ks_opt[b_idx, 0, 0] = fx if fx is not None else Ks[b_idx, 0, 0]
+                    Ks_opt[b_idx, 1, 1] = fy if fy is not None else Ks[b_idx, 1, 1]
+                    Ks_opt[b_idx, 0, 2] = cx if cx is not None else Ks[b_idx, 0, 2]
+                    Ks_opt[b_idx, 1, 2] = cy if cy is not None else Ks[b_idx, 1, 2]
+                    Ks_opt[b_idx, 2, 2] = 1.0
                 
-                Ks = K_opt.unsqueeze(0)  # [1, 3, 3]
+                Ks = Ks_opt  # [B, 3, 3]
             
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (

@@ -353,7 +353,7 @@ class EpochStatistics:
             )
 
         # Update sampling rate statistics if available
-        if params is not None and "camtoworlds" in info and "Ks" in info:
+        if params is not None and "means" in params and "camtoworlds" in info and "Ks" in info:
             # Compute euclidean distances from camera to gaussians
             camtoworlds = info["camtoworlds"]
             Ks = info["Ks"]

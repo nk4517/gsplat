@@ -10,9 +10,13 @@ from pathlib import Path
 
 from examples.vs_env import set_vc_envs; set_vc_envs()
 
+from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+from nerfstudio.cameras.cameras import Cameras
+
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+from adan import Adan
 import numpy as np
 import imageio
 import tqdm
@@ -21,11 +25,15 @@ import viser
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
+from datasets.colmap import Parser
 from examples.sky_only_trainer_2dgs_viewer import skysphere_renderer
-from datasets.colmap import Dataset, Parser
+from examples.datasets.scene_prepare import prepare_scene
+from examples.datasets.waymo import WaymoParser
+from examples.datasets.dataset import Dataset
 from examples.skysphere_model_parametrized import SkysphereModelParametrized
 from gsplat import rasterization_2dgs, RasterizationMode2DGS
 from gsplat.strategy.epoch_stats import EpochStatistics, training_data_generator
+from gsplat.strategy.ops import scaling_activation, opacity_activation, opacity_inverse_activation
 from gsplat_viewer_2dgs import GsplatViewer
 from nerfview import CameraState
 
@@ -33,12 +41,19 @@ from nerfview import CameraState
 @dataclass
 class SkyOnlySimpleConfig:
     # Path to dataset
-    data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
+    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
+    # data_dir: str = r"x:\_ai\_waymo\tensorflow_extractor\colmap_proj_F_FL_FR"
+    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
+    data_dir: str = r"x:\_ai\_waymo\tensorflow_extractor\colmap_proj"
+
     # Directory to save results
-    result_dir: str = r"x:\_ai\_my_nerfstudio_results\sky_only_simple"
+    result_dir: str = Path(data_dir).with_suffix(".results") / "sky-only"
+    # result_dir: str = r"x:\_ai\_my_nerfstudio_results\segment-102751"
 
     # Downsample factor for the dataset
     data_factor: int = 4
+    # Target resolution (alternative to factor): int for max side, tuple for (max_w, max_h)
+    target_resolution: int | tuple[int, int] | None = None
     # Every N images there is a test image
     test_every: int = 8
     # Preload all images into memory
@@ -49,14 +64,14 @@ class SkyOnlySimpleConfig:
     port: int = 8080
     
     # Training parameters
-    max_steps: int = 2_000
-    batch_size: int = 8
+    max_steps: int = 6_000
+    batch_size: int = 24
     eval_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
     save_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
     
     # Skysphere parameters
     skysphere_radius_multiplier: float = 20.0
-    full_skysphere_points: int = 500_000
+    full_skysphere_points: int = 1_000_000
     init_opacity: float = 0.1
     init_scale: float = 1.0
     
@@ -71,12 +86,38 @@ class SkyOnlySimpleConfig:
     tb_every: int = 100
     
     # Bilateral grid parameters
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
     use_fused_bilagrid: bool = True
     
     # Color correction for evaluation
     use_color_correct: bool = False
+
+    # Simple relocation parameters
+    relocation_start_epoch: int = 5
+    relocation_every_epochs: int = 3
+    relocation_min_opacity: float = 0.005
+    relocation_end_epoch: int | None = 100
+    # Learning rate scheduler settings
+    lr_scheduler: str = "cosine_warm_restarts"  # "exponential" or "cosine_warm_restarts"
+    # For cosine_warm_restarts: T_mult - period multiplier after each restart
+    cosine_T_mult: int = 1
+    # For cosine_warm_restarts: minimum LR as ratio of initial (eta_min = lr * ratio)
+    cosine_eta_min_ratio: float = 0.01
+    # Period for cosine restarts (in epochs)
+    add_every_epochs: int = 12
+
+    # Camera optimizer configuration (from nerfstudio)
+    camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
+
+    # Camera intrinsics optimization
+    optimize_intrinsics: bool = True
+    # Learning rate for intrinsics optimization
+    intrinsics_lr: float = 0.1
+    # Whether to optimize principal point (cx, cy)
+    optimize_principal_point: bool = True
+    # Whether to tie fx and fy together (single focal length)
+    tie_focal_lengths: bool = False
 
 
 def with_lock(lock_name):
@@ -161,18 +202,23 @@ class SkyOnlySimpleRunner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
         
         # Load data
-        self.parser = Parser(
+        self.parser = WaymoParser(
             data_dir=cfg.data_dir,
+            camera_angles=["FRONT", "FRONT_LEFT", "FRONT_RIGHT"],
+            frame_range=(0,250),
+        )
+        scene_fullscale = self.parser.scene
+        scene = prepare_scene(
+            scene_fullscale,
             factor=cfg.data_factor,
-            normalize=True,
-            test_every=cfg.test_every,
+            target_resolution=cfg.target_resolution,
         )
         
         # Create datasets
         if cfg.preload_images:
             from datasets.preloaded_dataset import PreloadedDataset
             self.trainset = PreloadedDataset(
-                self.parser,
+                scene,
                 split="train",
                 patch_size=None,
                 load_depths=False,
@@ -180,9 +226,10 @@ class SkyOnlySimpleRunner:
                 to_gpu=True,
                 require_sky_mask=True,
                 invert_sky_mask=True,
+                soft_sky_mask=True,
             )
             self.valset = PreloadedDataset(
-                self.parser,
+                scene,
                 split="val",
                 patch_size=None,
                 load_depths=False,
@@ -190,28 +237,32 @@ class SkyOnlySimpleRunner:
                 to_gpu=False,
                 require_sky_mask=True,
                 invert_sky_mask=True,
+                soft_sky_mask=True,
             )
         else:
             self.trainset = Dataset(
-                self.parser,
+                scene,
                 split="train",
                 patch_size=None,
                 load_depths=False,
+                require_sky_mask=True,
+                invert_sky_mask=True,
+                soft_sky_mask=True,
             )
-            self.valset = Dataset(self.parser, split="val")
+            self.valset = Dataset(scene, split="val")
         
-        self.scene_scale = self.parser.scene_scale * 1.1
+        self.scene_scale = scene.scene_scale * 1.1
         print(f"Scene scale: {self.scene_scale}")
         print(f"Number of training images: {len(self.trainset)}")
         print(f"Number of validation images: {len(self.valset)}")
 
-        self.skysphere_model = SkysphereModelParametrized(self.parser.scene_scale)
+        self.skysphere_model = SkysphereModelParametrized(self.scene_scale, trainable_opacities=True)
         
         # Initialize skysphere from trainset
         self.skysphere_model.initialize_from_trainset(
             trainset=self.trainset,
-            num_points=cfg.full_skysphere_points,
-            init_opacity=cfg.init_opacity,
+            full_skysphere_N_points=cfg.full_skysphere_points,
+            # init_opacity=cfg.init_opacity,
             init_scale=cfg.init_scale,
         )
         
@@ -246,6 +297,51 @@ class SkyOnlySimpleRunner:
         # Initialize epoch statistics for tracking
         self.epoch_stats = None  # Will be initialized at first epoch
         
+        # Initialize camera optimizer from nerfstudio
+        self.camera_optimizer: CameraOptimizer = cfg.camera_optimizer.setup(
+            num_cameras=len(self.trainset), device=self.device
+        )
+        self.pose_optimizers = []  # Will be populated in train() if camera optimization is enabled
+
+        # Initialize intrinsics optimization if enabled
+        self.intrinsics_optimizers = []
+        self.optimized_Ks = None
+        if cfg.optimize_intrinsics:
+            # Create optimizable K matrices for each camera
+            Ks_list = []
+            for i in range(len(self.trainset)):
+                # Get original K matrix for this camera
+                cam_data = self.trainset[i]
+                K_orig = cam_data["K"].clone()
+
+                # Create optimizable parameters
+                if cfg.tie_focal_lengths:
+                    # Single focal length parameter
+                    focal = (K_orig[0, 0] + K_orig[1, 1]) / 2.0
+                    focal_param = torch.nn.Parameter(torch.tensor([focal], device=self.device))
+                    if cfg.optimize_principal_point:
+                        principal_point = torch.nn.Parameter(K_orig[0:1, 2:3].clone().to(self.device))
+                        cy_param = torch.nn.Parameter(K_orig[1:2, 2:3].clone().to(self.device))
+                        Ks_list.append((focal_param, focal_param, principal_point, cy_param))
+                    else:
+                        Ks_list.append((focal_param, focal_param, None, None))
+                else:
+                    # Separate fx, fy parameters
+                    fx_param = torch.nn.Parameter(torch.tensor([K_orig[0, 0]], device=self.device))
+                    fy_param = torch.nn.Parameter(torch.tensor([K_orig[1, 1]], device=self.device))
+                    if cfg.optimize_principal_point:
+                        cx_param = torch.nn.Parameter(torch.tensor([K_orig[0, 2]], device=self.device))
+                        cy_param = torch.nn.Parameter(torch.tensor([K_orig[1, 2]], device=self.device))
+                        Ks_list.append((fx_param, fy_param, cx_param, cy_param))
+                    else:
+                        Ks_list.append((fx_param, fy_param, None, None))
+
+            self.optimized_Ks = torch.nn.ParameterList([
+                param for params_tuple in Ks_list
+                for param in params_tuple if param is not None
+            ])
+            self.Ks_structure = Ks_list  # Store structure for reconstruction
+
         # Metrics
         from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -327,7 +423,7 @@ class SkyOnlySimpleRunner:
             track_domination=track_domination,
         )
         
-        return render_colors, info
+        return render_colors, render_alphas, info
     
     def train(self):
         cfg = self.cfg
@@ -336,13 +432,22 @@ class SkyOnlySimpleRunner:
         max_steps = cfg.max_steps
         
         # Create schedulers
+        n_cameras_per_epoch = len(self.trainset)
+        T_0 = cfg.add_every_epochs * n_cameras_per_epoch
+
         schedulers = []
         for opt_name, optimizer in self.skysphere_optimizers.items():
-            schedulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
+            lr = optimizer.param_groups[0]["lr"]
+            # Apply cosine scheduler to scales and quats (quats control position on sphere)
+            if cfg.lr_scheduler == "cosine_warm_restarts" and opt_name in ("scales", "quats"):
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    optimizer, T_0=T_0, T_mult=cfg.cosine_T_mult, eta_min=lr * cfg.cosine_eta_min_ratio,
+                )
+            else:
+                scheduler = torch.optim.lr_scheduler.ExponentialLR(
                     optimizer, gamma=0.01 ** (1.0 / max_steps)
                 )
-            )
+            schedulers.append(scheduler)
         
         # Add schedulers for bilateral grid if enabled
         if cfg.use_bilateral_grid:
@@ -371,6 +476,7 @@ class SkyOnlySimpleRunner:
                     opt_params,
                     lr=1e-5 * math.sqrt(cfg.batch_size),  # Default lr, can be adjusted
                     weight_decay=1e-6,
+                    betas=(0.98/8, 0.92/8, 0.99/8),
                 )
                 schedulers.append(
                     torch.optim.lr_scheduler.ExponentialLR(
@@ -381,6 +487,21 @@ class SkyOnlySimpleRunner:
                 if not hasattr(self, 'pose_optimizers'):
                     self.pose_optimizers = []
                 self.pose_optimizers.append(optimizer)
+
+        # Create optimizer for intrinsics if enabled
+        if cfg.optimize_intrinsics and self.optimized_Ks is not None:
+            intrinsics_optimizer = Adan(
+                self.optimized_Ks.parameters(),
+                lr=cfg.intrinsics_lr * math.sqrt(cfg.batch_size),
+                eps=1e-15 / math.sqrt(cfg.batch_size),
+                betas=(0.98/4, 0.92/4, 0.99/4),
+            )
+            self.intrinsics_optimizers = [intrinsics_optimizer]
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    intrinsics_optimizer, gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
 
         # Create dataloader
         if cfg.preload_images:
@@ -429,6 +550,24 @@ class SkyOnlySimpleRunner:
             # Get image IDs for camera optimization
             image_ids = data["image_id"].to(device)  # [B]
 
+            # Use optimized intrinsics if enabled
+            if cfg.optimize_intrinsics and self.optimized_Ks is not None:
+                # Reconstruct K matrices from optimized parameters for each camera in batch
+                batch_size_actual = image_ids.shape[0]
+                Ks_opt = torch.zeros(batch_size_actual, 3, 3, device=device)
+
+                for b_idx in range(batch_size_actual):
+                    cam_idx = image_ids[b_idx].item()
+                    fx, fy, cx, cy = self.Ks_structure[cam_idx]
+
+                    Ks_opt[b_idx, 0, 0] = fx if fx is not None else Ks[b_idx, 0, 0]
+                    Ks_opt[b_idx, 1, 1] = fy if fy is not None else Ks[b_idx, 1, 1]
+                    Ks_opt[b_idx, 0, 2] = cx if cx is not None else Ks[b_idx, 0, 2]
+                    Ks_opt[b_idx, 1, 2] = cy if cy is not None else Ks[b_idx, 1, 2]
+                    Ks_opt[b_idx, 2, 2] = 1.0
+
+                Ks = Ks_opt  # [B, 3, 3]
+
             # Apply camera optimization
             if self.camera_optimizer.config.mode != "off":
                 # Create a Cameras object for nerfstudio camera optimizer
@@ -453,23 +592,21 @@ class SkyOnlySimpleRunner:
                     camtoworlds = optimized_c2w
 
             # Get sky mask (1 = sky, 0 = world)
-            if "sky_mask" not in data:
+            if data.get("sky_mask") is None:
                 raise ValueError("Sky mask not found in data!")
             sky_mask = data["sky_mask"].to(device).float()  # [B, H, W]
-            
-            # Get image IDs for bilateral grid
-            image_ids = data["image_id"].to(device)  # [B]
-            
+
             # Render sky
             sky_colors, sky_wsum, info = self.rasterize_sky(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
                 height=height,
-                track_domination=False,
+                track_domination=True,
             )
-            
-            # sky_colors = sky_colors.clamp(0, 1)
+
+            # Penalty for exceeding 0-1 per channel
+            overflow_penalty = (sky_colors - 1.0).clamp(min=0).mean() + (-sky_colors).clamp(min=0).mean()
             
             # Apply bilateral grid if enabled
             if cfg.use_bilateral_grid:
@@ -494,7 +631,8 @@ class SkyOnlySimpleRunner:
             
             # Compute losses only on sky regions
             l1loss = F.l1_loss(sky_colors_masked, pixels_masked)
-            
+
+
             # SSIM loss with masking
             # Permute for SSIM computation
             pixels_perm = pixels_masked.permute(0, 3, 1, 2)  # [B, 3, H, W]
@@ -503,12 +641,23 @@ class SkyOnlySimpleRunner:
             
             # Combined loss
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            
+
+            loss += 0.5 * overflow_penalty
+
+            outmasked_penality = (sky_wsum * (1-sky_heat.unsqueeze(-1))).clamp(0).mean()
+            loss += 0.1 * outmasked_penality
+
             # Add total variation loss for bilateral grid
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
-            
+
+            # Add loss from camera optimizer
+            loss_dict = {}
+            self.camera_optimizer.get_loss_dict(loss_dict)
+            for loss_name, loss_value in loss_dict.items():
+                loss += loss_value
+
             # Backward pass
             loss.backward()
 
@@ -547,7 +696,12 @@ class SkyOnlySimpleRunner:
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            
+
+            # Optimize intrinsics if enabled
+            for optimizer in self.intrinsics_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
             for scheduler in schedulers:
                 scheduler.step()
             
@@ -557,12 +711,19 @@ class SkyOnlySimpleRunner:
                 should_relocate = (
                     epoch_ctx.i_epoch >= cfg.relocation_start_epoch and
                     epoch_ctx.i_epoch % cfg.relocation_every_epochs == 0
+                    and (cfg.relocation_end_epoch is None or
+                         epoch_ctx.i_epoch <= cfg.relocation_end_epoch)
                 )
                 if should_relocate:
                     # Consider splats dead if they were never touched OR have zero importance (no gradients)
-                    dead_mask = (self.epoch_stats.n_touched_accum == 0) | (self.epoch_stats.importance < 1e-12)
-                    if self.skysphere_model.trainable_opacities:
-                        dead_mask |= (opacity_activation(self.skysphere_model.params["opacities"]) < 0.01)
+                    dead_mask = (self.epoch_stats.n_touched_accum == 0) #| (self.epoch_stats.importance  == 0)
+                    # if self.skysphere_model.trainable_opacities:
+                    #     dead_mask |= (opacity_activation(self.skysphere_model.params["opacities"]) < cfg.relocation_min_opacity*4)
+                    #
+                    # # Mark smallest 0.5% by scale as dead
+                    # scales_activated = scaling_activation(self.skysphere_model.params["scales"]).mean(dim=-1)
+                    # scale_threshold = torch.quantile(scales_activated, 0.005)
+                    # dead_mask |= (scales_activated < scale_threshold)
 
                     n_relocated = simple_relocate_quaternion(
                         params=self.skysphere_model.params,
@@ -602,13 +763,15 @@ class SkyOnlySimpleRunner:
                 # Create checkpoint directory for this step
                 step_dir = f"{self.ckpt_dir}/step_{step:06d}"
                 os.makedirs(step_dir, exist_ok=True)
-                
+
                 # Save skysphere model
-                torch.save({
-                    "step": step,
-                    "skysphere": self.skysphere_model.state_dict(),
-                    "epoch": epoch_ctx.i_epoch,
-                }, f"{step_dir}/skysphere.pt")
+                self.skysphere_model.save_checkpoint(f"{step_dir}/skysphere.pt")
+
+                # torch.save({
+                #     "step": step,
+                #     "skysphere": self.skysphere_model.state_dict(),
+                #     "epoch": epoch_ctx.i_epoch,
+                # }, f"{step_dir}/skysphere.pt")
                 
                 print(f"Saved checkpoint at step {step}")
             
@@ -714,17 +877,30 @@ class SkyOnlySimpleRunner:
         grow_grad2d = self.cfg.grow_grad2d if hasattr(self.cfg, 'grow_grad2d') else 0.0002
         n_points = self.skysphere_model.n_points
 
-        return skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, camera_state, render_tab_state)
+        return skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, self.skysphere_model, camera_state, render_tab_state)
 
 
 def main(cfg: SkyOnlySimpleConfig):
-    # Import BilateralGrid and related functions based on configuration
     global BilateralGrid, slice, total_variation_loss, color_correct
-    if cfg.use_bilateral_grid:
+
+    # Import BilateralGrid and related functions based on configuration
+    if cfg.use_bilateral_grid or cfg.use_fused_bilagrid:
         if cfg.use_fused_bilagrid:
-            pass
+            cfg.use_bilateral_grid = True
+            from fused_bilagrid import (
+                BilateralGrid,
+                color_correct,
+                slice,
+                total_variation_loss,
+            )
         else:
-            pass
+            cfg.use_bilateral_grid = True
+            from lib_bilagrid import (
+                BilateralGrid,
+                color_correct,
+                slice,
+                total_variation_loss,
+            )
     
     runner = SkyOnlySimpleRunner(cfg)
     runner.train()

@@ -410,7 +410,6 @@ def reset_opa(
     )
 
 
-@torch.no_grad()
 def normalize_quats(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
     optimizers: Dict[str, torch.optim.Optimizer],
@@ -432,7 +431,7 @@ def normalize_quats(
             raise ValueError(f"Unexpected parameter name: {name}")
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        return torch.zeros_like(v)
+        return v  # Preserve optimizer state instead of zeroing
 
     # update the parameters and the state in the optimizers
     _update_param_with_optimizer(
@@ -606,8 +605,9 @@ def inject_noise_to_quats(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
     optimizers: Dict[str, torch.optim.Optimizer],
     state: Dict[str, Tensor],
-    noise_multipliers: Tensor,
-    base_angle: float = 1e-4,
+    # noise_multipliers: Tensor,
+    scaler: float,
+    base_angle: float = 1e-7,
 ):
     """Inject noise to quaternions for MCMC exploration.
     
@@ -615,7 +615,7 @@ def inject_noise_to_quats(
         params: Dictionary of parameters including "quats"
         optimizers: Dictionary of optimizers
         state: State dictionary
-        noise_multipliers: Tensor of per-gaussian noise multipliers [N]
+        # noise_multipliers: Tensor of per-gaussian noise multipliers [N]
         base_angle: Base rotation angle in radians (default 1e-4)
     """
     quats = params["quats"]  # [N, 4]
@@ -623,7 +623,7 @@ def inject_noise_to_quats(
     device = quats.device
     
     # Create mask for non-zero noise multipliers
-    noise_mask = noise_multipliers > 0
+    noise_mask = params["opacities"] > 0.05
     if not noise_mask.any():
         # No noise to apply
         return
@@ -637,17 +637,17 @@ def inject_noise_to_quats(
     random_axis = F.normalize(random_axis, dim=-1)
     
     # Fixed small angle scaled by per-gaussian multipliers
-    angle = base_angle * noise_multipliers[noise_mask]
+    angle = base_angle * scaler
     
     # Convert axis-angle to quaternion perturbation
     # q = [cos(θ/2), sin(θ/2) * axis]
     half_angle = angle * 0.5
-    cos_half = torch.cos(half_angle)
-    sin_half = torch.sin(half_angle)
+    cos_half = math.cos(half_angle)
+    sin_half = math.sin(half_angle)
     
     noise_quat = torch.zeros(n_noisy, 4, device=device)
     noise_quat[:, 0] = cos_half
-    noise_quat[:, 1:] = sin_half.unsqueeze(-1) * random_axis
+    noise_quat[:, 1:] = sin_half * random_axis
     
     # Apply perturbation by quaternion multiplication
     # q_new = q_noise * q_original
@@ -675,3 +675,145 @@ def inject_noise_to_quats(
     
     # Normalize only modified quaternions to maintain unit length
     params["quats"][noise_mask] = F.normalize(params["quats"][noise_mask], dim=-1)
+
+
+@torch.no_grad()
+def relocate_quaternion(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    binoms: Tensor,
+    radius: float,
+    min_opacity: float = 0.005,
+    probs: Optional[Tensor] = None,
+):
+    """Relocate dead Gaussians for quaternion-parametrized skysphere.
+    
+    For skysphere with quaternion parametrization, means are computed from quaternions.
+    This function relocates dead gaussians by copying quaternions from alive ones.
+    
+    Args:
+        params: Dictionary with 'quats', 'scales', 'opacities', 'colors' (NO 'means')
+        optimizers: Optimizers for parameters
+        state: State dictionary
+        mask: Boolean mask indicating dead gaussians
+        binoms: Binomial coefficients lookup table
+        radius: Sphere radius (fixed, not optimized)
+        min_opacity: Minimum opacity threshold
+        probs: Optional sampling probabilities
+    """
+    opacities = opacity_activation(params["opacities"].flatten())
+    
+    dead_indices = mask.nonzero(as_tuple=True)[0]
+    alive_indices = (~mask).nonzero(as_tuple=True)[0]
+    n = len(dead_indices)
+    
+    if n == 0:
+        return
+    
+    # Sample alive gaussians
+    eps = torch.finfo(torch.float32).eps
+    if probs is None:
+        probs = opacities[alive_indices].flatten()
+    else:
+        probs = probs[alive_indices].flatten()
+
+    sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+    sampled_idxs = alive_indices[sampled_idxs]
+
+    # Simple opacity division by new count
+    new_opacities = opacities[sampled_idxs] / (torch.bincount(sampled_idxs)[sampled_idxs] + 1)
+    new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        nonlocal new_opacities
+        if name == "opacities":
+            p[sampled_idxs] = opacity_inverse_activation(new_opacities)
+
+        # Copy sampled parameters to dead positions
+        p[dead_indices] = p[sampled_idxs]
+        return torch.nn.Parameter(p, requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v[sampled_idxs] = 0
+        return v
+    
+    # Update parameters and optimizer states
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    
+    # Update extra running state
+    wrapped_state = StateWrapper(state)
+    for k, v in wrapped_state.items():
+        if isinstance(v, torch.Tensor) and len(v) == len(opacities):
+            v[sampled_idxs] = 0
+
+
+@torch.no_grad()
+def sample_add_quaternion(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    n: int,
+    binoms: Tensor,
+    radius: float,
+    min_opacity: float = 0.005,
+    probs: Optional[Tensor] = None,
+):
+    """Add new Gaussians by sampling for quaternion-parametrized skysphere.
+    
+    For skysphere with quaternion parametrization, means are computed from quaternions.
+    This function adds new gaussians by copying quaternions from existing ones.
+    
+    Args:
+        params: Dictionary with 'quats', 'scales', 'opacities', 'colors' (NO 'means')
+        optimizers: Optimizers for parameters
+        state: State dictionary
+        n: Number of gaussians to add
+        binoms: Binomial coefficients lookup table
+        radius: Sphere radius (fixed, not optimized)
+        min_opacity: Minimum opacity threshold
+        probs: Optional sampling probabilities
+    """
+    opacities = opacity_activation(params["opacities"].flatten())
+    
+    eps = torch.finfo(torch.float32).eps
+    if probs is None:
+        probs = opacities.flatten()
+    else:
+        probs = probs.flatten()
+    
+    sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+    
+    # Compute new opacities and scales
+    new_opacities, new_scales = compute_relocation(
+        opacities=opacities[sampled_idxs],
+        scales=scaling_activation(params["scales"])[sampled_idxs],
+        ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
+        binoms=binoms,
+    )
+    new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
+    
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        nonlocal new_opacities, new_scales
+        if name == "opacities":
+            p[sampled_idxs] = opacity_inverse_activation(new_opacities)
+        elif name == "scales":
+            p[sampled_idxs] = scaling_inverse_activation(new_scales)
+        # For quats and colors, just copy from sampled indices
+        p_new = torch.cat([p, p[sampled_idxs]])
+        return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+    
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+        return torch.cat([v, v_new])
+    
+    # Update parameters and optimizer states
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    
+    # Update extra running state
+    wrapped_state = StateWrapper(state)
+    for k, v in wrapped_state.items():
+        if isinstance(v, torch.Tensor) and len(v) == len(opacities):
+            v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
+            wrapped_state[k] = torch.cat((v, v_new))

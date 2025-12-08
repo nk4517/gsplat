@@ -131,23 +131,14 @@ class SkysphereModelParametrized(nn.Module):
     def initialize_from_trainset(
         self,
         trainset,
-        num_points: int = 50_000,
-        init_opacity: float = 0.1,
+        full_skysphere_N_points: int = 50_000,
         init_scale: float = 1.0,
-        use_dog: bool = False,
-        dog_sigma: float = 2.0,
-        dog_k: float = 3.6,
     ):
         """Initialize skysphere from training set data."""
         # Initialize skysphere geometry
-        if use_dog:
-            points, colors, quats = compute_skysphere_geometry_dog(
-                trainset, self.radius, num_points, self.device, dog_sigma, dog_k
-            )
-        else:
-            points, colors, quats = compute_skysphere_geometry(
-                trainset, self.radius, num_points, self.device
-            )
+        points, colors, quats = compute_skysphere_geometry(
+            trainset, self.radius, full_skysphere_N_points, self.device
+        )
         
         if points is None:
             # No sky masks available, create empty skysphere
@@ -227,7 +218,7 @@ class SkysphereModelParametrized(nn.Module):
             height=height,
         )
         
-        transition_range = self.bg_threshold - self.bg_base_weight
+        # transition_range = self.bg_threshold - self.bg_base_weight
         # bg_weight = self.bg_base_weight * torch.clamp((self.bg_threshold - sky_wsum) / transition_range, 0, None)
         # total_weight = sky_wsum + bg_weight
         # return (sky_colors + sh_bg * bg_weight) / (total_weight + 1e-8)
@@ -249,8 +240,8 @@ class SkysphereModelParametrized(nn.Module):
         
         # Learning rates for skysphere (no means to optimize)
         lr_config = {
-            "scales": 5e-4,
-            "quats": 1e-4,  # Quaternions control both orientation AND position
+            "scales": 1e-2,
+            "quats": 2.5e-4,  # Quaternions control both orientation AND position
             "colors": 2.5e-2,
         }
         
@@ -260,7 +251,9 @@ class SkysphereModelParametrized(nn.Module):
         
         optimizers = {}
         for name, lr in lr_config.items():
-            param = self.params[name]
+            param: nn.Parameter = self.params[name]
+            if not param.requires_grad:
+                continue
             
             # Scale learning rate based on batch size
             scaled_lr = lr * math.sqrt(batch_size)
@@ -274,9 +267,11 @@ class SkysphereModelParametrized(nn.Module):
                     betas=scaled_betas,
                 )
             else:
+                scaled_betas = (1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.99))
                 optimizer = Adan(
                     [{"params": param, "lr": lr}],
                     eps=scaled_eps,
+                    # betas=(0.98/8, 0.92/8, 0.99/8),
                     fused=True,
                 )
             
@@ -317,10 +312,10 @@ class SkysphereModelParametrized(nn.Module):
                 checkpoint['sh_background_state'] = self.sh_background.state_dict()
         torch.save(checkpoint, path)
     
-    def load_checkpoint(self, path: str):
+    def load_checkpoint(self, path: str, frozen=False):
         """Load model checkpoint from file."""
         checkpoint = torch.load(path, map_location=self.device)
-        
+
         self.scene_scale = checkpoint['scene_scale']
         self.radius_multiplier = checkpoint['radius_multiplier']
         self.radius = self.scene_scale * self.radius_multiplier
@@ -340,7 +335,17 @@ class SkysphereModelParametrized(nn.Module):
                 )
         if not self.is_empty:
             self.n_points = checkpoint['n_points']
+            n = self.n_points
+            self.params['scales'] = nn.Parameter(torch.zeros(n, 3, device=self.device))
+            self.params['quats'] = nn.Parameter(torch.zeros(n, 4, device=self.device))
+            self.params['colors'] = nn.Parameter(torch.zeros(n, 3, device=self.device))
+            self.params['opacities'] = nn.Parameter(torch.zeros(n, device=self.device))
             self.load_state_dict(checkpoint['state_dict'])
+            if frozen:
+                self.params["scales"].requires_grad = not frozen
+                self.params["quats"].requires_grad = not frozen
+                self.params["colors"].requires_grad = not frozen
+                self.params["opacities"].requires_grad = self.trainable_opacities and not frozen
         
         # Load SH background state if saved separately (new format)
         if self.sh_background is not None and 'sh_background_state' in checkpoint:

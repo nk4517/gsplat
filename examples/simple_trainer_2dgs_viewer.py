@@ -21,7 +21,7 @@ def render_inner(
         render_tab_state: "GsplatRenderTabState",
         device: str,
         splats: torch.nn.ParameterDict,
-        parser_Ks_dict: Dict,
+        f_orig: float,
         cfg: "Config",
         n_cameras: int,
         rasterize_splats_fn,
@@ -45,9 +45,6 @@ def render_inner(
     # viewer_splats = {k: v.clone().detach() for k, v in splats.items()}
     viewer_splats = splats
 
-    focal = float(K[0, 0] + K[1, 1])/2  # Use focal length from K matrix
-    K_orig = list(parser_Ks_dict.values())[0]
-    f_orig = float(K_orig[0, 0] + K_orig[1, 1])/2
 
     blur_mod = render_tab_state.blur_mod
 

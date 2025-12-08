@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from .base import Strategy
-from .ops import inject_noise_to_position, relocate, sample_add, opacity_activation, scaling_activation, remove
+from .ops import inject_noise_to_position, relocate, sample_add, opacity_activation, scaling_activation, remove, relocate_quaternion, sample_add_quaternion, inject_noise_to_quats
 from .epoch_stats import EpochStatistics, EpochContext
 
 
@@ -173,7 +173,10 @@ class MCMCStrategy(Strategy):
             epoch_ctx (EpochContext): Context information about the current epoch.
         """
         # move to the correct device
-        device = params["means"].device
+        if "means" in params:
+            device = params["means"].device
+        else:
+            device = params["quats"].device
 
         with torch.no_grad():
             # Update statistics in epoch_stats
@@ -221,16 +224,21 @@ class MCMCStrategy(Strategy):
                 if self.verbose:
                     print(
                         f"Epoch {epoch_ctx.i_epoch} (Step {step}): Added {n_new_gs} GSs. "
-                        f"Now having {len(params['means'])} GSs."
+                        f"Now having {len(params['means'] if 'means' in params else params['quats'])} GSs."
                     )
 
             if should_relocate or should_add:
                 torch.cuda.empty_cache()
 
         # add noise to GSs
-        inject_noise_to_position(
-            params=params, optimizers=optimizers, state={}, scaler=lr * self.noise_lr
-        )
+        if "means" in params:
+            inject_noise_to_position(
+                params=params, optimizers=optimizers, state={}, scaler=lr * self.noise_lr
+            )
+        # else:
+        #     inject_noise_to_quats(
+        #         params=params, optimizers=optimizers, state={}, scaler=lr * self.noise_lr
+        #     )
 
         with torch.no_grad():
             # Reset epoch statistics for next epoch
@@ -244,6 +252,7 @@ class MCMCStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
         state: Dict[str, Any],
+        pct=0.01,
     ) -> int:
         opacities = opacity_activation(params["opacities"].flatten())
         device = params["scales"].device
@@ -259,22 +268,17 @@ class MCMCStrategy(Strategy):
         )
         dead_mask |= is_too_big
 
-        if "epoch_stats" in state and hasattr(state["epoch_stats"], "max_touchedPct"):
-            # Prune gaussians that touch too many pixels (e.g., > 1% of image)
-            is_too_big_2d = state["epoch_stats"].max_touchedPct > 0.9
-            dead_mask |= is_too_big_2d
-        
         if "epoch_stats" in state:
             # Use n_touched from epoch to determine dead splats
             dead_mask |= state["epoch_stats"].n_touched_accum == 0
-            
+
             # Check 2D scale if enabled
             if hasattr(state["epoch_stats"], "max_touchedPct"):
-                # Relocate gaussians that touch too many pixels (e.g., > 90% of image)
-                is_too_big_2d = state["epoch_stats"].max_touchedPct > 0.9
+                # Relocate gaussians that touch too many pixels
+                is_too_big_2d = state["epoch_stats"].max_touchedPct > self.prune_scale2d
                 dead_mask |= is_too_big_2d
-            
-            # Also relocate 10% of splats with lowest importance scores
+
+            # Also relocate N% of splats with lowest importance scores
             epoch_stats = state["epoch_stats"]
             if hasattr(epoch_stats, "importance") and hasattr(epoch_stats, "count"):
                 scores = epoch_stats.importance
@@ -285,8 +289,6 @@ class MCMCStrategy(Strategy):
                     scores / count.clamp_min(1),
                     torch.zeros_like(scores)
                 )
-
-                pct = 0.2
 
                 # Find threshold for relocating N% with lowest importance
                 if normalized_scores.numel() > 0:
@@ -302,16 +304,29 @@ class MCMCStrategy(Strategy):
             # probs = _calc_prob1(params, state)
             probs = None
 
-            relocate(
-                params=params,
-                optimizers=optimizers,
-                state=state,
-                mask=dead_mask,
-                binoms=binoms,
-                min_opacity=self.min_opacity,
-                model_type=self.model_type,
-                probs=probs,
-            )
+            if self.model_type == "quaternion":
+                # Use quaternion-specific relocate for skysphere
+                relocate_quaternion(
+                    params=params,
+                    optimizers=optimizers,
+                    state=state,
+                    mask=dead_mask,
+                    binoms=binoms,
+                    radius=state["scene_scale"],  # Use scene_scale as radius
+                    min_opacity=self.min_opacity,
+                    probs=probs,
+                )
+            else:
+                relocate(
+                    params=params,
+                    optimizers=optimizers,
+                    state=state,
+                    mask=dead_mask,
+                    binoms=binoms,
+                    min_opacity=self.min_opacity,
+                    model_type=self.model_type,
+                    probs=probs,
+                )
         return n_gs
 
     @torch.no_grad()
@@ -322,7 +337,7 @@ class MCMCStrategy(Strategy):
         binoms: Tensor,
         state: Dict[str, Any],
     ) -> int:
-        current_n_points = len(params["means"])
+        current_n_points = len(params["means"] if "means" in params else params["quats"])
         n_target = min(self.cap_max, int(self.growth_factor * current_n_points))
         n_gs = max(0, n_target - current_n_points)
         if n_gs > 0:
@@ -330,16 +345,29 @@ class MCMCStrategy(Strategy):
             # probs = _calc_prob1(params, state)
             probs=None
 
-            sample_add(
-                params=params,
-                optimizers=optimizers,
-                state=state,
-                n=n_gs,
-                binoms=binoms,
-                min_opacity=self.min_opacity,
-                model_type=self.model_type,
-                probs=probs,
-            )
+            if self.model_type == "quaternion":
+                # Use quaternion-specific sample_add for skysphere
+                sample_add_quaternion(
+                    params=params,
+                    optimizers=optimizers,
+                    state=state,
+                    n=n_gs,
+                    binoms=binoms,
+                    radius=state["scene_scale"],  # Use scene_scale as radius
+                    min_opacity=self.min_opacity,
+                    probs=probs,
+                )
+            else:
+                sample_add(
+                    params=params,
+                    optimizers=optimizers,
+                    state=state,
+                    n=n_gs,
+                    binoms=binoms,
+                    min_opacity=self.min_opacity,
+                    model_type=self.model_type,
+                    probs=probs,
+                )
         return n_gs
 
     @torch.no_grad()

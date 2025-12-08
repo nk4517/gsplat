@@ -19,7 +19,7 @@ def compute_gcr(grad2d, grad2d_abs, count):
     return torch.clamp(gcr, 0.0, 1.0), avg_grad, avg_grad_abs
 
 
-def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, skysphere_model, cfg, camera_state: CameraState, render_tab_state):
+def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, skysphere_model, camera_state: CameraState, render_tab_state):
 
     width = render_tab_state.viewer_width
     height = render_tab_state.viewer_height
@@ -154,7 +154,7 @@ def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_gra
                 width=width,
                 height=height,
             )
-            renders = sky_colors.squeeze(0).clamp(0, 1).cpu().numpy()
+            renders = sky_colors.squeeze(0).cpu().numpy()
             
     else:
         # Non-epoch_stats modes
@@ -168,8 +168,6 @@ def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_gra
             height=height,
             track_domination=track_domination,
         )
-
-        sky_colors = sky_colors.clamp(0, 1)
 
         if render_tab_state.render_mode == "domination" and "median_ids" in info:
             renders = (
@@ -197,6 +195,7 @@ def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_gra
             sky_colors = skysphere_model.compose_with_background(
                 sky_colors, sky_wsum, c2w[None], K[None], width, height
             )
+            # .clamp(0, 1)
             renders = sky_colors.squeeze(0).cpu().numpy()
 
     # Update render tab state

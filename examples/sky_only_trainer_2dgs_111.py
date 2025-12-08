@@ -23,7 +23,8 @@ import viser
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Parser
+from examples.datasets.dataset import Dataset
 from examples.skysphere_model_parametrized import SkysphereModelParametrized
 from gsplat import rasterization_2dgs, RasterizationMode2DGS
 from gsplat.strategy.epoch_stats import EpochStatistics, training_data_generator
@@ -173,7 +174,7 @@ class SkyOnlyRunner:
         # Initialize skysphere from trainset
         self.skysphere_model.initialize_from_trainset(
             trainset=self.trainset,
-            num_points=cfg.skysphere_points,
+            full_skysphere_N_points=cfg.skysphere_points,
             init_opacity=cfg.init_opacity,
             init_scale=cfg.init_scale,
         )

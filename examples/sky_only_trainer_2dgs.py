@@ -22,10 +22,13 @@ import viser
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Parser
+from examples.datasets.dataset import Dataset
 from examples.skysphere_model_parametrized import SkysphereModelParametrized
 from gsplat import rasterization_2dgs, RasterizationMode2DGS
 from gsplat.strategy.epoch_stats import EpochStatistics, training_data_generator
+from gsplat import MCMCStrategy
+from gsplat.strategy.ops import scaling_activation, opacity_activation
 from gsplat_viewer_2dgs import GsplatViewer
 from nerfview import CameraState
 
@@ -44,6 +47,8 @@ class SkyOnlyConfig:
 
     # Downsample factor for the dataset
     data_factor: int = 4
+    # Target resolution (alternative to factor): int for max side, tuple for (max_w, max_h)
+    target_resolution: int | tuple[int, int] | None = None
     # Every N images there is a test image
     test_every: int = 8
     # Preload all images into memory
@@ -61,7 +66,7 @@ class SkyOnlyConfig:
 
     # Skysphere parameters
     skysphere_radius_multiplier: float = 20.0
-    skysphere_points: int = 50_000
+    full_skysphere_N_points: int = 500_000
     init_opacity: float = 0.1
     init_scale: float = 1.0
     trainable_opacities: bool = True
@@ -82,23 +87,35 @@ class SkyOnlyConfig:
     tb_every: int = 100
 
     # Bilateral grid parameters
-    use_bilateral_grid: bool = False
+    use_bilateral_grid: bool = True
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
     use_fused_bilagrid: bool = True
 
     # Color correction for evaluation
-    use_color_correct: bool = False
+    use_color_correct: bool = True
 
     # SH background parameters
 
     use_sh_background: bool = True
     sh_background_degree: int = 4
-    sh_background_lr: float = 1e-2
+    sh_background_lr: float = 5e-3
 
     sh_bg_base_weight: float = 0.5  # Base weight for SH background blending
     sh_bg_threshold: float = 15  # Threshold above which SH background is not visible
 
     wsum_penalty_lambda: float = 5e-3  # Penalty for high wsum values to encourage SH background
+    regularize_lambda: float = 5e-3  # Penalty for high wsum values to encourage SH background
+
+    # MCMC strategy parameters
+    use_mcmc_strategy: bool = True
+    mcmc_cap_max: int = 25_000
+    mcmc_noise_lr: float = 5e5
+    mcmc_refine_start_epochs: int = 20
+    mcmc_refine_stop_epochs: int = 500
+    mcmc_refine_every_epochs: int = 10
+    mcmc_add_every_epochs: int = 20
+    mcmc_min_opacity: float = 0.005
+    mcmc_growth_factor: float = 1.05
 
 
 def with_lock(lock_name):
@@ -140,6 +157,7 @@ class SkyOnlyRunner:
         self.parser = Parser(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
+            target_resolution=cfg.target_resolution,
             normalize=True,
             test_every=cfg.test_every,
         )
@@ -148,7 +166,7 @@ class SkyOnlyRunner:
         if cfg.preload_images:
             from datasets.preloaded_dataset import PreloadedDataset
             self.trainset = PreloadedDataset(
-                self.parser,
+                self.parser.scene,
                 split="train",
                 patch_size=None,
                 load_depths=False,
@@ -158,7 +176,7 @@ class SkyOnlyRunner:
                 invert_sky_mask=cfg.invert_sky_mask,
             )
             self.valset = PreloadedDataset(
-                self.parser,
+                self.parser.scene,
                 split="val",
                 patch_size=None,
                 load_depths=False,
@@ -169,14 +187,14 @@ class SkyOnlyRunner:
             )
         else:
             self.trainset = Dataset(
-                self.parser,
+                self.parser.scene,
                 split="train",
                 patch_size=None,
                 load_depths=False,
             )
-            self.valset = Dataset(self.parser, split="val")
+            self.valset = Dataset(self.parser.scene, split="val")
 
-        self.scene_scale = self.parser.scene_scale * 1.1
+        self.scene_scale = self.parser.scene.scene_scale * 1.1
         print(f"Scene scale: {self.scene_scale}")
         print(f"Number of training images: {len(self.trainset)}")
         print(f"Number of validation images: {len(self.valset)}")
@@ -194,10 +212,10 @@ class SkyOnlyRunner:
         # Initialize skysphere from trainset
         self.skysphere_model.initialize_from_trainset(
             trainset=self.trainset,
-            num_points=cfg.skysphere_points,
-            init_opacity=cfg.init_opacity,
+            full_skysphere_N_points=cfg.full_skysphere_N_points,
+            # init_opacity=cfg.init_opacity,
             init_scale=cfg.init_scale,
-            use_dog=True,
+            # use_dog=False,
         )
 
         if self.skysphere_model.is_empty:
@@ -211,6 +229,29 @@ class SkyOnlyRunner:
             sparse_grad=False,
             sh_background_lr=cfg.sh_background_lr,
         )
+
+        # Initialize MCMC strategy if enabled
+        self.strategy = None
+        self.strategy_state = None
+        if cfg.use_mcmc_strategy:
+            self.strategy = MCMCStrategy(
+                cap_max=cfg.mcmc_cap_max,
+                noise_lr=cfg.mcmc_noise_lr,
+                refine_start_epochs=cfg.mcmc_refine_start_epochs,
+                refine_stop_epochs=cfg.mcmc_refine_stop_epochs,
+                refine_every_epochs=cfg.mcmc_refine_every_epochs,
+                add_every_epochs=cfg.mcmc_add_every_epochs,
+                min_opacity=cfg.mcmc_min_opacity,
+                growth_factor=cfg.mcmc_growth_factor,
+                verbose=True,
+                model_type="quaternion",  # Use quaternion-specific functions
+            )
+            self.strategy_state = self.strategy.initialize_state(
+                scene_scale=self.skysphere_model.radius
+            )
+            print(f"MCMC strategy initialized with quaternion model type")
+        else:
+            print("No strategy enabled - manual training mode")
 
         # Initialize bilateral grid if enabled
         self.bil_grid_optimizers = []
@@ -357,14 +398,14 @@ class SkyOnlyRunner:
             trainloader = PreloadedDataLoader(
                 self.trainset,
                 batch_size=cfg.batch_size,
-                shuffle=True,
+                shuffle=False,
                 device=device,
             )
         else:
             trainloader = torch.utils.data.DataLoader(
                 self.trainset,
                 batch_size=cfg.batch_size,
-                shuffle=True,
+                shuffle=False,
                 num_workers=4,
                 persistent_workers=True,
                 pin_memory=True,
@@ -386,8 +427,18 @@ class SkyOnlyRunner:
             # Initialize epoch statistics at the start of each epoch
             if epoch_ctx.epoch_start:
                 n_gaussian = self.skysphere_model.n_points
-                if self.epoch_stats is None or len(self.epoch_stats.count) != n_gaussian:
+                if not cfg.use_mcmc_strategy and (self.epoch_stats is None or len(self.epoch_stats.count) != n_gaussian):
                     self.epoch_stats = EpochStatistics(n_gaussian, device)
+
+                # Call strategy epoch start if enabled
+                if self.strategy is not None:
+                    self.strategy.step_epoch_start(
+                        params=self.skysphere_model.params,
+                        optimizers=self.skysphere_optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        epoch_ctx=epoch_ctx,
+                    )
 
             camtoworlds = data["camtoworld"].to(device)  # [B, 4, 4]
             Ks = data["K"].to(device)  # [B, 3, 3]
@@ -406,8 +457,8 @@ class SkyOnlyRunner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                track_domination=False,
-                drop_rate=0.05,
+                track_domination=True,
+                drop_rate=None,
             )
 
             sky_colors = self.skysphere_model.compose_with_background(
@@ -448,17 +499,36 @@ class SkyOnlyRunner:
             # Combined loss
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
+            # Penalty for exceeding 0-1 per channel
+            overflow_penalty = (sky_colors_masked - 1.0).clamp(min=0).mean() + (1.0 - sky_colors_masked).clamp(min=0).mean()
+            loss += 0.1 * overflow_penalty
+
             if cfg.use_sh_background:
                 # Wsum penalty - encourage lower wsum to allow SH background
                 wsum_penalty = cfg.wsum_penalty_lambda * sky_wsum.mean()
 
+                scales = scaling_activation(self.skysphere_model.params['scales'][..., :2])
+                regularize_penality = cfg.regularize_lambda * (scales-scales.mean()).abs().mean()
+
                 # Combined loss
                 loss += wsum_penalty
+                loss += regularize_penality
 
             # Add total variation loss for bilateral grid
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
+
+            # Call strategy pre_backward if enabled
+            if self.strategy is not None:
+                self.strategy.step_pre_backward(
+                    params=self.skysphere_model.params,
+                    optimizers=self.skysphere_optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    epoch_ctx=epoch_ctx,
+                )
 
             # Backward pass
             loss.backward()
@@ -493,6 +563,20 @@ class SkyOnlyRunner:
 
             for scheduler in schedulers:
                 scheduler.step()
+
+            # Call strategy post_backward if enabled
+            if self.strategy is not None:
+                # Get current learning rate from first scheduler
+                current_lr = schedulers[0].get_last_lr()[0] if schedulers else 1e-3
+                self.strategy.step_post_backward(
+                    params=self.skysphere_model.params,
+                    optimizers=self.skysphere_optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    lr=current_lr,
+                    epoch_ctx=epoch_ctx,
+                )
 
             # Reset epoch statistics at the end of epoch
             if epoch_ctx.epoch_end and self.epoch_stats is not None:
@@ -636,13 +720,13 @@ class SkyOnlyRunner:
         # Prepare all needed parameters for external function
         device = self.device
         rasterize_fn = self.rasterize_sky
-        epoch_stats = self.epoch_stats
+        epoch_stats = self.strategy_state["epoch_stats"] if self.strategy_state is not None else self.epoch_stats
         trainset_len = len(self.trainset)
         grow_grad2d = self.cfg.grow_grad2d if hasattr(self.cfg, 'grow_grad2d') else 0.0002
         n_points = self.skysphere_model.n_points
         cfg = self.cfg
 
-        return skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, self.skysphere_model, cfg, camera_state, render_tab_state)
+        return skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, self.skysphere_model, camera_state, render_tab_state)
 
 
 def main(cfg: SkyOnlyConfig):

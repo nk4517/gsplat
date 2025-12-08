@@ -44,6 +44,7 @@ def reproject_skysphere(trainset, skysphere_radius, samples, device):
         if sky_mask is None:
             print("no skymask", data.keys())
             continue
+        sky_mask = sky_mask > 0.5
 
         # Project skysphere points to camera
         worldtocam = torch.linalg.inv(camtoworld[0])

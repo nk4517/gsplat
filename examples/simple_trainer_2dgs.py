@@ -7,8 +7,52 @@ from typing import Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal, assert_never
 from pathlib import Path
 
+from examples.datasets.scene_prepare import prepare_scene
+from examples.datasets.waymo import WaymoParser
 from examples.vs_env import set_vc_envs; set_vc_envs()
 
+
+"""
+LLM INSTRUCTION: Epoch-based training architecture
+===================================================
+WHY EPOCHS MATTER HERE:
+Densification (split/clone) and pruning decisions require statistics accumulated
+over ALL training cameras. Original 3DGS used step-based triggers (refine_every=100),
+but with batching and shuffling this means decisions are made on incomplete/biased data.
+
+This codebase uses EPOCH-BASED triggers: statistics are accumulated over full epoch
+(every camera seen exactly once), then decisions are made at epoch END based on
+configurable schedules:
+
+SCHEDULING PARAMETERS (in Config and Strategy):
+- refine_start_epochs / refine_stop_epochs: window when refinement is active
+- refine_every_epochs: how often to refine (e.g., 5 = every 5th epoch)
+- reset_every_epochs: how often to reset opacities (within reset_start..reset_end window)
+- pause_refine_after_reset_epochs: skip refinement for N epochs after reset
+- For MCMC: add_every_epochs controls when new gaussians are sampled
+
+FLOW:
+1. training_data_generator yields (step, data, epoch_ctx) where epoch_ctx has:
+   - i_epoch: current epoch number
+   - epoch_start = first batch, epoch_end = last batch
+   - i: batch index within epoch, epoch_len: total batches in epoch
+2. On START: strategy.step_epoch_start() initializes/resets EpochStatistics
+3. Each batch: step_pre_backward (retain_grad), backward, step_post_backward (accumulate stats)
+4. On END: step_post_backward checks schedules and triggers refine/prune/reset if conditions met
+   (EpochStatistics always reset at epoch end regardless of whether operations were performed)
+
+CONFIG CONVERSION:
+Parameters are specified in FRAMES (number of camera views) for intuitive configuration,
+then converted to EPOCHS with CEIL rounding to ensure operations happen at epoch boundaries:
+
+  refine_every_epochs = ceil(refine_every_frames / n_cameras_per_epoch)
+  add_every_epochs = ceil(add_every_frames / n_cameras_per_epoch)
+  pause_refine_after_reset_epochs = ceil(pause_refine_after_reset_frames / n_cameras_per_epoch)
+
+Example: refine_every_frames=1000, n_cameras=173 -> refine_every_epochs=ceil(1000/173)=6 (1000 / 173 = 5.78...)
+
+max_steps and eval_steps are also aligned to epoch boundaries for clean checkpoints.
+"""
 
 print("import 111")
 
@@ -18,6 +62,7 @@ print("import 111")
 from examples.lib_compose import CompositingOrder, compose_renders, compose_renders_back_to_front
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
+from examples.datasets.dataset import Scene
 
 from examples.simple_trainer_2dgs_viewer import render_inner
 
@@ -84,7 +129,9 @@ class Config:
     # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
     # data_dir: str = r"x:\_ai\_glomap\data\south-building"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = None
+    # Target resolution (alternative to factor): int for max side, tuple for (max_w, max_h)
+    target_resolution: int | tuple[int, int] | None = 320
     # Directory to save results
     # result_dir: str = r"x:\_ai\_my_nerfstudio_results\koneva1"
     result_dir: str = r"x:\_ai\_my_nerfstudio_results\bicycle"
@@ -103,16 +150,16 @@ class Config:
     port: int = 8080
 
     # Batch size for training. Learning rates are scaled automatically
-    batch_size: int = 1
+    batch_size: int = 16
     # A global factor to scale the number of training steps
-    steps_scaler: float = 4.0
+    steps_scaler: float = 1/5
 
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [Config.max_steps//4, Config.max_steps])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [Config.max_steps//4, Config.max_steps])
 
     # Initialization strategy
     init_type: str = "sfm" # "random" # "sfm"
@@ -139,28 +186,35 @@ class Config:
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.05
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float = 0.0001
+    grow_grad2d: float = 0.001
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
-    prune_scale3d: float = 0.1
+    prune_scale3d: float = 0.4
+    # GSs with 2d scale (normalized by image resolution) above this value will be pruned
+    prune_scale2d: float = 0.33
+    # Stop refining GSs based on 2d scale after this iteration
+    refine_scale2d_stop_iter: int = 0
 
     # Start refining GSs after this epoch
     refine_start_epochs: int = 0
     # Stop refining GSs after this epoch
     refine_stop_epochs: int = 500
     # Refine GSs every this many epochs
-    refine_every_epochs: int = 1
+    refine_every_frames: int = 1000  # Target frames between refines (~100 iters * batch_size=16)
     # Add new GSs every this many epochs (for MCMCStrategy)
-    add_every_epochs: int = 2
+    add_every_frames: int = 2000  # Target frames between adds (2x refine)
     # Start resetting opacities after this epoch
-    reset_start_epochs: int = 100
+    reset_start_epochs: int = 100000000
     # Stop resetting opacities after this epoch
     reset_end_epochs: int = 10000
     # Reset opacities every this many epochs
     reset_every_epochs: int = 20
     # Pause refining for this many epochs after reset
-    pause_refine_after_reset_epochs: int = 1
+    pause_refine_after_reset_frames: int = 3000  # Target frames to pause after reset
+
+    # MCMC strategy cap_max parameter
+    mcmc_cap_max: int = 500_000
 
     # Auto-calculate epoch parameters from legacy step-based values
     auto_epoch_params: bool = False
@@ -213,7 +267,7 @@ class Config:
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Enable depth loss. (experimental)
-    depth_loss: bool = True
+    depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
@@ -222,7 +276,7 @@ class Config:
     # Weight for normal loss
     normal_lambda: float = 5e-2
     # Iteration to start normal consistency regulerization
-    normal_start_iter: int = 7_000
+    normal_start_iter: int = 1_000
 
     # Distortion loss. (experimental)
     dist_loss: bool = True
@@ -311,14 +365,31 @@ class Config:
     skysphere_init_opacity: float = 0.1
     skysphere_init_scale: float = 1.0
     skysphere_loss_lambda: float = 1.0  # Weight for sky loss
+    # Path to pretrained skysphere checkpoint (cold mode - no training, render only)
+    # skysphere_ckpt: Optional[str] = r"X:\_ai\_my_nerfstudio_results\segment-102751\ckpts\step_005999\skysphere.pt"
+    # skysphere_ckpt: Optional[str] = r"X:\_ai\_my_nerfstudio_results\sky_only_simple_F_FL_FR\ckpts\step_005999\skysphere.pt"
+    skysphere_ckpt: Optional[str] = r"X:\_ai\_waymo\tensorflow_extractor\colmap_proj.results\sky-only\ckpts\step_005999\skysphere.pt"
     # Sky mask: 1 = sky, 0 = world (after inversion if invert_sky_mask=True in dataset)
     require_sky_mask: bool = True  # Require sky masks in dataset
-    invert_sky_mask: bool = True  # Invert sky mask (if mask marks non-sky as 1)
+    invert_sky_mask: bool = False  # Invert sky mask (if mask marks non-sky as 1)
     
     # Sky alpha regularization (penalizes world splats rendering in sky regions)
-    sky_alpha_loss: bool = True  # Enable sky alpha regularization
+    sky_alpha_loss: bool = False  # Enable sky alpha regularization
     sky_alpha_lambda: float = 0.1  # Weight for sky alpha loss
     sky_alpha_start_iter: int = 0  # Iteration to start sky alpha regularization
+
+    # Mask alpha regularization (penalizes opacity outside mask regions)
+    # mask: 1 = keep (object), 0 = discard (penalize opacity here)
+    mask_alpha_loss: bool = False  # Enable mask alpha regularization
+    mask_alpha_lambda: float = 0.1  # Weight for mask alpha loss
+    mask_alpha_start_iter: int = 0  # Iteration to start mask alpha regularization
+
+    # Learning rate scheduler settings
+    lr_scheduler: Literal["exponential", "cosine_warm_restarts"] = "cosine_warm_restarts"
+    # For cosine_warm_restarts: T_mult - period multiplier after each restart
+    cosine_T_mult: int = 1
+    # For cosine_warm_restarts: minimum LR as ratio of initial (eta_min = lr * ratio)
+    cosine_eta_min_ratio: float = 0.01
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -340,8 +411,8 @@ class Config:
         self.max_steps = align_to_epoch_end(self.max_steps)
 
 
-def create_splats_with_optimizers(
-    parser: Parser,
+def create_splats(
+    scene: Scene,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
@@ -349,14 +420,12 @@ def create_splats_with_optimizers(
     init_scale: float = 1.0,
     scene_scale: float = 1.0,
     sh_degree: int = 3,
-    sparse_grad: bool = False,
-    batch_size: int = 1,
     feature_dim: Optional[int] = None,
     device: str = "cuda",
-) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+) -> torch.nn.ParameterDict:
     if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        points = torch.from_numpy(scene.points.xyz).float()
+        rgbs = torch.from_numpy(scene.points.rgb / 255.0).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -398,50 +467,54 @@ def create_splats_with_optimizers(
         params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size, reference:
-    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-    # Note that this would not make the training exactly equivalent, see
-    # https://arxiv.org/pdf/2402.18824v1
+    return splats
 
-    # Create optimizers for each parameter group
+
+def create_optimizers_for_splats(
+    splats: torch.nn.ParameterDict,
+    scene_scale: float = 1.0,
+    sparse_grad: bool = False,
+    batch_size: int = 1,
+) -> dict[str, torch.optim.Optimizer]:
+    """Create optimizers for existing splats ParameterDict."""
+    # LR mapping for each parameter
+    lr_map = {
+        "means": 1.6e-4 * scene_scale,
+        "scales": 5e-3,
+        "quats": 5e-3,
+        "opacities": 5e-2,
+        "sh0": 2.5e-3,
+        "shN": 2.5e-3 / 20,
+        "features": 2.5e-3,
+        "colors": 2.5e-3,
+    }
+
     optimizers = {}
-    for name, _, lr in params:
-        if lr is None:  # Skip parameters without learning rate
+    for name, param in splats.items():
+        if name not in lr_map:  # skip max_sampling_rate etc
             continue
+        lr = lr_map[name]
 
-        # Scaled learning rate and hyperparameters based on batch size
         scaled_lr = lr * math.sqrt(batch_size)
         scaled_eps = 1e-15 / math.sqrt(batch_size)
-        scaled_betas = (1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.99))#, 1 - batch_size * (1 - 0.99))
+        scaled_betas = (0.98/16, 0.92/16, 0.99/16)
 
-        adan111 = False
-
-        if adan111:
-            scaled_betas = (0.98, 0.92, 0.99)
-            # scaled_betas = (1 - batch_size * (1 - 0.98), 1 - batch_size * (1 - 0.99), 1 - batch_size * (1 - 0.99))
-
-
-        # Choose optimizer based on sparse_grad setting
         if sparse_grad:
-            # Use SparseAdam for sparse gradients
             optimizer = torch.optim.SparseAdam(
-                [{"params": splats[name], "lr": scaled_lr}],
+                [{"params": param, "lr": scaled_lr}],
                 eps=scaled_eps,
-                betas=scaled_betas,
+                betas=scaled_betas[:2],
             )
         else:
-
-            # Use Adan optimizer (drop-in replacement for Adam with better performance)
-            optimizer = (Adan if adan111 else torch.optim.Adam)(
-                [{"params": splats[name], "lr": lr }],
+            optimizer = Adan(
+                [{"params": param, "lr": lr}],
                 eps=scaled_eps,
                 betas=scaled_betas,
-                fused=True,  # Enable fused operations for better performance
+                fused=True,
             )
-
         optimizers[name] = optimizer
 
-    return splats, optimizers
+    return optimizers
 
 
 class Runner:
@@ -468,20 +541,36 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
+        # self.parser = Parser(
+        #     data_dir=cfg.data_dir,
+        #     factor=cfg.data_factor,
+        #     target_resolution=cfg.target_resolution,
+        #     normalize=cfg.normalize_world_space,
+        #     test_every=cfg.test_every,
+        # )
+        self.parser = WaymoParser(
             data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
-            test_every=cfg.test_every,
+            camera_angles=["FRONT", "FRONT_LEFT"],
+            frame_range=(0,250),
         )
-        
+        scene_fullscale = self.parser.scene
+        self.scene = prepare_scene(
+            scene_fullscale,
+            factor=cfg.data_factor,
+            target_resolution=cfg.target_resolution,
+        )
+        scene = self.scene
+
+        need_sky_masks = (cfg.require_sky_mask or cfg.enable_skysphere)  #: and cfg.skysphere_ckpt is None
+        sky_mask_params = {"load_sky_mask": need_sky_masks, "soft_sky_mask": True,
+                           "invert_sky_mask": cfg.invert_sky_mask} if need_sky_masks else {}
+
         # Choose between preloaded and regular dataset
         if cfg.preload_images:
             from datasets.preloaded_dataset import PreloadedDataset
-            sky_mask_params = {"require_sky_mask": cfg.require_sky_mask or cfg.enable_skysphere,
-                               "invert_sky_mask": cfg.invert_sky_mask} if (cfg.require_sky_mask or cfg.enable_skysphere) else {}
+            # Only require sky masks if skysphere is enabled AND not using frozen checkpoint
             self.trainset = PreloadedDataset(
-                self.parser,
+                scene,
                 split="train",
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
@@ -490,7 +579,7 @@ class Runner:
                 **sky_mask_params,
             )
             self.valset = PreloadedDataset(
-                self.parser,
+                scene,
                 split="val",
                 patch_size=None,
                 load_depths=False,
@@ -498,29 +587,34 @@ class Runner:
                 to_gpu=False, # Store directly on GPU for fastest access
                 **sky_mask_params,
             )
-            self.valset = PreloadedDataset(
-                self.parser,
-                split="val",
-                patch_size=None,
-                load_depths=False,
-                device=self.device,
-                to_gpu=False, # Store directly on GPU for fastest access
-            )
         else:
             self.trainset = Dataset(
-                self.parser,
+                scene,
                 split="train",
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
+                **sky_mask_params,
             )
-            self.valset = Dataset(self.parser, split="val")
+            self.valset = Dataset(scene, split="val")
         
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        self.scene_scale = scene.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+
+        # Training resolution (for checkpoint naming)
+        first_cam = list(scene.cameras.values())[0]
+        self.train_width, self.train_height = first_cam.width, first_cam.height
+        print(f"Training resolution: {self.train_width}x{self.train_height}")
 
         # Auto-calculate epoch parameters from legacy step-based values
         n_cameras_per_epoch = len(self.trainset)
         print(f"Cameras per epoch: {n_cameras_per_epoch}")
+        
+        # Convert frames to epochs (ceil to epoch boundaries)
+        cfg.refine_every_epochs = max(1, math.ceil(cfg.refine_every_frames / n_cameras_per_epoch))
+        cfg.add_every_epochs = max(1, math.ceil(cfg.add_every_frames / n_cameras_per_epoch))
+        cfg.pause_refine_after_reset_epochs = max(1, math.ceil(cfg.pause_refine_after_reset_frames / n_cameras_per_epoch))
+        print(f"Converted to epochs: refine_every={cfg.refine_every_epochs}, "
+              f"add_every={cfg.add_every_epochs}, pause_after_reset={cfg.pause_refine_after_reset_epochs}")
         
         # Align eval and save steps to epoch boundaries
         cfg.align_steps_to_epochs(n_cameras_per_epoch)
@@ -562,23 +656,44 @@ class Runner:
             print(f"  reset_start={cfg.reset_start_epochs} epochs, "
                   f"reset_end={cfg.reset_end_epochs} epochs")
 
-        # Model
-        feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
-            self.parser,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
-            scene_scale=self.scene_scale,
-            sh_degree=cfg.sh_degree,
-            sparse_grad=cfg.sparse_grad,
-            batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
-            device=self.device,
-        )
-        print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        if cfg.resume_ckpt is None:
+            # Model
+            feature_dim = 32 if cfg.app_opt else None
+
+            self.splats = create_splats(
+                scene,
+                init_type=cfg.init_type,
+                init_num_pts=cfg.init_num_pts,
+                init_extent=cfg.init_extent,
+                init_opacity=cfg.init_opa,
+                init_scale=cfg.init_scale,
+                scene_scale=self.scene_scale,
+                sh_degree=cfg.sh_degree,
+                feature_dim=feature_dim,
+                device=self.device,
+            )
+            self.optimizers = create_optimizers_for_splats(
+                self.splats, scene_scale=self.scene_scale,
+                sparse_grad=cfg.sparse_grad, batch_size=cfg.batch_size,
+            )
+            print("Model initialized. Number of GS:", len(self.splats["means"]))
+        else:
+            # Load checkpoint for resuming training if specified
+            print(f"Loading checkpoint from {cfg.resume_ckpt}")
+            ckpt = torch.load(cfg.resume_ckpt, map_location=self.device)
+            # Create splats from checkpoint data
+            self.splats = torch.nn.ParameterDict({
+                k: torch.nn.Parameter(v) for k, v in ckpt["splats"].items() if k not in ('max_sampling_rate',)
+            }).to(self.device)
+            print(f"Resumed from step {ckpt.get('step', 'unknown')}, {len(self.splats['means'])} gaussians")
+            self.optimizers = create_optimizers_for_splats(
+                self.splats,
+                scene_scale=self.scene_scale,
+                sparse_grad=cfg.sparse_grad,
+                batch_size=cfg.batch_size,
+            )
+
         self.model_type = cfg.model_type
 
         if self.model_type == "2dgs":
@@ -771,19 +886,33 @@ class Runner:
         if cfg.enable_skysphere:
             from examples.skysphere_model_parametrized import SkysphereModelParametrized
             self.skysphere_model = SkysphereModelParametrized(self.scene_scale)
-            self.skysphere_model.initialize_from_trainset(
-                trainset=self.trainset,
-                num_points=cfg.skysphere_num_points,
-                init_opacity=cfg.skysphere_init_opacity,
-                init_scale=cfg.skysphere_init_scale,
-            )
-            if self.skysphere_model.is_empty:
-                print("WARNING: No sky masks found, disabling skysphere")
-                self.skysphere_model = None
-            else:
-                print(f"Skysphere initialized with {self.skysphere_model.n_points} points")
+            
+            if cfg.skysphere_ckpt is not None:
+                # Frozen mode: load from checkpoint, no training
+                self.skysphere_model.load_checkpoint(cfg.skysphere_ckpt, frozen=True)
+                if self.skysphere_model.is_empty:
+                    print("WARNING: Loaded skysphere checkpoint is empty, disabling skysphere")
+                    self.skysphere_model = None
+                else:
+                    print(f"Skysphere loaded from checkpoint with {self.skysphere_model.n_points} points (frozen mode)")
+
                 self.skysphere_optimizers = self.skysphere_model.create_optimizers(
                     batch_size=cfg.batch_size, sparse_grad=cfg.sparse_grad)
+            else:
+                # Normal mode: initialize from trainset
+                self.skysphere_model.initialize_from_trainset(
+                    trainset=self.trainset,
+                    full_skysphere_N_points=cfg.skysphere_num_points,
+                    # init_opacity=cfg.skysphere_init_opacity,
+                    init_scale=cfg.skysphere_init_scale,
+                )
+                if self.skysphere_model.is_empty:
+                    print("WARNING: No sky masks found, disabling skysphere")
+                    self.skysphere_model = None
+                else:
+                    print(f"Skysphere initialized with {self.skysphere_model.n_points} points")
+                    self.skysphere_optimizers = self.skysphere_model.create_optimizers(
+                        batch_size=cfg.batch_size, sparse_grad=cfg.sparse_grad)
 
         if cfg.use_aa_smoothing:
             update_max_sampling_rate(
@@ -981,12 +1110,21 @@ class Runner:
         max_steps = cfg.max_steps
         init_step = 0
 
-        schedulers = [
-            # means has a learning rate schedule, that end at 0.01 of the initial value
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
-            ),
-        ]
+        # Create schedulers for means and scales
+        n_cameras_per_epoch = len(self.trainset)
+        T_0 = cfg.add_every_epochs * n_cameras_per_epoch  # restart period for cosine
+
+        schedulers = []
+        for opt_name in ["means", "scales"]:
+            opt = self.optimizers[opt_name]
+            lr = opt.param_groups[0]["lr"]
+            if cfg.lr_scheduler == "cosine_warm_restarts":
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    opt, T_0=T_0, T_mult=cfg.cosine_T_mult, eta_min=lr * cfg.cosine_eta_min_ratio,
+                )
+            else:  # exponential
+                scheduler = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.01 ** (1.0 / max_steps))
+            schedulers.append(scheduler)
 
         # Get camera optimizer's optimizers and add schedulers for them
         camera_optimizers = {}
@@ -997,6 +1135,7 @@ class Runner:
                     opt_params,
                     lr=1e-5 * math.sqrt(cfg.batch_size),  # Default lr, can be adjusted
                     weight_decay=1e-6,
+                    betas=(0.98/8, 0.92/8, 0.99/8),
                 )
                 schedulers.append(
                     torch.optim.lr_scheduler.ExponentialLR(
@@ -1054,7 +1193,7 @@ class Runner:
             trainloader = PreloadedDataLoader(
                 self.trainset,
                 batch_size=cfg.batch_size,
-                shuffle=True,
+                shuffle=False,
                 device=device,
                 shared_intrinsics=cfg.shared_intrinsics,
             )
@@ -1062,7 +1201,7 @@ class Runner:
             trainloader = torch.utils.data.DataLoader(
                 self.trainset,
                 batch_size=cfg.batch_size,
-                shuffle=True,
+                shuffle=False,
                 num_workers=4,
                 persistent_workers=True,
                 pin_memory=True,
@@ -1249,7 +1388,7 @@ class Runner:
                 info=info,
                 epoch_ctx=epoch_ctx,
             )
-            masks = data["mask"].to(device) if "mask" in data else None
+            masks = data["sky_mask"].to(device) if "sky_mask" in data else None
             if masks is not None:
                 pixels = pixels * masks[..., None]
                 colors = colors * masks[..., None]
@@ -1363,7 +1502,7 @@ class Runner:
                     curr_opacity_l1_lambda = 0.0
                 # L1 regularization on activated opacities
                 activated_opacities = opacity_activation(self.splats["opacities"])
-                opacity_l1_loss = (activated_opacities).mean()
+                opacity_l1_loss = activated_opacities.mean()
                 loss += opacity_l1_loss * curr_opacity_l1_lambda
 
             if cfg.erank_loss:
@@ -1397,21 +1536,22 @@ class Runner:
 
             # Sky-specific loss (on sky mask regions)
             skyloss = torch.tensor(0.0, device=device)
-            if self.skysphere_model is not None and sky_colors is not None and "sky_mask" in data:
-                sky_mask = data["sky_mask"].to(device).float()  # [B, H, W], 1=sky, 0=world
-                # Compute loss only on sky regions
-                sky_mask_expanded = sky_mask.unsqueeze(-1)  # [B, H, W, 1]
-                # Use the composited colors vs ground truth on sky regions
-                sky_region_rendered = colors * sky_mask_expanded
-                sky_region_gt = pixels * sky_mask_expanded
-                # L1 loss on sky regions
-                sky_pixel_count = sky_mask.sum() + 1e-8
-                skyloss = F.l1_loss(sky_region_rendered, sky_region_gt, reduction='sum') / sky_pixel_count
-                loss += skyloss * cfg.skysphere_loss_lambda
+            # if self.skysphere_model is not None and sky_colors is not None and "sky_mask" in data:
+            #     sky_mask = data["sky_mask"].to(device).float()  # [B, H, W], 1=sky, 0=world
+            #     # Compute loss only on sky regions
+            #     sky_mask_expanded = sky_mask.unsqueeze(-1)  # [B, H, W, 1]
+            #     # Use the composited colors vs ground truth on sky regions
+            #     sky_region_rendered = colors * sky_mask_expanded
+            #     sky_region_gt = pixels * sky_mask_expanded
+            #     # L1 loss on sky regions
+            #     sky_pixel_count = sky_mask.sum() + 1e-8
+            #     skyloss = F.l1_loss(sky_region_rendered, sky_region_gt, reduction='sum') / sky_pixel_count
+            #     loss += skyloss * cfg.skysphere_loss_lambda
 
             # Sky alpha regularization - penalize world splats in sky regions
             sky_alpha_loss_val = torch.tensor(0.0, device=device)
-            if cfg.sky_alpha_loss and "sky_mask" in data:
+            # Only apply sky_alpha_loss if not using frozen skysphere (let optimizer handle it naturally)
+            if cfg.sky_alpha_loss and "sky_mask" in data:# and cfg.skysphere_ckpt is None:
                 if step > cfg.sky_alpha_start_iter:
                     curr_sky_alpha_lambda = cfg.sky_alpha_lambda
                 else:
@@ -1420,6 +1560,21 @@ class Runner:
                 # Penalize world alpha in sky regions
                 sky_alpha_loss_val = (world_alphas.squeeze(-1) * sky_mask).mean()
                 loss += sky_alpha_loss_val * curr_sky_alpha_lambda
+
+            # Mask alpha regularization - penalize opacity outside mask regions
+            mask_alpha_loss_val = torch.tensor(0.0, device=device)
+            if cfg.mask_alpha_loss and masks is not None:
+                if step > cfg.mask_alpha_start_iter:
+                    curr_mask_alpha_lambda = cfg.mask_alpha_lambda
+                else:
+                    curr_mask_alpha_lambda = 0.0
+                # Penalize world alpha outside mask (where mask == 0)
+                mask_alpha_loss_val = (world_alphas.squeeze(-1) * (1.0 - masks)).mean()
+                loss += mask_alpha_loss_val * curr_mask_alpha_lambda
+
+            if self.skysphere_model is not None and cfg.skysphere_ckpt is not None:
+                # только там, где небо вообще хоть как-то есть.
+                loss += (world_alphas * (sky_alphas > 0.01).float()).mean() * 1e-3
 
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
@@ -1470,8 +1625,11 @@ class Runner:
             if cfg.use_bilateral_grid:
                 loss_components["tvloss"] = tvloss
 
-            if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:
+            if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:# and cfg.skysphere_ckpt is None:
                 loss_components["sky_alpha_loss"] = sky_alpha_loss_val
+
+            if cfg.mask_alpha_loss and masks is not None and step > cfg.mask_alpha_start_iter:
+                loss_components["mask_alpha_loss"] = mask_alpha_loss_val
 
             loss.backward()
 
@@ -1490,8 +1648,10 @@ class Runner:
                 desc += f" scale_percentile={scale_percentile_loss.item():.4f}"
             if cfg.erank_loss and step > cfg.erank_start_iter:
                 desc += f" erank={erank_loss.item():.4f}"
-            if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:
+            if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:# and cfg.skysphere_ckpt is None:
                 desc += f" sky_a={sky_alpha_loss_val.item():.4f}"
+            if cfg.mask_alpha_loss and masks is not None and step > cfg.mask_alpha_start_iter:
+                desc += f" mask_a={mask_alpha_loss_val.item():.4f}"
             if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
                 desc += f" op_l1={opacity_l1_loss.item():.4f}"
             pbar.set_description(desc)
@@ -1515,8 +1675,10 @@ class Runner:
                     self.writer.add_scalar("train/elongation_loss", elongation_loss.item(), step)
                 if cfg.scale_percentile_loss and step > cfg.scale_percentile_start_iter:
                     self.writer.add_scalar("train/scale_percentile_loss", scale_percentile_loss.item(), step)
-                if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:
+                if cfg.sky_alpha_loss and "sky_mask" in data and step > cfg.sky_alpha_start_iter:# and cfg.skysphere_ckpt is None:
                     self.writer.add_scalar("train/sky_alpha_loss", sky_alpha_loss_val.item(), step)
+                if cfg.mask_alpha_loss and masks is not None and step > cfg.mask_alpha_start_iter:
+                    self.writer.add_scalar("train/mask_alpha_loss", mask_alpha_loss_val.item(), step)
                 if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
                     self.writer.add_scalar("train/opacity_l1_loss", opacity_l1_loss.item(), step)
                 if cfg.use_bilateral_grid:
@@ -1630,7 +1792,7 @@ class Runner:
                     checkpoint_data["Ks_structure"] = self.Ks_structure
                 torch.save(
                     checkpoint_data,
-                    f"{self.ckpt_dir}/ckpt_{step}.pt",
+                    f"{self.ckpt_dir}/ckpt_{self.train_width}x{self.train_height}_{step}.pt",
                 )
 
             # eval the full set
@@ -1866,71 +2028,87 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
-        camtoworlds = self.parser.camtoworlds[5:-5]
-        camtoworlds = generate_interpolated_path(camtoworlds, 1)  # [N, 3, 4]
-        camtoworlds = np.concatenate(
-            [
-                camtoworlds,
-                np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds), axis=0),
-            ],
-            axis=1,
-        )  # [N, 4, 4]
-
-        camtoworlds = torch.from_numpy(camtoworlds).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-        width, height = list(self.parser.imsize_dict.values())[0]
-
-        canvas_all = []
-        for i in tqdm.trange(len(camtoworlds), desc="Rendering trajectory"):
-            renders, alphas, _, surf_normals, _, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds[i : i + 1],
-                Ks=K[None],
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [1, H, W, 4]
-
-            colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
-
-            # Composite with skysphere if enabled
-            if self.skysphere_model is not None:
-                sky_colors, sky_alphas, _ = self.rasterize_sky(
+        scene = self.scene
+        
+        # Group images by camera_id
+        from collections import defaultdict
+        images_by_cam: dict[int, list] = defaultdict(list)
+        for img in scene.images:
+            images_by_cam[img.camera_id].append(img)
+        
+        video_dir = f"{cfg.result_dir}/videos"
+        os.makedirs(video_dir, exist_ok=True)
+        
+        for cam_id, cam_images in images_by_cam.items():
+            if len(cam_images) < 10:
+                print(f"Skipping camera {cam_id}: only {len(cam_images)} images")
+                continue
+            
+            cam = scene.cameras[cam_id]
+            K = torch.from_numpy(cam.K.copy()).float().to(device)
+            width, height = cam.width, cam.height
+            
+            # Build trajectory from this camera's poses
+            cam_c2ws = np.array([img.camtoworld for img in cam_images])
+            if len(cam_c2ws) > 10:
+                cam_c2ws = cam_c2ws[5:-5]
+            camtoworlds = generate_interpolated_path(cam_c2ws, 1)  # [N, 3, 4]
+            camtoworlds = np.concatenate(
+                [
+                    camtoworlds,
+                    np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds), axis=0),
+                ],
+                axis=1,
+            )  # [N, 4, 4]
+            camtoworlds = torch.from_numpy(camtoworlds).float().to(device)
+            
+            canvas_all = []
+            for i in tqdm.trange(len(camtoworlds), desc=f"Rendering traj cam_{cam_id}"):
+                renders, alphas, _, surf_normals, _, _, _ = self.rasterize_splats(
                     camtoworlds=camtoworlds[i : i + 1],
                     Ks=K[None],
                     width=width,
                     height=height,
-                )
-                if sky_colors is not None:
-                    # Composite: world over sky (same as in train)
-                    sky_colors = sky_colors[0].clamp(0, 1)
-                    sky_alpha = sky_alphas[0].clamp(0, 1)  # sky_alphas is wsum
-                    colors, _ = compose_renders_back_to_front(
-                        renders_list=[colors, sky_colors],
-                        alphas_list=[alphas[0], torch.ones_like(sky_alpha)],
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+ED",
+                )  # [1, H, W, 4]
+
+                colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
+
+                # Composite with skysphere if enabled
+                if self.skysphere_model is not None:
+                    sky_colors, sky_alphas, _ = self.rasterize_sky(
+                        camtoworlds=camtoworlds[i : i + 1],
+                        Ks=K[None],
+                        width=width,
+                        height=height,
                     )
+                    if sky_colors is not None:
+                        sky_colors = sky_colors[0].clamp(0, 1)
+                        sky_alpha = sky_alphas[0].clamp(0, 1)
+                        colors, _ = compose_renders_back_to_front(
+                            renders_list=[colors, sky_colors],
+                            alphas_list=[alphas[0], torch.ones_like(sky_alpha)],
+                        )
 
-            depths = renders[0, ..., 3:4]  # [H, W, 1]
-            depths = normalize_robust(depths)
-            surf_normals = normalize_robust(surf_normals)
+                depths = renders[0, ..., 3:4]  # [H, W, 1]
+                depths = normalize_robust(depths)
+                surf_normals = normalize_robust(surf_normals)
 
-            # write images
-            canvas = torch.cat(
-                [colors, depths.repeat(1, 1, 3)], dim=0 if width > height else 1
-            )
-            canvas = (canvas.cpu().numpy() * 255).astype(np.uint8)
-            canvas_all.append(canvas)
+                canvas = torch.cat(
+                    [colors, depths.repeat(1, 1, 3)], dim=0 if width > height else 1
+                )
+                canvas = (canvas.cpu().numpy() * 255).astype(np.uint8)
+                canvas_all.append(canvas)
 
-        # save to video
-        video_dir = f"{cfg.result_dir}/videos"
-        os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
-        for canvas in canvas_all:
-            writer.append_data(canvas)
-        writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+            video_path = f"{video_dir}/traj_{step}_cam{cam_id}.mp4"
+            writer = imageio.get_writer(video_path, fps=30)
+            for canvas in canvas_all:
+                writer.append_data(canvas)
+            writer.close()
+            print(f"Video saved to {video_path}")
 
     @torch.no_grad()
     def _viewer_render_fn(
@@ -1941,7 +2119,9 @@ class Runner:
         # Extract all self references at the beginning for future extraction
         device = self.device
         splats = self.splats
-        parser_Ks_dict = self.parser.Ks_dict
+        scene = self.scene
+        first_cam = list(scene.cameras.values())[0]
+        f_orig = float(first_cam.K[0, 0] + first_cam.K[1, 1]) / 2
         cfg = self.cfg
         strategy_state = self.strategy_state
         trainset = self.trainset
@@ -1953,7 +2133,7 @@ class Runner:
         rasterize_sky_fn = self.rasterize_sky
         
         return render_inner(camera_state=camera_state, render_tab_state=render_tab_state, device=device,
-                            splats=splats, parser_Ks_dict=parser_Ks_dict, cfg=cfg, n_cameras=n_cameras,
+                            splats=splats, f_orig=f_orig, cfg=cfg, n_cameras=n_cameras,
                             rasterize_splats_fn=rasterize_splats_fn,
                             epoch_stats=epoch_stats,
                             skysphere_model=skysphere_model,
@@ -2008,4 +2188,3 @@ if __name__ == "__main__":
             )
     
     main(cfg)
-

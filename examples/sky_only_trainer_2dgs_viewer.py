@@ -1,8 +1,8 @@
 import torch
 from nerfview import CameraState
+from nerfview import apply_float_colormap
 
-from examples.utils import index_map_to_pseudocolor, scalar_to_colormap
-
+from examples.utils import index_map_to_pseudocolor, scalar_to_colormap, normalize_robust
 
 def safe_divide(numerator, denominator, min_denom=1):
     """Безопасное деление с проверкой на ноль."""
@@ -19,7 +19,7 @@ def compute_gcr(grad2d, grad2d_abs, count):
     return torch.clamp(gcr, 0.0, 1.0), avg_grad, avg_grad_abs
 
 
-def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, camera_state: CameraState, render_tab_state):
+def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, sh_background, cfg, camera_state: CameraState, render_tab_state):
 
     width = render_tab_state.viewer_width
     height = render_tab_state.viewer_height
@@ -148,7 +148,7 @@ def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_gra
             )
         else:
             # Fallback if no data available for requested mode
-            sky_colors, _ = rasterize_fn(
+            sky_colors, _, _ = rasterize_fn(
                 camtoworlds=c2w[None],
                 Ks=K[None],
                 width=width,
@@ -161,7 +161,7 @@ def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_gra
         track_domination = render_tab_state.render_mode == "domination"
         
         # Render sky
-        sky_colors, info = rasterize_fn(
+        sky_colors, sky_wsum, info = rasterize_fn(
             camtoworlds=c2w[None],
             Ks=K[None],
             width=width,
@@ -181,8 +181,25 @@ def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_gra
                 .cpu()
                 .numpy()
             )
+        elif render_tab_state.render_mode == "alpha":
+            alpha = sky_wsum[0, ..., 0:1]
+            alpha_norm = normalize_robust(alpha)
+            if render_tab_state.inverse:
+                alpha_norm = 1 - alpha_norm
+            renders = (
+                apply_float_colormap(alpha_norm, render_tab_state.colormap).cpu().numpy()
+            )
         else:
             # Default RGB mode
+            # Compose with SH background if enabled
+            if cfg.use_sh_background and sh_background is not None:
+                sh_bg = sh_background.render(
+                    camtoworlds=c2w[None],
+                    Ks=K[None],
+                    width=width,
+                    height=height,
+                )
+                sky_colors = sh_background.blend_with_sky(sky_colors, sky_wsum, sh_bg)
             renders = sky_colors.squeeze(0).cpu().numpy()
 
     # Update render tab state

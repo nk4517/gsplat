@@ -131,7 +131,7 @@ class SHBackgroundModel(nn.Module):
         return torch.stack(renders, dim=0)  # [B, H, W, 3]
 
     def blend_with_sky(
-        self,
+            self,
         sky_colors: torch.Tensor,  # [B, H, W, 3]
         sky_wsum: torch.Tensor,    # [B, H, W, 1]
         sh_bg: torch.Tensor,       # [B, H, W, 3]

@@ -752,9 +752,13 @@ class Runner:
             self.cfg.strategy.refine_every_epochs = cfg.refine_every_epochs
             self.cfg.strategy.add_every_epochs = cfg.add_every_epochs
             self.cfg.strategy.min_opacity = cfg.prune_opa
+            self.cfg.strategy.cap_max = cfg.mcmc_cap_max
             self.cfg.strategy.growth_factor = 1.15
             self.cfg.strategy.verbose = True
             self.cfg.strategy.model_type = cfg.model_type
+            self.cfg.strategy.prune_scale3d = cfg.prune_scale3d
+            self.cfg.strategy.prune_scale2d = cfg.prune_scale2d
+            self.cfg.strategy.refine_scale2d_stop_iter = cfg.refine_scale2d_stop_iter
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)

@@ -30,6 +30,7 @@ class PreloadedDataset:
             to_gpu: bool = False,  # If True, store directly on GPU instead of pinned memory
             require_sky_mask: bool = False,  # If True, exclude images without sky masks from dataset
             load_sky_mask: bool = False,  # If True, load sky masks into memory
+            load_aux_keys: list[str] | None = None,  # List of aux keys to load (e.g. ["mask", "sky_heat"])
             invert_sky_mask: bool = False,
             soft_sky_mask: bool = False,
     ):
@@ -45,6 +46,10 @@ class PreloadedDataset:
         self.load_sky_mask = load_sky_mask or require_sky_mask  # require implies load
         self.invert_sky_mask = invert_sky_mask
         self.soft_sky_mask = soft_sky_mask
+        # Собрать все aux ключи для загрузки
+        self.aux_keys_to_load: set[str] = set(load_aux_keys or [])
+        if self.load_sky_mask:
+            self.aux_keys_to_load.add("mask")
 
         # Determine indices based on split
         indices = np.arange(len(self.scene.images))
@@ -78,8 +83,8 @@ class PreloadedDataset:
         self.preloaded_masks = []
         self.preloaded_camera_ids = []
 
-        if self.load_sky_mask:
-            self.preloaded_sky_masks = []
+        # aux данные: {key: [tensor | None, ...]}
+        self.preloaded_aux: dict[str, list] = {k: [] for k in self.aux_keys_to_load}
 
         if self.load_depths:
             self.preloaded_points = []
@@ -98,23 +103,28 @@ class PreloadedDataset:
             K = cam_info.K.copy()
             camtoworld = img_data.camtoworld
 
-            # Load sky mask if required and available
-            sky_mask = None
-            mask_fpath = img_data.aux_fpaths.get("mask")
-            if self.load_sky_mask and mask_fpath and mask_fpath.exists():
-                try:
-                    sky_mask = imageio.imread(mask_fpath)
-                    if len(sky_mask.shape) == 3:
-                        sky_mask = sky_mask[..., 0]
-                    # uint8 0-255 -> float 0.0-1.0
-                    sky_mask = sky_mask.astype(np.float32) / 255.0
-                    if self.invert_sky_mask:
-                        sky_mask = 1.0 - sky_mask
-                    if not self.soft_sky_mask:
-                        sky_mask = sky_mask > 0.5
-                except Exception as e:
-                    print(f"Warning: failed to load sky mask {mask_fpath}: {e}")
-                    sky_mask = None
+            # Load aux data (mask, sky_heat, etc.)
+            aux_loaded: dict[str, np.ndarray | None] = {}
+            for aux_key in self.aux_keys_to_load:
+                aux_fpath = img_data.aux_fpaths.get(aux_key)
+                aux_data = None
+                if aux_fpath and aux_fpath.exists():
+                    try:
+                        aux_data = imageio.imread(aux_fpath)
+                        if len(aux_data.shape) == 3:
+                            aux_data = aux_data[..., 0]
+                        # uint8 0-255 -> float 0.0-1.0
+                        aux_data = aux_data.astype(np.float32) / 255.0
+                        # Специальная обработка для mask (sky_mask)
+                        if aux_key == "mask":
+                            if self.invert_sky_mask:
+                                aux_data = 1.0 - aux_data
+                            if not self.soft_sky_mask:
+                                aux_data = aux_data > 0.5
+                    except Exception as e:
+                        print(f"Warning: failed to load {aux_key} from {aux_fpath}: {e}")
+                        aux_data = None
+                aux_loaded[aux_key] = aux_data
 
             # Fisheye mask (valid region after undistortion)
             mask = cam_info.undistortion.valid_mask if cam_info.undistortion is not None else None
@@ -156,17 +166,18 @@ class PreloadedDataset:
             else:
                 self.preloaded_masks.append(None)
 
-            if self.load_sky_mask:
-                if sky_mask is not None:
-                    # sky_mask уже float32 или bool после конвертации выше
-                    sky_mask_tensor = torch.from_numpy(sky_mask)
+            # Сохранить aux данные
+            for aux_key in self.aux_keys_to_load:
+                aux_data = aux_loaded.get(aux_key)
+                if aux_data is not None:
+                    aux_tensor = torch.from_numpy(aux_data)
                     if self.to_gpu:
-                        sky_mask_tensor = sky_mask_tensor.to(self.device)
+                        aux_tensor = aux_tensor.to(self.device)
                     elif self.pin_memory:
-                        sky_mask_tensor = sky_mask_tensor.pin_memory()
-                    self.preloaded_sky_masks.append(sky_mask_tensor)
+                        aux_tensor = aux_tensor.pin_memory()
+                    self.preloaded_aux[aux_key].append(aux_tensor)
                 else:
-                    self.preloaded_sky_masks.append(None)
+                    self.preloaded_aux[aux_key].append(None)
 
             # Load depth data if needed
             if self.load_depths:
@@ -226,7 +237,11 @@ class PreloadedDataset:
         K = self.preloaded_Ks[item]
         camtoworld = self.preloaded_camtoworlds[item]
         mask = self.preloaded_masks[item]
-        sky_mask = self.preloaded_sky_masks[item] if self.load_sky_mask else None
+
+        # Получить aux данные для этого item
+        aux_data: dict[str, torch.Tensor | None] = {}
+        for aux_key, aux_list in self.preloaded_aux.items():
+            aux_data[aux_key] = aux_list[item] if aux_list else None
 
         # Clone K since we might modify it (already on correct device)
         K = K.clone()
@@ -243,9 +258,10 @@ class PreloadedDataset:
             if mask is not None:
                 mask = mask[y: y + self.patch_size, x: x + self.patch_size]
 
-            if sky_mask is not None:
-                sky_mask = sky_mask[y: y + self.patch_size, x: x + self.patch_size]
-
+            # Crop aux data
+            for aux_key, aux_val in aux_data.items():
+                if aux_val is not None:
+                    aux_data[aux_key] = aux_val[y: y + self.patch_size, x: x + self.patch_size]
 
         data = {
             "K": K,
@@ -257,8 +273,11 @@ class PreloadedDataset:
         if mask is not None:
             data["mask"] = mask
 
-        if sky_mask is not None:
-            data["sky_mask"] = sky_mask
+        # Добавить aux данные в output (mask -> sky_mask для обратной совместимости)
+        for aux_key, aux_val in aux_data.items():
+            if aux_val is not None:
+                out_key = "sky_mask" if aux_key == "mask" else aux_key
+                data[out_key] = aux_val
 
         if self.load_depths and self.preloaded_points[item] is not None:
             data["points"] = self.preloaded_points[item]

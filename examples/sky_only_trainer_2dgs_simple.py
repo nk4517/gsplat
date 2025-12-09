@@ -25,10 +25,11 @@ import viser
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
-from datasets.colmap import Parser
 from examples.sky_only_trainer_2dgs_viewer import skysphere_renderer
 from examples.datasets.scene_prepare import prepare_scene
 from examples.datasets.waymo import WaymoParser
+from examples.datasets.colmap import Parser as ColmapParser
+from examples import my_datasets
 from examples.datasets.dataset import Dataset
 from examples.skysphere_model_parametrized import SkysphereModelParametrized
 from gsplat import rasterization_2dgs, RasterizationMode2DGS
@@ -40,15 +41,8 @@ from nerfview import CameraState
 
 @dataclass
 class SkyOnlySimpleConfig:
-    # Path to dataset
-    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
-    # data_dir: str = r"x:\_ai\_waymo\tensorflow_extractor\colmap_proj_F_FL_FR"
-    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
-    data_dir: str = r"x:\_ai\_waymo\tensorflow_extractor\colmap_proj"
-
-    # Directory to save results
-    result_dir: str = Path(data_dir).with_suffix(".results") / "sky-only"
-    # result_dir: str = r"x:\_ai\_my_nerfstudio_results\segment-102751"
+    # Dataset configuration
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_WAYMO_COLMAP_PROJ)
 
     # Downsample factor for the dataset
     data_factor: int = 4
@@ -188,25 +182,39 @@ class SkyOnlySimpleRunner:
         self.cfg = cfg
         self.device = "cuda"
         self.rasterize_lock = threading.Lock()
-        
+
+        # Default result_dir if not specified
+        if cfg.dataset.result_dir is None:
+            cfg.dataset.result_dir = str(Path(cfg.dataset.data_dir).with_suffix(".result") / "sky-only")
+
         # Setup output directories
-        os.makedirs(cfg.result_dir, exist_ok=True)
-        self.ckpt_dir = f"{cfg.result_dir}/ckpts"
+        os.makedirs(cfg.dataset.result_dir, exist_ok=True)
+        self.ckpt_dir = f"{cfg.dataset.result_dir}/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.stats_dir = f"{cfg.result_dir}/stats"
+        self.stats_dir = f"{cfg.dataset.result_dir}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
-        self.render_dir = f"{cfg.result_dir}/renders"
+        self.render_dir = f"{cfg.dataset.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
-        
-        # Load data
-        self.parser = WaymoParser(
-            data_dir=cfg.data_dir,
-            camera_angles=["FRONT", "FRONT_LEFT", "FRONT_RIGHT"],
-            frame_range=(0,250),
-        )
+        self.writer = SummaryWriter(log_dir=f"{cfg.dataset.result_dir}/tb")
+
+        # Load data based on dataset type
+        if isinstance(cfg.dataset, my_datasets.WaymoDatasetConfig):
+            self.parser = WaymoParser(
+                data_dir=cfg.dataset.data_dir,
+                camera_angles=cfg.dataset.waymo_camera_angles,
+                frame_range=cfg.dataset.waymo_frame_range,
+                load_lidar=cfg.dataset.waymo_load_lidar,
+                waymo_calib_dir=cfg.dataset.waymo_calib_dir,
+            )
+        elif isinstance(cfg.dataset, my_datasets.ColmapDatasetConfig):
+            self.parser = ColmapParser(
+                data_dir=cfg.dataset.data_dir,
+            )
+        else:
+            raise ValueError(f"Unknown dataset type: {type(cfg.dataset)}")
+
         scene_fullscale = self.parser.scene
         scene = prepare_scene(
             scene_fullscale,
@@ -225,8 +233,8 @@ class SkyOnlySimpleRunner:
                 device=self.device,
                 to_gpu=True,
                 require_sky_mask=True,
-                invert_sky_mask=True,
-                soft_sky_mask=True,
+                invert_sky_mask=cfg.dataset.invert_mask,
+                soft_sky_mask=cfg.dataset.soft_mask,
             )
             self.valset = PreloadedDataset(
                 scene,
@@ -236,8 +244,8 @@ class SkyOnlySimpleRunner:
                 device=self.device,
                 to_gpu=False,
                 require_sky_mask=True,
-                invert_sky_mask=True,
-                soft_sky_mask=True,
+                invert_sky_mask=cfg.dataset.invert_mask,
+                soft_sky_mask=cfg.dataset.soft_mask,
             )
         else:
             self.trainset = Dataset(
@@ -246,8 +254,8 @@ class SkyOnlySimpleRunner:
                 patch_size=None,
                 load_depths=False,
                 require_sky_mask=True,
-                invert_sky_mask=True,
-                soft_sky_mask=True,
+                invert_sky_mask=cfg.dataset.invert_mask,
+                soft_sky_mask=cfg.dataset.soft_mask,
             )
             self.valset = Dataset(scene, split="val")
         
@@ -353,7 +361,7 @@ class SkyOnlySimpleRunner:
             self.viewer = GsplatViewer(
                 server=self.server,
                 render_fn=self._viewer_render_fn,
-                output_dir=Path(cfg.result_dir),
+                output_dir=Path(cfg.dataset.result_dir),
                 mode="training",
             )
     

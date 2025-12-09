@@ -7,8 +7,6 @@ from typing import Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal, assert_never
 from pathlib import Path
 
-from examples.datasets.scene_prepare import prepare_scene
-from examples.datasets.waymo import WaymoParser
 from examples.vs_env import set_vc_envs; set_vc_envs()
 
 
@@ -59,7 +57,11 @@ print("import 111")
 
 # импортировать всё, что связано c torch только после этого
 
-from examples.lib_compose import CompositingOrder, compose_renders, compose_renders_back_to_front
+from examples.datasets.scene_prepare import prepare_scene
+from examples.datasets.waymo import WaymoParser
+from examples.datasets.colmap import Parser as ColmapParser
+from examples import my_datasets
+from examples.lib_compose import compose_renders_back_to_front
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from examples.datasets.dataset import Scene
@@ -80,7 +82,7 @@ import tqdm
 import tyro
 import viser
 # from tiny_renderer.minigui import CUDARenderer
-from datasets.colmap import Dataset, Parser
+from examples.datasets.dataset import Dataset
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -110,39 +112,24 @@ def binary_cross_entropy_loss(input: torch.Tensor, target: torch.Tensor) -> torc
 
 @dataclass
 class Config:
+    # Dataset configuration
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_GUGONG)
+    
     # Disable viewer
     disable_viewer: bool = False
     use_viser: bool = True
-    # Path to the .pt file. If provide, it will skip training and render a video
-    ckpt: Optional[str] = None
 
-    # Path to the Mip-NeRF 360 dataset
-    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube05\towel"
-    # data_dir: str = r"X:\_ai\_gsplat\datasets\garden"
-    # data_dir: str = r"x:\_ai\_gsplat\datasets\bicycle"
-    # data_dir: str = r"X:\_ai\_gsplat\datasets\kitchen"
-    # data_dir: str = r"x:\_ai\_gsplat\datasets\fb_colmap_res"
-    # data_dir: str = r"y:\_gopro_kv92\extracted_keyframes\GOPR6996_colmap"
-    # data_dir: str = r"y:\_gopro_kv92\calib_charuco\video\extracted_keyframes\GOPR7015\colmap_db"
-    # data_dir: str = r"y:\_gopro_kv92\2025-10-06-1\3-statue"
-    data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
-    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
-    # data_dir: str = r"x:\_ai\_glomap\data\south-building"
     # Downsample factor for the dataset
     data_factor: int = None
     # Target resolution (alternative to factor): int for max side, tuple for (max_w, max_h)
     target_resolution: int | tuple[int, int] | None = 320
-    # Directory to save results
-    # result_dir: str = r"x:\_ai\_my_nerfstudio_results\koneva1"
-    result_dir: str = r"x:\_ai\_my_nerfstudio_results\bicycle"
+
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
-    # Normalize the world space
-    normalize_world_space: bool = True
     # Preload all images into memory for faster training
     preload_images: bool = True
 
@@ -359,19 +346,15 @@ class Config:
     split_big_touched_pct: float = 0.025  # Split gaussians touching more than this percentage of pixels in one view
 
     # Skysphere parameters for joint sky training
-    enable_skysphere: bool = True  # Enable joint skysphere training
+    enable_skysphere: bool = False  # Enable joint skysphere training
     skysphere_radius_multiplier: float = 20.0  # Radius = scene_scale * multiplier
     skysphere_num_points: int = 100_000  # Number of sky gaussians
     skysphere_init_opacity: float = 0.1
     skysphere_init_scale: float = 1.0
     skysphere_loss_lambda: float = 1.0  # Weight for sky loss
-    # Path to pretrained skysphere checkpoint (cold mode - no training, render only)
-    # skysphere_ckpt: Optional[str] = r"X:\_ai\_my_nerfstudio_results\segment-102751\ckpts\step_005999\skysphere.pt"
-    # skysphere_ckpt: Optional[str] = r"X:\_ai\_my_nerfstudio_results\sky_only_simple_F_FL_FR\ckpts\step_005999\skysphere.pt"
-    skysphere_ckpt: Optional[str] = r"X:\_ai\_waymo\tensorflow_extractor\colmap_proj.results\sky-only\ckpts\step_005999\skysphere.pt"
+
     # Sky mask: 1 = sky, 0 = world (after inversion if invert_sky_mask=True in dataset)
     require_sky_mask: bool = True  # Require sky masks in dataset
-    invert_sky_mask: bool = False  # Invert sky mask (if mask marks non-sky as 1)
     
     # Sky alpha regularization (penalizes world splats rendering in sky regions)
     sky_alpha_loss: bool = False  # Enable sky alpha regularization
@@ -526,33 +509,46 @@ class Runner:
         self.cfg = cfg
         self.device = "cuda"
 
+        # Default result_dir if not specified
+        if cfg.dataset.result_dir is None:
+            cfg.dataset.result_dir = str(Path(cfg.dataset.data_dir).with_suffix(".result"))
+
         # Where to dump results.
-        os.makedirs(cfg.result_dir, exist_ok=True)
+        os.makedirs(cfg.dataset.result_dir, exist_ok=True)
 
         # Setup output directories.
-        self.ckpt_dir = f"{cfg.result_dir}/ckpts"
+        self.ckpt_dir = f"{cfg.dataset.result_dir}/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.stats_dir = f"{cfg.result_dir}/stats"
+        self.stats_dir = f"{cfg.dataset.result_dir}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
-        self.render_dir = f"{cfg.result_dir}/renders"
+        self.render_dir = f"{cfg.dataset.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+        self.writer = SummaryWriter(log_dir=f"{cfg.dataset.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        # self.parser = Parser(
-        #     data_dir=cfg.data_dir,
-        #     factor=cfg.data_factor,
-        #     target_resolution=cfg.target_resolution,
-        #     normalize=cfg.normalize_world_space,
-        #     test_every=cfg.test_every,
-        # )
-        self.parser = WaymoParser(
-            data_dir=cfg.data_dir,
-            camera_angles=["FRONT", "FRONT_LEFT"],
-            frame_range=(0,250),
-        )
+        if isinstance(cfg.dataset, my_datasets.WaymoDatasetConfig):
+            self.parser = WaymoParser(
+                data_dir=cfg.dataset.data_dir,
+                camera_angles=cfg.dataset.waymo_camera_angles,
+                frame_range=cfg.dataset.waymo_frame_range,
+                test_every=cfg.test_every,
+                normalize=cfg.dataset.normalize,
+                load_lidar=cfg.dataset.waymo_load_lidar,
+                waymo_calib_dir=cfg.dataset.waymo_calib_dir,
+            )
+        elif isinstance(cfg.dataset, my_datasets.ColmapDatasetConfig):
+            self.parser = ColmapParser(
+                data_dir=cfg.dataset.data_dir,
+                normalize=cfg.dataset.normalize,
+                test_every=cfg.test_every,
+            )
+        elif isinstance(cfg.dataset, my_datasets.RCDatasetConfig):
+            raise NotImplementedError("RealityCapture parser not implemented")
+        else:
+            raise ValueError(f"Unknown dataset type: {type(cfg.dataset)}")
+
         scene_fullscale = self.parser.scene
         self.scene = prepare_scene(
             scene_fullscale,
@@ -563,7 +559,7 @@ class Runner:
 
         need_sky_masks = (cfg.require_sky_mask or cfg.enable_skysphere)  #: and cfg.skysphere_ckpt is None
         sky_mask_params = {"load_sky_mask": need_sky_masks, "soft_sky_mask": True,
-                           "invert_sky_mask": cfg.invert_sky_mask} if need_sky_masks else {}
+                           "invert_sky_mask": cfg.dataset.invert_mask} if need_sky_masks else {}
 
         # Choose between preloaded and regular dataset
         if cfg.preload_images:
@@ -656,8 +652,7 @@ class Runner:
             print(f"  reset_start={cfg.reset_start_epochs} epochs, "
                   f"reset_end={cfg.reset_end_epochs} epochs")
 
-
-        if cfg.resume_ckpt is None:
+        if cfg.dataset.resume_ckpt is None:
             # Model
             feature_dim = 32 if cfg.app_opt else None
 
@@ -680,8 +675,8 @@ class Runner:
             print("Model initialized. Number of GS:", len(self.splats["means"]))
         else:
             # Load checkpoint for resuming training if specified
-            print(f"Loading checkpoint from {cfg.resume_ckpt}")
-            ckpt = torch.load(cfg.resume_ckpt, map_location=self.device)
+            print(f"Loading checkpoint from {cfg.dataset.resume_ckpt}")
+            ckpt = torch.load(cfg.dataset.resume_ckpt, map_location=self.device)
             # Create splats from checkpoint data
             self.splats = torch.nn.ParameterDict({
                 k: torch.nn.Parameter(v) for k, v in ckpt["splats"].items() if k not in ('max_sampling_rate',)
@@ -891,9 +886,9 @@ class Runner:
             from examples.skysphere_model_parametrized import SkysphereModelParametrized
             self.skysphere_model = SkysphereModelParametrized(self.scene_scale)
             
-            if cfg.skysphere_ckpt is not None:
+            if cfg.dataset.skysphere_ckpt is not None:
                 # Frozen mode: load from checkpoint, no training
-                self.skysphere_model.load_checkpoint(cfg.skysphere_ckpt, frozen=True)
+                self.skysphere_model.load_checkpoint(cfg.dataset.skysphere_ckpt, frozen=True)
                 if self.skysphere_model.is_empty:
                     print("WARNING: Loaded skysphere checkpoint is empty, disabling skysphere")
                     self.skysphere_model = None
@@ -940,7 +935,7 @@ class Runner:
             self.viewer = GsplatViewer(
                 server=self.server,
                 render_fn=self._viewer_render_fn,
-                output_dir=Path(cfg.result_dir),
+                output_dir=Path(cfg.dataset.result_dir),
                 mode="training",
             )
 
@@ -1576,7 +1571,7 @@ class Runner:
                 mask_alpha_loss_val = (world_alphas.squeeze(-1) * (1.0 - masks)).mean()
                 loss += mask_alpha_loss_val * curr_mask_alpha_lambda
 
-            if self.skysphere_model is not None and cfg.skysphere_ckpt is not None:
+            if self.skysphere_model is not None and cfg.dataset.skysphere_ckpt is not None:
                 # только там, где небо вообще хоть как-то есть.
                 loss += (world_alphas * (sky_alphas > 0.01).float()).mean() * 1e-3
 
@@ -2040,7 +2035,7 @@ class Runner:
         for img in scene.images:
             images_by_cam[img.camera_id].append(img)
         
-        video_dir = f"{cfg.result_dir}/videos"
+        video_dir = f"{cfg.dataset.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
         
         for cam_id, cam_images in images_by_cam.items():
@@ -2147,9 +2142,9 @@ class Runner:
 def main(cfg: Config):
     runner = Runner(cfg)
 
-    if cfg.ckpt is not None:
+    if cfg.dataset.ckpt is not None:
         # run eval only
-        ckpt = torch.load(cfg.ckpt, map_location=runner.device)
+        ckpt = torch.load(cfg.dataset.ckpt, map_location=runner.device)
         for k in runner.splats.keys():
             if k in ckpt["splats"]:
                 runner.splats[k].data = ckpt["splats"][k]

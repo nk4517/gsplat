@@ -9,12 +9,6 @@ from pycolmap import SceneManager
 from tqdm import tqdm
 from typing_extensions import assert_never
 
-from .normalize import (
-    align_principal_axes,
-    similarity_from_cameras,
-    transform_cameras,
-    transform_points,
-)
 from .dataset import (
     UndistortionMaps,
     CameraIntrinsics,
@@ -31,8 +25,6 @@ class Parser:
     def __init__(
         self,
         data_dir: str,
-        normalize: bool = False,
-        test_every: int = 8,
     ):
         colmap_dir = Path(data_dir) / "sparse/0"
         if not colmap_dir.exists():
@@ -179,36 +171,7 @@ class Parser:
             k: np.array(v).astype(np.int32) for k, v in point_indices.items()
         }
 
-        # Normalize the world space.
-        if normalize:
-            T1 = similarity_from_cameras(camtoworlds)
-            camtoworlds = transform_cameras(T1, camtoworlds)
-            points = transform_points(T1, points)
-
-            T2 = align_principal_axes(points)
-            camtoworlds = transform_cameras(T2, camtoworlds)
-            points = transform_points(T2, points)
-
-            transform = T2 @ T1
-
-            # Fix for up side down. We assume more points towards
-            # the bottom of the scene which is true when ground floor is
-            # present in the images.
-            if np.median(points[:, 2]) > np.mean(points[:, 2]):
-                # rotate 180 degrees around x axis such that z is flipped
-                T3 = np.array(
-                    [
-                        [1.0, 0.0, 0.0, 0.0],
-                        [0.0, -1.0, 0.0, 0.0],
-                        [0.0, 0.0, -1.0, 0.0],
-                        [0.0, 0.0, 0.0, 1.0],
-                    ]
-                )
-                camtoworlds = transform_cameras(T3, camtoworlds)
-                points = transform_points(T3, points)
-                transform = T3 @ transform
-        else:
-            transform = np.eye(4)
+        transform = np.eye(4)
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.

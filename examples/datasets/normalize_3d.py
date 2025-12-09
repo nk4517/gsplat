@@ -1,5 +1,6 @@
 import numpy as np
 
+from .dataset import Scene
 
 def similarity_from_cameras(c2w, strict_scaling=False, center_method="focus"):
     """
@@ -55,10 +56,10 @@ def similarity_from_cameras(c2w, strict_scaling=False, center_method="focus"):
     transform[:3, 3] = translate
     transform[:3, :3] = R_align
 
-    # (3) Rescale the scene using camera distances
-    scale_fn = np.max if strict_scaling else np.median
-    scale = 1.0 / scale_fn(np.linalg.norm(t + translate, axis=-1))
-    transform[:3, :] *= scale
+    # # (3) Rescale the scene using camera distances
+    # scale_fn = np.max if strict_scaling else np.median
+    # scale = 1.0 / scale_fn(np.linalg.norm(t + translate, axis=-1))
+    # transform[:3, :] *= scale
 
     return transform
 
@@ -130,7 +131,7 @@ def transform_cameras(matrix, camtoworlds):
     return camtoworlds
 
 
-def normalize(camtoworlds, points=None):
+def normalize_camtoworlds(camtoworlds, points=None):
     T1 = similarity_from_cameras(camtoworlds)
     camtoworlds = transform_cameras(T1, camtoworlds)
     if points is not None:
@@ -141,3 +142,84 @@ def normalize(camtoworlds, points=None):
         return camtoworlds, points, T2 @ T1
     else:
         return camtoworlds, T1
+
+
+def normalize_scene(camtoworlds, points=None):
+    """Normalize scene: align cameras, align principal axes, fix upside-down.
+
+    Args:
+        camtoworlds: Nx4x4 array of camera-to-world matrices
+        points: Mx3 array of 3D points
+        
+    Returns:
+        camtoworlds: normalized camera-to-world matrices
+        points: normalized points
+        transform: 4x4 combined transformation matrix
+    """
+    T1 = similarity_from_cameras(camtoworlds)
+    camtoworlds = transform_cameras(T1, camtoworlds)
+
+    if points is None:
+        return camtoworlds, None, T1
+
+    points = transform_points(T1, points)
+
+    T2 = align_principal_axes(points)
+    camtoworlds = transform_cameras(T2, camtoworlds)
+    points = transform_points(T2, points)
+
+    transform = T2 @ T1
+
+    # Fix for upside down. We assume more points towards
+    # the bottom of the scene which is true when ground floor is
+    # present in the images.
+    if np.median(points[:, 2]) > np.mean(points[:, 2]):
+        # rotate 180 degrees around x axis such that z is flipped
+        T3 = np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+        camtoworlds = transform_cameras(T3, camtoworlds)
+        points = transform_points(T3, points)
+        transform = T3 @ transform
+
+    return camtoworlds, points, transform
+
+
+def apply_scene_normalization(scene: Scene) -> Scene:
+    """Apply normalization to Scene dataclass in-place.
+    
+    Extracts camtoworlds and points from scene, normalizes them,
+    and updates scene fields.
+    
+    Args:
+        scene: Scene dataclass to normalize
+        
+    Returns:
+        The same scene object with updated fields
+    """
+    camtoworlds = np.stack([img.camtoworld for img in scene.images], axis=0)
+    points = scene.points.xyz if scene.points is not None else None
+    
+    camtoworlds, points, new_transform = normalize_scene(camtoworlds, points)
+    
+    # Update camtoworlds in images
+    for i, img in enumerate(scene.images):
+        img.camtoworld = camtoworlds[i]
+    
+    # Update points
+    if scene.points is not None and points is not None:
+        scene.points.xyz = points
+    
+    # Update transform (compose with existing)
+    scene.transform = new_transform @ scene.transform
+    
+    # Recalculate scene_scale
+    camera_locations = camtoworlds[:, :3, 3]
+    scene_center = np.mean(camera_locations, axis=0)
+    dists = np.linalg.norm(camera_locations - scene_center, axis=1)
+    scene.scene_scale = float(np.max(dists))
+    
+    return scene

@@ -65,6 +65,7 @@ from examples.lib_compose import compose_renders_back_to_front
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from examples.datasets.dataset import Scene
+from examples.datasets.normalize_3d import apply_scene_normalization
 
 from examples.simple_trainer_2dgs_viewer import render_inner
 
@@ -534,14 +535,12 @@ class Runner:
                 camera_angles=cfg.dataset.waymo_camera_angles,
                 frame_range=cfg.dataset.waymo_frame_range,
                 test_every=cfg.test_every,
-                normalize=cfg.dataset.normalize,
                 load_lidar=cfg.dataset.waymo_load_lidar,
                 waymo_calib_dir=cfg.dataset.waymo_calib_dir,
             )
         elif isinstance(cfg.dataset, my_datasets.ColmapDatasetConfig):
             self.parser = ColmapParser(
                 data_dir=cfg.dataset.data_dir,
-                normalize=cfg.dataset.normalize,
                 test_every=cfg.test_every,
             )
         elif isinstance(cfg.dataset, my_datasets.RCDatasetConfig):
@@ -550,6 +549,9 @@ class Runner:
             raise ValueError(f"Unknown dataset type: {type(cfg.dataset)}")
 
         scene_fullscale = self.parser.scene
+        if cfg.dataset.normalize_world_space:
+            apply_scene_normalization(scene_fullscale)
+
         self.scene = prepare_scene(
             scene_fullscale,
             factor=cfg.data_factor,

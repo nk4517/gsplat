@@ -25,6 +25,7 @@ import viser
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
+from examples.datasets.normalize_3d import apply_scene_normalization
 from examples.sky_only_trainer_2dgs_viewer import skysphere_renderer
 from examples.datasets.scene_prepare import prepare_scene
 from examples.datasets.waymo import WaymoParser
@@ -216,6 +217,10 @@ class SkyOnlySimpleRunner:
             raise ValueError(f"Unknown dataset type: {type(cfg.dataset)}")
 
         scene_fullscale = self.parser.scene
+
+        if cfg.dataset.normalize_world_space:
+            apply_scene_normalization(scene_fullscale)
+
         scene = prepare_scene(
             scene_fullscale,
             factor=cfg.data_factor,

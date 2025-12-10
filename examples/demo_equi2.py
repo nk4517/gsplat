@@ -133,7 +133,7 @@ def eac_to_equirect(eac: np.ndarray, H_eq: int, W_eq: int, interpolation = cv2.I
 
 def main1():
     """Demo: equirect -> EAC -> equirect roundtrip."""
-    input_path = Path(r"P:\3d_printing\_gsplat_sandbox\splatting_app\gsplat-2025\examples\data\1000_F_208486829_9Zf0XvJq5IQTWPf9kcJPes4dOWWMXlNX.jpg")
+    input_path = Path(r"P:\3d_printing\_gsplat_sandbox\splatting_app\gsplat-2025\examples\data\pano4s.png")
     eac_path = input_path.with_stem(input_path.stem + "_eac").with_suffix(".png")
     roundtrip_path = input_path.with_stem(input_path.stem + "_roundtrip").with_suffix(".png")
     diff_path = input_path.with_stem(input_path.stem + "_diff").with_suffix(".png")

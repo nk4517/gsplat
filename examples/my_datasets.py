@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 from typing_extensions import Literal
 
+from examples.datasets.waymo import WAYMO_CAMERAS
+
 
 @dataclass
 class DatasetConfig:
@@ -51,9 +53,9 @@ class ColmapDatasetConfig(DatasetConfig):
 class WaymoDatasetConfig(DatasetConfig):
     """Waymo dataset configuration."""
     parser_type: Literal["waymo"] = "waymo"
-    waymo_camera_angles: List[str] = field(default_factory=lambda: ["FRONT", "FRONT_LEFT"])
+    waymo_camera_angles: List[str] = field(default_factory=lambda: WAYMO_CAMERAS)
     waymo_frame_range: Tuple[int, int] = (0, 250)
-    waymo_calib_dir: Optional[str] = None
+    waymo_calib_dir: Optional[str] = r"X:\_ai\_waymo\tensorflow_extractor\colmap_proj"
     waymo_load_lidar: bool = True
 
 
@@ -104,6 +106,7 @@ DATASET_GOOD_PARK = ColmapDatasetConfig(
 )
 DATASET_SEGMENT_102751 = ColmapDatasetConfig(
     dataset_dir=r"x:\_ai\_demos\_gsplat\_datasets\segment-102751",
+    skysphere_ckpt=r"X:\_ai\_demos\_gsplat\_datasets\segment-102751.out\ckpts\ckpt_9999.pt",
     invert_mask=True,
 )
 DATASET_YOUTUBE01 = ColmapDatasetConfig(
@@ -114,12 +117,12 @@ DATASET_SOUTH_BUILDING = ColmapDatasetConfig(
 )
 DATASET_WAYMO_F_FL_FR = WaymoDatasetConfig(
     dataset_dir=r"x:\_ai\_waymo\tensorflow_extractor\colmap_proj_F_FL_FR",
-    skysphere_ckpt=r"step_005999\skysphere.pt",
+    # skysphere_ckpt=r"step_005999\skysphere.pt",
     invert_mask=True,
 )
 DATASET_WAYMO_COLMAP_PROJ = WaymoDatasetConfig(
     dataset_dir=r"x:\_ai\_waymo\tensorflow_extractor\colmap_proj",
-    skysphere_ckpt=r"X:\_ai\_waymo\tensorflow_extractor\colmap_proj.result\sky-only\ckpts\step_005999\skysphere.pt",
+    # skysphere_ckpt=r"X:\_ai\_waymo\tensorflow_extractor\colmap_proj.result\sky-only\ckpts\step_005999\skysphere.pt",
     invert_mask=True,
     waymo_camera_angles=["FRONT", "FRONT_LEFT", "FRONT_RIGHT", "SIDE_LEFT", "SIDE_RIGHT"],
 )

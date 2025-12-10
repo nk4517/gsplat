@@ -114,7 +114,7 @@ def binary_cross_entropy_loss(input: torch.Tensor, target: torch.Tensor) -> torc
 @dataclass
 class Config:
     # Dataset configuration
-    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_GUGONG)
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_SEGMENT_102751)
     
     # Disable viewer
     disable_viewer: bool = False
@@ -152,7 +152,7 @@ class Config:
     # Initialization strategy
     init_type: str = "sfm" # "random" # "sfm"
     # Initial number of GSs. Ignored if using sfm
-    init_num_pts: int = 200_000
+    init_num_pts: int = 20_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
@@ -185,7 +185,7 @@ class Config:
     refine_scale2d_stop_iter: int = 0
 
     # Start refining GSs after this epoch
-    refine_start_epochs: int = 0
+    refine_start_epochs: int = 10
     # Stop refining GSs after this epoch
     refine_stop_epochs: int = 500
     # Refine GSs every this many epochs
@@ -347,7 +347,7 @@ class Config:
     split_big_touched_pct: float = 0.025  # Split gaussians touching more than this percentage of pixels in one view
 
     # Skysphere parameters for joint sky training
-    enable_skysphere: bool = False  # Enable joint skysphere training
+    enable_skysphere: bool = True  # Enable joint skysphere training
     skysphere_radius_multiplier: float = 20.0  # Radius = scene_scale * multiplier
     skysphere_num_points: int = 100_000  # Number of sky gaussians
     skysphere_init_opacity: float = 0.1
@@ -358,7 +358,7 @@ class Config:
     require_sky_mask: bool = True  # Require sky masks in dataset
     
     # Sky alpha regularization (penalizes world splats rendering in sky regions)
-    sky_alpha_loss: bool = False  # Enable sky alpha regularization
+    sky_alpha_loss: bool = True  # Enable sky alpha regularization
     sky_alpha_lambda: float = 0.1  # Weight for sky alpha loss
     sky_alpha_start_iter: int = 0  # Iteration to start sky alpha regularization
 
@@ -467,7 +467,7 @@ def create_optimizers_for_splats(
         "scales": 5e-3,
         "quats": 5e-3,
         "opacities": 5e-2,
-        "sh0": 2.5e-3,
+        "sh0": 2.5e-2,
         "shN": 2.5e-3 / 20,
         "features": 2.5e-3,
         "colors": 2.5e-3,
@@ -511,27 +511,28 @@ class Runner:
         self.device = "cuda"
 
         # Default result_dir if not specified
-        if cfg.dataset.result_dir is None:
-            cfg.dataset.result_dir = str(Path(cfg.dataset.data_dir).with_suffix(".result"))
+        if cfg.dataset.output_dir is None:
+            cfg.dataset.output_dir = str(Path(cfg.dataset.dataset_dir).with_suffix(".result"))
 
         # Where to dump results.
-        os.makedirs(cfg.dataset.result_dir, exist_ok=True)
+        os.makedirs(cfg.dataset.output_dir, exist_ok=True)
 
         # Setup output directories.
-        self.ckpt_dir = f"{cfg.dataset.result_dir}/ckpts"
+        self.ckpt_dir = f"{cfg.dataset.output_dir}/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.stats_dir = f"{cfg.dataset.result_dir}/stats"
+        self.stats_dir = f"{cfg.dataset.output_dir}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
-        self.render_dir = f"{cfg.dataset.result_dir}/renders"
+        self.render_dir = f"{cfg.dataset.output_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.dataset.result_dir}/tb")
+        self.writer = SummaryWriter(log_dir=f"{cfg.dataset.output_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
         if isinstance(cfg.dataset, my_datasets.WaymoDatasetConfig):
             self.parser = WaymoParser(
-                data_dir=cfg.dataset.data_dir,
+                data_dir=cfg.dataset.dataset_dir,
+                output_dir=cfg.dataset.output_dir,
                 camera_angles=cfg.dataset.waymo_camera_angles,
                 frame_range=cfg.dataset.waymo_frame_range,
                 test_every=cfg.test_every,
@@ -540,8 +541,8 @@ class Runner:
             )
         elif isinstance(cfg.dataset, my_datasets.ColmapDatasetConfig):
             self.parser = ColmapParser(
-                data_dir=cfg.dataset.data_dir,
-                test_every=cfg.test_every,
+                data_dir=cfg.dataset.dataset_dir,
+                output_dir=cfg.dataset.output_dir,
             )
         elif isinstance(cfg.dataset, my_datasets.RCDatasetConfig):
             raise NotImplementedError("RealityCapture parser not implemented")
@@ -937,7 +938,7 @@ class Runner:
             self.viewer = GsplatViewer(
                 server=self.server,
                 render_fn=self._viewer_render_fn,
-                output_dir=Path(cfg.dataset.result_dir),
+                output_dir=Path(cfg.dataset.output_dir),
                 mode="training",
             )
 
@@ -1116,7 +1117,7 @@ class Runner:
         T_0 = cfg.add_every_epochs * n_cameras_per_epoch  # restart period for cosine
 
         schedulers = []
-        for opt_name in ["means", "scales"]:
+        for opt_name in ["means", "quats", "scales", "sh0"]:
             opt = self.optimizers[opt_name]
             lr = opt.param_groups[0]["lr"]
             if cfg.lr_scheduler == "cosine_warm_restarts":
@@ -1389,10 +1390,12 @@ class Runner:
                 info=info,
                 epoch_ctx=epoch_ctx,
             )
-            masks = data["sky_mask"].to(device) if "sky_mask" in data else None
-            if masks is not None:
-                pixels = pixels * masks[..., None]
-                colors = colors * masks[..., None]
+
+            # if cfg.enable_skysphere:
+            #     masks = data["sky_mask"].to(device) if "sky_mask" in data else None
+            #     if masks is not None:
+            #         pixels = pixels * masks[..., None]
+            #         colors = colors * masks[..., None]
 
             # loss
             l1loss = F.l1_loss(colors, pixels)
@@ -2037,7 +2040,7 @@ class Runner:
         for img in scene.images:
             images_by_cam[img.camera_id].append(img)
         
-        video_dir = f"{cfg.dataset.result_dir}/videos"
+        video_dir = f"{cfg.dataset.output_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
         
         for cam_id, cam_images in images_by_cam.items():

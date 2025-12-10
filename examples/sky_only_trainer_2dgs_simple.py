@@ -43,7 +43,7 @@ from nerfview import CameraState
 @dataclass
 class SkyOnlySimpleConfig:
     # Dataset configuration
-    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_WAYMO_COLMAP_PROJ)
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_SEGMENT_102751)
 
     # Downsample factor for the dataset
     data_factor: int = 4
@@ -61,8 +61,8 @@ class SkyOnlySimpleConfig:
     # Training parameters
     max_steps: int = 6_000
     batch_size: int = 24
-    eval_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
-    save_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
+    eval_steps: List[int] = field(default_factory=lambda: [SkyOnlySimpleConfig.max_steps//3, SkyOnlySimpleConfig.max_steps])
+    save_steps: List[int] = field(default_factory=lambda: [SkyOnlySimpleConfig.max_steps//3, SkyOnlySimpleConfig.max_steps])
     
     # Skysphere parameters
     skysphere_radius_multiplier: float = 20.0
@@ -89,10 +89,10 @@ class SkyOnlySimpleConfig:
     use_color_correct: bool = False
 
     # Simple relocation parameters
-    relocation_start_epoch: int = 5
+    relocation_start_epoch: int = 10
     relocation_every_epochs: int = 3
     relocation_min_opacity: float = 0.005
-    relocation_end_epoch: int | None = 100
+    relocation_end_epoch: int | None = 500
     # Learning rate scheduler settings
     lr_scheduler: str = "cosine_warm_restarts"  # "exponential" or "cosine_warm_restarts"
     # For cosine_warm_restarts: T_mult - period multiplier after each restart
@@ -190,15 +190,15 @@ class SkyOnlySimpleRunner:
 
         # Setup output directories
         os.makedirs(cfg.dataset.output_dir, exist_ok=True)
-        self.ckpt_dir = f"{cfg.dataset.output_dir}/ckpts"
+        self.ckpt_dir = f"{cfg.dataset.output_dir}/skysphere/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.stats_dir = f"{cfg.dataset.output_dir}/stats"
+        self.stats_dir = f"{cfg.dataset.output_dir}/skysphere/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
-        self.render_dir = f"{cfg.dataset.output_dir}/renders"
+        self.render_dir = f"{cfg.dataset.output_dir}/skysphere/renders"
         os.makedirs(self.render_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.dataset.output_dir}/tb")
+        self.writer = SummaryWriter(log_dir=f"{cfg.dataset.output_dir}/skysphere/tb")
 
         # Load data based on dataset type
         if isinstance(cfg.dataset, my_datasets.WaymoDatasetConfig):
@@ -375,15 +375,6 @@ class SkyOnlySimpleRunner:
                 output_dir=Path(cfg.dataset.output_dir),
                 mode="training",
             )
-    
-    def load_checkpoint(self, checkpoint_dir: str):
-        """Load checkpoint from directory."""
-        # Load skysphere model
-        skysphere_path = f"{checkpoint_dir}/skysphere.pt"
-        if os.path.exists(skysphere_path):
-            checkpoint = torch.load(skysphere_path, map_location=self.device)
-            self.skysphere_model.load_state_dict(checkpoint["skysphere"])
-            print(f"Loaded skysphere from {skysphere_path}")
     
     @with_lock('rasterize_lock')
     def rasterize_sky(
@@ -614,6 +605,7 @@ class SkyOnlySimpleRunner:
             if data.get("sky_mask") is None:
                 raise ValueError("Sky mask not found in data!")
             sky_mask = data["sky_mask"].to(device).float()  # [B, H, W]
+            sky_heat = data["sky_heat"].to(device).float()  # [B, H, W]
 
             # Render sky
             sky_colors, sky_wsum, info = self.rasterize_sky(

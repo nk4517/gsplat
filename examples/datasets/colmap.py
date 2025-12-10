@@ -25,6 +25,7 @@ class Parser:
     def __init__(
         self,
         data_dir: str,
+        output_dir: str| Path | None = None,
     ):
         colmap_dir = Path(data_dir) / "sparse/0"
         if not colmap_dir.exists():
@@ -319,6 +320,7 @@ class Parser:
             bounds=bounds,
             extconf=extconf,
             dataset_dir=Path(data_dir),
+            output_dir=output_dir,
         )
 
 

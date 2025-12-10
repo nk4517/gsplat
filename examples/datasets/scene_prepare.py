@@ -8,7 +8,6 @@ from tqdm import tqdm
 
 from .dataset import Scene, CameraIntrinsics, ImagePose, PrepareContext, ImagePrepareEntry
 from .dir_undistort import (
-    get_rel_paths,
     resize_and_undistort_file,
     save_masked_visualization,
 )
@@ -17,17 +16,25 @@ _AUX_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.npy')
 _AUX_SUBDIRS = ('mask', 'masks', 'skymask', 'masks_alpha', 'depth', 'depths', "sky_heat")
 
 
-def _find_aux_files(dataset_dir: Path, base_path: Path) -> dict[str, Path]:
-    """Найти aux-файлы (mask, depth) для изображения. Возвращает {subdir: rel_path}."""
+def _find_aux_files(
+    dataset_dir: Path,
+    base_path: Path,
+    extra_dirs: list[Path] | None = None,
+) -> dict[str, Path]:
+    """Найти aux-файлы (mask, depth, sky_heat) для изображения. Возвращает {subdir: rel_path}."""
     result: dict[str, Path] = {}
+    search_dirs = [dataset_dir] + (extra_dirs or [])
     for subdir in _AUX_SUBDIRS:
-        aux_dir = dataset_dir / subdir
-        if not aux_dir.is_dir():
-            continue
-        for ext in _AUX_EXTENSIONS:
-            candidate = aux_dir / base_path.with_suffix(ext)
-            if candidate.exists():
-                result[subdir] = base_path.with_suffix(ext)
+        for search_dir in search_dirs:
+            aux_dir = Path(search_dir) / subdir
+            if not aux_dir.is_dir():
+                continue
+            for ext in _AUX_EXTENSIONS:
+                candidate = aux_dir / base_path.with_suffix(ext)
+                if candidate.exists():
+                    result[subdir] = base_path.with_suffix(ext)
+                    break
+            if subdir in result:
                 break
     return result
 
@@ -48,18 +55,28 @@ def prepare_scene(
         Модифицированная сцена с обновлёнными путями и интринсиками
     """
 
-    dataset_dir = scene.dataset_dir
+    dataset_dir = Path(scene.dataset_dir)
+    destination_dir = Path(scene.output_dir)
+    if destination_dir is None:
+        raise ValueError("scene.output_dir must be set before calling prepare_scene")
 
     has_distortion = any(c.undistortion is not None for c in scene.cameras.values())
     need_preparation = (factor is not None) or (target_resolution is not None) or has_distortion
-    
-    if not need_preparation:
+
+    try:
         images_subdir = scene.images[0].image_fpath.relative_to(dataset_dir).parts[0]
         images_basedir = dataset_dir / images_subdir
+    except ValueError:
+        images_subdir = scene.images[0].image_fpath.relative_to(destination_dir).parts[0]
+        images_basedir = destination_dir / images_subdir
+
+    if not need_preparation:
+        extra_dirs = [scene.output_dir] if scene.output_dir and scene.output_dir != dataset_dir else None
+        
         new_images = []
         for img in scene.images:
             base_path = img.image_fpath.relative_to(images_basedir).with_suffix("")
-            aux_raw = _find_aux_files(dataset_dir, base_path)
+            aux_raw = _find_aux_files(dataset_dir, base_path, extra_dirs)
             aux_fpaths = {}
             for subdir, rel in aux_raw.items():
                 key = "mask" if "mask" in subdir else "depth" if "depth" in subdir else subdir
@@ -72,9 +89,15 @@ def prepare_scene(
                 aux_fpaths=aux_fpaths,
             ))
         return Scene(
-            cameras=scene.cameras, images=new_images, points=scene.points,
-            transform=scene.transform, scene_scale=scene.scene_scale,
-            bounds=scene.bounds, extconf=scene.extconf,
+            cameras=scene.cameras,
+            images=new_images,
+            points=scene.points,
+            transform=scene.transform,
+            scene_scale=scene.scene_scale,
+            bounds=scene.bounds,
+            extconf=scene.extconf,
+            dataset_dir=dataset_dir,
+            output_dir=destination_dir,
         )
     
     # Построить суффикс для каталогов
@@ -89,10 +112,6 @@ def prepare_scene(
     if has_distortion:
         suffix_parts.append("_undist")
     dir_suffix = "".join(suffix_parts)
-
-    images_subdir = scene.images[0].image_fpath.relative_to(dataset_dir).parts[0]
-
-    images_basedir = dataset_dir / images_subdir
     
     # Собрать ImagePrepareEntry для каждого изображения
     images_list: list[ImagePrepareEntry] = []
@@ -127,7 +146,8 @@ def prepare_scene(
             )
         
         # aux files
-        aux = _find_aux_files(dataset_dir, base_path)
+        extra_dirs = [destination_dir] if destination_dir and destination_dir != dataset_dir else None
+        aux = _find_aux_files(dataset_dir, base_path, extra_dirs)
         
         images_list.append(ImagePrepareEntry(
             rel_path=rel_path,
@@ -139,7 +159,7 @@ def prepare_scene(
     
     ctx = PrepareContext(
         dataset_dir=dataset_dir,
-        destination_dir=dataset_dir,
+        destination_dir=Path(destination_dir),
         transform_suffix=dir_suffix,
         images=images_list,
     )
@@ -168,6 +188,13 @@ def prepare_scene(
         # aux files (mask, depth, etc.)
         for aux_subdir, aux_rel_path in entry.aux.items():
             aux_src = ctx.dataset_dir / aux_subdir / aux_rel_path
+            # Если файл не в dataset_dir, проверить в destination_dir (для сгенерированных файлов типа sky_heat)
+            if not aux_src.exists() and ctx.destination_dir:
+                alt_src = ctx.destination_dir / aux_subdir / aux_rel_path
+                if alt_src.exists():
+                    aux_src = alt_src
+                else:
+                    raise RuntimeError("missing aux")
             aux_dst_dir = ctx.destination_dir / (aux_subdir + dir_suffix)
             aux_dst = aux_dst_dir / aux_rel_path.with_suffix(".png")
             mode = 'mask' if 'mask' in aux_subdir else 'image'
@@ -176,6 +203,8 @@ def prepare_scene(
             )
             if aux_result:
                 aux_mappings.setdefault(aux_subdir, {})[entry.rel_path] = aux_result
+            elif not aux_src.exists():
+                print(f"Warning: aux file not found: {aux_src}")
     
     # Визуализация для всех типов масок (не depth)
     for aux_subdir, mapping in aux_mappings.items():
@@ -256,5 +285,7 @@ def prepare_scene(
         scene_scale=scene.scene_scale,
         bounds=scene.bounds,
         extconf=scene.extconf,
+        dataset_dir=dataset_dir,
+        output_dir=destination_dir,
     )
  

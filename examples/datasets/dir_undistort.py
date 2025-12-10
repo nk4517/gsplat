@@ -4,25 +4,11 @@
 # Для отсечения расширения использовать только Path(rel_path).with_suffix("").
 
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .dataset import PrepareContext
 
 import cv2
 import imageio.v2 as imageio
 import numpy as np
 from tqdm import tqdm
-
-def get_rel_paths(path_dir: Path) -> list[str]:
-    """Рекурсивно получить относительные пути файлов в каталоге."""
-    paths = []
-    for path in path_dir.rglob("*"):
-        if path.is_file():
-            if path.suffix.lower() == ".db":
-                continue
-            paths.append(str(path.relative_to(path_dir).as_posix()))
-    return paths
 
 def normalize_to_uint8(data: np.ndarray) -> np.ndarray:
     if data.dtype == np.uint8:

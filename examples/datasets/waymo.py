@@ -28,6 +28,7 @@ class WaymoParser:
         frame_range: tuple[int, int] = (0, 50),
         test_every: int = 8,
         load_lidar: bool = True,
+        output_dir: str | Path | None = None,
         waymo_calib_dir: str | None = None,
     ):
         """
@@ -158,5 +159,6 @@ class WaymoParser:
             bounds=np.array([0.01, 1.0]),
             extconf={},
             dataset_dir=data_dir,
+            output_dir=output_dir,
         )
         self.test_every = test_every

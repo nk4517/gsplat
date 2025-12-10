@@ -76,6 +76,7 @@ class Scene:
     # Extended config (from ext_metadata.json)
     extconf: dict = field(default_factory=dict)
     dataset_dir: Path | None = None
+    output_dir: Path | None = None  # для сгенерированного контента (undistort, resize и т.п.)
 
 
 class Dataset:

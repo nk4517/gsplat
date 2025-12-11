@@ -4,7 +4,7 @@ from typing import Dict, Optional, Any, TYPE_CHECKING
 import torch
 from nerfview import apply_float_colormap
 
-from examples.lib_compose import compose_renders, CompositingOrder
+from examples.lib_compose import compose_renders, CompositingOrder, compose_renders_back_to_front
 from examples.utils import scalar_to_colormap, normalize_robust, index_map_to_pseudocolor
 from gsplat.antialias_2dgs import calc_sigma_sq
 from gsplat.strategy.ops import scaling_activation
@@ -387,7 +387,14 @@ def render_inner(
                 height=height,
             )
             if sky_colors is not None:
-                render_colors = render_colors * render_alphas[0] + sky_colors[0] * (1 - render_alphas[0])
+                sky_colors = skysphere_model.compose_with_background(
+                    sky_colors, sky_alphas, c2w[None], K[None], width, height
+                )
+                sky_colors = sky_colors.clamp(0, 1)
+                render_colors, _ = compose_renders_back_to_front(
+                    renders_list=[render_colors, sky_colors[0]],
+                    alphas_list=[render_alphas[0], torch.ones_like(sky_alphas[0])],
+                )
 
         renders = render_colors.cpu().numpy()
     return renders

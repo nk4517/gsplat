@@ -240,7 +240,7 @@ class SkysphereModelParametrized(nn.Module):
         
         # Learning rates for skysphere (no means to optimize)
         lr_config = {
-            "scales": 1e-2,
+            "scales": 3e-2,
             "quats": 2.5e-4,  # Quaternions control both orientation AND position
             "colors": 2.5e-2,
         }

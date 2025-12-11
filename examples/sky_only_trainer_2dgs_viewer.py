@@ -19,7 +19,7 @@ def compute_gcr(grad2d, grad2d_abs, count):
     return torch.clamp(gcr, 0.0, 1.0), avg_grad, avg_grad_abs
 
 
-def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, sh_background, cfg, camera_state: CameraState, render_tab_state):
+def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, skysphere_model, cfg, camera_state: CameraState, render_tab_state):
 
     width = render_tab_state.viewer_width
     height = render_tab_state.viewer_height
@@ -168,7 +168,9 @@ def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_gra
             height=height,
             track_domination=track_domination,
         )
-        
+
+        sky_colors = sky_colors.clamp(0, 1)
+
         if render_tab_state.render_mode == "domination" and "median_ids" in info:
             renders = (
                 index_map_to_pseudocolor(info["median_ids"][0, ...])
@@ -192,14 +194,9 @@ def skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_gra
         else:
             # Default RGB mode
             # Compose with SH background if enabled
-            if cfg.use_sh_background and sh_background is not None:
-                sh_bg = sh_background.render(
-                    camtoworlds=c2w[None],
-                    Ks=K[None],
-                    width=width,
-                    height=height,
-                )
-                sky_colors = sh_background.blend_with_sky(sky_colors, sky_wsum, sh_bg)
+            sky_colors = skysphere_model.compose_with_background(
+                sky_colors, sky_wsum, c2w[None], K[None], width, height
+            )
             renders = sky_colors.squeeze(0).cpu().numpy()
 
     # Update render tab state

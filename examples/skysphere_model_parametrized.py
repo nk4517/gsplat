@@ -5,6 +5,7 @@ from typing import Dict
 from gsplat.strategy.ops import scaling_inverse_activation
 from examples.utils import knn
 from examples.lib_skysphere import compute_skysphere_geometry, compute_skysphere_geometry_dog
+from examples.sh_background_model import SHBackgroundModel
 
 """
 !!!CRITICAL IMPLEMENTATION DETAILS - LLM MUST READ CAREFULLY!!!
@@ -26,7 +27,8 @@ This skysphere model uses QUATERNION PARAMETRIZATION instead of direct 3D positi
    
 3. RENDERING MODE:
    - Uses RasterizationMode2DGS.WEIGHTED_SUM (NOT CLASSIC mode)
-   - Opacities are CONSTANT 1.0 (not learnable, not activated)
+   - Opacities default to CONSTANT 1.0 (can be made trainable via trainable_opacities flag)
+   - Trainable opacities allow individual splats to be dimmed during training (instead of shrinking to points via scale reduction)
    - Colors are direct RGB values (no SH, no view-dependency)
    - WEIGHTED_SUM directly sums weighted colors without alpha accumulation
    
@@ -90,6 +92,10 @@ class SkysphereModelParametrized(nn.Module):
         scene_scale: float,
         radius_multiplier: float = 20.0,
         trainable_opacities: bool = False,
+        use_sh_background: bool = False,
+        sh_degree: int = 4,
+        sh_bg_base_weight: float = 0.01,
+        sh_bg_threshold: float = 0.5,
         device: str = "cuda",
     ):
         super().__init__()
@@ -99,6 +105,8 @@ class SkysphereModelParametrized(nn.Module):
         self.radius = scene_scale * radius_multiplier
         self.device = device
         self.trainable_opacities = trainable_opacities
+        self.bg_base_weight = sh_bg_base_weight
+        self.bg_threshold = sh_bg_threshold
         
         # Initialize as empty by default
         self.n_points = 0
@@ -106,6 +114,16 @@ class SkysphereModelParametrized(nn.Module):
         
         # Store radius as buffer
         self.register_buffer('radius_buffer', torch.tensor(self.radius, device=device))
+        
+        # Initialize SH background if enabled
+        if use_sh_background:
+            self.sh_background = SHBackgroundModel(
+                sh_degree=sh_degree,
+                device=device,
+            )
+            print(f"SH background initialized with degree {sh_degree}")
+        else:
+            self.sh_background = None
     
     def initialize_from_trainset(
         self,
@@ -155,7 +173,6 @@ class SkysphereModelParametrized(nn.Module):
         # Update radius buffer if needed
         self.radius_buffer = torch.tensor(self.radius, device=self.device)
         
-        # Opacities - trainable or constant based on configuration
         opacities_init = torch.ones((self.n_points,), device=self.device)
         if self.trainable_opacities:
             self.opacities = nn.Parameter(opacities_init)
@@ -176,7 +193,51 @@ class SkysphereModelParametrized(nn.Module):
             "colors": torch.sigmoid(self.colors),  # Convert from logit to RGB
         }
     
-    def create_optimizers(self, batch_size: int = 1, sparse_grad: bool = False) -> Dict[str, torch.optim.Optimizer]:
+    def compose_with_background(
+        self,
+        sky_colors: torch.Tensor,
+        sky_wsum: torch.Tensor,
+        camtoworlds: torch.Tensor,
+        Ks: torch.Tensor,
+        width: int,
+        height: int,
+    ) -> torch.Tensor:
+        """Compose sky colors with SH background if enabled.
+        
+        Args:
+            sky_colors: Rendered sky colors [B, H, W, 3]
+            sky_wsum: Sky weight sum [B, H, W, 1]
+            camtoworlds: Camera to world matrices [B, 4, 4]
+            Ks: Camera intrinsics [B, 3, 3]
+            width: Image width
+            height: Image height
+            
+        Returns:
+            Final composed colors [B, H, W, 3]
+        """
+        if self.sh_background is None:
+            return sky_colors
+        
+        sh_bg = self.sh_background.render(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+        )
+        
+        transition_range = self.bg_threshold - self.bg_base_weight
+        # bg_weight = self.bg_base_weight * torch.clamp((self.bg_threshold - sky_wsum) / transition_range, 0, None)
+        # total_weight = sky_wsum + bg_weight
+        # return (sky_colors + sh_bg * bg_weight) / (total_weight + 1e-8)
+        bg_weight = self.bg_base_weight  # всегда 0.1
+        total_weight = sky_wsum + bg_weight
+        return (sky_colors + sh_bg * bg_weight) / (total_weight + 1e-8)
+
+    def create_optimizers(
+            self,
+            sh_background_lr=1e-3,
+            batch_size: int = 1,
+            sparse_grad: bool = False) -> Dict[str, torch.optim.Optimizer]:
         """Create optimizers for skysphere parameters."""
         if self.is_empty:
             return {}
@@ -186,14 +247,14 @@ class SkysphereModelParametrized(nn.Module):
         
         # Learning rates for skysphere (no means to optimize)
         lr_config = {
-            "scales": 5e-3,
-            "quats": 5e-4,  # Quaternions control both orientation AND position
+            "scales": 5e-4,
+            "quats": 1e-4,  # Quaternions control both orientation AND position
             "colors": 2.5e-2,
         }
         
         # Add opacities if trainable
         if self.trainable_opacities:
-            lr_config["opacities"] = 1e-3
+            lr_config["opacities"] = 2.5e-3
         
         optimizers = {}
         for name, lr in lr_config.items():
@@ -219,6 +280,10 @@ class SkysphereModelParametrized(nn.Module):
             
             optimizers[name] = optimizer
         
+        # Add SH background optimizer if present
+        if self.sh_background is not None:
+            optimizers['sh_background'] = self.sh_background.create_optimizer(lr=sh_background_lr)
+        
         return optimizers
 
     def save_checkpoint(self, path: str):
@@ -230,6 +295,9 @@ class SkysphereModelParametrized(nn.Module):
                 'scene_scale': self.scene_scale,
                 'radius_multiplier': self.radius_multiplier,
                 'trainable_opacities': self.trainable_opacities,
+                'bg_base_weight': self.bg_base_weight,
+                'bg_threshold': self.bg_threshold,
+                'has_sh_background': self.sh_background is not None,
             }
         else:
             checkpoint = {
@@ -237,9 +305,14 @@ class SkysphereModelParametrized(nn.Module):
                 'scene_scale': self.scene_scale,
                 'radius_multiplier': self.radius_multiplier,
                 'trainable_opacities': self.trainable_opacities,
+                'bg_base_weight': self.bg_base_weight,
+                'bg_threshold': self.bg_threshold,
                 'n_points': self.n_points,
                 'state_dict': self.state_dict(),
+                'has_sh_background': self.sh_background is not None,
             }
+            if self.sh_background is not None:
+                checkpoint['sh_background_state'] = self.sh_background.state_dict()
         torch.save(checkpoint, path)
     
     def load_checkpoint(self, path: str):
@@ -251,6 +324,8 @@ class SkysphereModelParametrized(nn.Module):
         self.radius = self.scene_scale * self.radius_multiplier
         self.is_empty = checkpoint['is_empty']
         self.trainable_opacities = checkpoint.get('trainable_opacities', False)
+        self.bg_base_weight = checkpoint.get('bg_base_weight', 0.01)
+        self.bg_threshold = checkpoint.get('bg_threshold', 0.5)
         
         # Create SH background BEFORE load_state_dict (it's a submodule, its state is in state_dict)
         if checkpoint.get('has_sh_background', False):
@@ -264,3 +339,9 @@ class SkysphereModelParametrized(nn.Module):
         if not self.is_empty:
             self.n_points = checkpoint['n_points']
             self.load_state_dict(checkpoint['state_dict'])
+        
+        # Load SH background state if saved separately (new format)
+        if self.sh_background is not None and 'sh_background_state' in checkpoint:
+            self.sh_background.load_state_dict(checkpoint['sh_background_state'])
+            if frozen:
+                self.sh_background.sh_coeffs.requires_grad = False

@@ -3,6 +3,7 @@ import torch.nn as nn
 from typing import Optional
 
 from adan import Adan
+from torch.optim import Adam
 
 
 class SHBackgroundModel(nn.Module):
@@ -11,16 +12,12 @@ class SHBackgroundModel(nn.Module):
     def __init__(
         self,
         sh_degree: int = 2,
-        bg_base_weight: float = 0.005,
-        bg_threshold: float = 0.05,
         device: str = "cuda",
     ):
         super().__init__()
         
         self.sh_degree = sh_degree
         self.device = device
-        self.bg_base_weight = bg_base_weight
-        self.bg_threshold = bg_threshold
         
         # Number of SH coefficients for given degree
         self.n_coeffs = (sh_degree + 1) ** 2
@@ -129,18 +126,6 @@ class SHBackgroundModel(nn.Module):
 
         # Stack batch
         return torch.stack(renders, dim=0)  # [B, H, W, 3]
-
-    def blend_with_sky(
-            self,
-        sky_colors: torch.Tensor,  # [B, H, W, 3]
-        sky_wsum: torch.Tensor,    # [B, H, W, 1]
-        sh_bg: torch.Tensor,       # [B, H, W, 3]
-    ) -> torch.Tensor:
-        """Blend SH background with sky colors using weighted mixing."""
-        transition_range = self.bg_threshold - self.bg_base_weight
-        bg_weight = self.bg_base_weight * torch.clamp((self.bg_threshold - sky_wsum) / transition_range, 0, None)
-        total_weight = sky_wsum + bg_weight
-        return (sky_colors + sh_bg * bg_weight) / (total_weight + 1e-8)
     
     def create_optimizer(self, lr: float = 1e-3) -> torch.optim.Optimizer:
         """Create optimizer for SH coefficients."""

@@ -24,7 +24,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from datasets.colmap import Dataset, Parser
 from examples.skysphere_model_parametrized import SkysphereModelParametrized
-from examples.sh_background_model import SHBackgroundModel
 from gsplat import rasterization_2dgs, RasterizationMode2DGS
 from gsplat.strategy.epoch_stats import EpochStatistics, training_data_generator
 from gsplat_viewer_2dgs import GsplatViewer
@@ -94,13 +93,12 @@ class SkyOnlyConfig:
 
     use_sh_background: bool = True
     sh_background_degree: int = 4
-    sh_background_lr: float = 2.5e-3
+    sh_background_lr: float = 1e-2
 
-    sh_bg_base_weight: float = 0.01  # Base weight for SH background blending
-    sh_bg_threshold: float = 0.5  # Threshold above which SH background is not visible
+    sh_bg_base_weight: float = 0.5  # Base weight for SH background blending
+    sh_bg_threshold: float = 15  # Threshold above which SH background is not visible
 
-    sky_alpha_threshold: float = 0.05  # Threshold below which SH background is visible
-    wsum_penalty_lambda: float = 0.01  # Penalty for high wsum values to encourage SH background
+    wsum_penalty_lambda: float = 5e-3  # Penalty for high wsum values to encourage SH background
 
 
 def with_lock(lock_name):
@@ -187,6 +185,10 @@ class SkyOnlyRunner:
         self.skysphere_model = SkysphereModelParametrized(
             self.parser.scene_scale,
             trainable_opacities=cfg.trainable_opacities,
+            use_sh_background=cfg.use_sh_background,
+            sh_degree=cfg.sh_background_degree,
+            sh_bg_base_weight=cfg.sh_bg_base_weight,
+            sh_bg_threshold=cfg.sh_bg_threshold,
         )
 
         # Initialize skysphere from trainset
@@ -203,24 +205,11 @@ class SkyOnlyRunner:
 
         print(f"Skysphere initialized with {self.skysphere_model.n_points} points")
 
-        # Initialize SH background if enabled
-        self.sh_background_optimizer = None
-        if cfg.use_sh_background:
-            self.sh_background = SHBackgroundModel(
-                sh_degree=cfg.sh_background_degree,
-                bg_base_weight=cfg.sh_bg_base_weight,
-                bg_threshold=cfg.sh_bg_threshold,
-                device=self.device,
-            )
-            self.sh_background_optimizer = self.sh_background.create_optimizer(lr=cfg.sh_background_lr)
-            print(f"SH background initialized with degree {cfg.sh_background_degree}")
-        else:
-            self.sh_background = None
-
         # Create optimizers for skysphere
         self.skysphere_optimizers = self.skysphere_model.create_optimizers(
             batch_size=cfg.batch_size,
             sparse_grad=False,
+            sh_background_lr=cfg.sh_background_lr,
         )
 
         # Initialize bilateral grid if enabled
@@ -267,7 +256,8 @@ class SkyOnlyRunner:
             height: int,
             track_domination: bool = False,
             override_colors: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Dict]:
+            **kwargs,
+    ) -> Tuple[Tensor, Tensor, Dict]:
         """Rasterize sky using WEIGHTED_SUM mode.
         
         Returns:
@@ -282,6 +272,10 @@ class SkyOnlyRunner:
         quats = sky_splats["quats"]  # [N, 4]
         scales = sky_splats["scales"]  # [N, 3]
         opacities = sky_splats["opacities"]  # [N,] - already 1.0 constants
+
+        drop_rate = kwargs.pop("drop_rate", None)
+        if drop_rate is not None:
+            opacities = F.dropout(opacities, p=drop_rate, training=True)
 
         # Use override colors if provided, otherwise use sky colors
         if override_colors is not None:
@@ -412,25 +406,12 @@ class SkyOnlyRunner:
                 width=width,
                 height=height,
                 track_domination=False,
+                drop_rate=0.05,
             )
 
-            # Render and compose SH background if enabled
-            if cfg.use_sh_background:
-                # Render SH background
-                sh_bg = self.sh_background.render(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                )  # [B, H, W, 3]
-                
-                final_colors = self.sh_background.blend_with_sky(sky_colors, sky_wsum, sh_bg)
-            else:
-                # No SH background, use sky_colors as is
-                final_colors = sky_colors
-            
-            # Use final_colors for loss computation
-            sky_colors = final_colors
+            sky_colors = self.skysphere_model.compose_with_background(
+                sky_colors, sky_wsum, camtoworlds, Ks, width, height
+            )
 
             # Apply bilateral grid if enabled
             if cfg.use_bilateral_grid:
@@ -507,11 +488,6 @@ class SkyOnlyRunner:
             for optimizer in self.skysphere_optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-
-            # Optimize SH background
-            if cfg.use_sh_background and self.sh_background_optimizer is not None:
-                self.sh_background_optimizer.step()
-                self.sh_background_optimizer.zero_grad(set_to_none=True)
 
             # Optimize bilateral grid
             for optimizer in self.bil_grid_optimizers:
@@ -609,15 +585,12 @@ class SkyOnlyRunner:
                 height=height,
             )
 
+            sky_colors = sky_colors.clamp(0, 1)
+
             # Compose with SH background if enabled
-            if cfg.use_sh_background:
-                sh_bg = self.sh_background.render(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                )
-                sky_colors = self.sh_background.blend_with_sky(sky_colors, sky_wsum, sh_bg)
+            sky_colors = self.skysphere_model.compose_with_background(
+                sky_colors, sky_wsum, camtoworlds, Ks, width, height
+            )
 
             # Save rendered image
             canvas = torch.cat([pixels, sky_colors], dim=2).squeeze(0).cpu().numpy()
@@ -670,10 +643,9 @@ class SkyOnlyRunner:
         trainset_len = len(self.trainset)
         grow_grad2d = self.cfg.grow_grad2d if hasattr(self.cfg, 'grow_grad2d') else 0.0002
         n_points = self.skysphere_model.n_points
-        sh_background = self.sh_background
         cfg = self.cfg
 
-        return skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, sh_background, cfg, camera_state, render_tab_state)
+        return skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, self.skysphere_model, cfg, camera_state, render_tab_state)
 
 
 def main(cfg: SkyOnlyConfig):

@@ -45,7 +45,7 @@ from nerfview import CameraState
 @dataclass
 class SkyOnlyConfig:
     # Dataset configuration
-    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_SEGMENT_102751)
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_TRAIN)
 
     # Downsample factor for the dataset
     data_factor: int = 4
@@ -61,14 +61,14 @@ class SkyOnlyConfig:
     port: int = 8080
 
     # Training parameters
-    max_steps: int = 10_000
+    max_steps: int = 6_000
     batch_size: int = 8
-    eval_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
-    save_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
+    eval_steps: List[int] = field(default_factory=lambda: [SkyOnlyConfig.max_steps//3, SkyOnlyConfig.max_steps])
+    save_steps: List[int] = field(default_factory=lambda: [SkyOnlyConfig.max_steps//3, SkyOnlyConfig.max_steps])
 
     # Skysphere parameters
     skysphere_radius_multiplier: float = 20.0
-    full_skysphere_N_points: int = 500_000
+    full_skysphere_N_points: int = 1_000_000
     init_opacity: float = 0.1
     init_scale: float = 1.0
     trainable_opacities: bool = True

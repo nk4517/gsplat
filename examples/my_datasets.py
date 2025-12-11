@@ -126,3 +126,15 @@ DATASET_WAYMO_COLMAP_PROJ = WaymoDatasetConfig(
     invert_mask=True,
     waymo_camera_angles=["FRONT", "FRONT_LEFT", "FRONT_RIGHT", "SIDE_LEFT", "SIDE_RIGHT"],
 )
+DATASET_TRAIN = ColmapDatasetConfig(
+    dataset_dir=r"x:\_ai\_demos\_gsplat\_datasets\train",
+    skysphere_ckpt=r"X:\_ai\_demos\_gsplat\_datasets\train.out\sky-full\ckpts\step_005999\skysphere.pt",
+)
+DATASET_TRUCK = ColmapDatasetConfig(
+    dataset_dir=r"x:\_ai\_demos\_gsplat\_datasets\truck",
+)
+
+DATASET_TRAIN_DA3 = ColmapDatasetConfig(
+    dataset_dir=r"x:\_ai\_my_depthanything_3_workspace\output",
+    output_dir=r"X:\_ai\_demos\_gsplat\_datasets\train.out",
+)

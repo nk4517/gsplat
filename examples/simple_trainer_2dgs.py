@@ -114,7 +114,7 @@ def binary_cross_entropy_loss(input: torch.Tensor, target: torch.Tensor) -> torc
 @dataclass
 class Config:
     # Dataset configuration
-    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_SEGMENT_102751)
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_TRAIN)
     
     # Disable viewer
     disable_viewer: bool = False
@@ -189,9 +189,9 @@ class Config:
     # Stop refining GSs after this epoch
     refine_stop_epochs: int = 500
     # Refine GSs every this many epochs
-    refine_every_frames: int = 1000  # Target frames between refines (~100 iters * batch_size=16)
+    refine_every_frames: int = 400  # Target frames between refines (~100 iters * batch_size=16)
     # Add new GSs every this many epochs (for MCMCStrategy)
-    add_every_frames: int = 2000  # Target frames between adds (2x refine)
+    add_every_frames: int = 1000  # Target frames between adds (2x refine)
     # Start resetting opacities after this epoch
     reset_start_epochs: int = 100000000
     # Stop resetting opacities after this epoch
@@ -561,7 +561,7 @@ class Runner:
         scene = self.scene
 
         need_sky_masks = (cfg.require_sky_mask or cfg.enable_skysphere)  #: and cfg.skysphere_ckpt is None
-        sky_mask_params = {"load_sky_mask": need_sky_masks, "soft_sky_mask": True,
+        sky_mask_params = {"require_sky_mask": need_sky_masks, "soft_sky_mask": True,
                            "invert_sky_mask": cfg.dataset.invert_mask} if need_sky_masks else {}
 
         # Choose between preloaded and regular dataset
@@ -1335,6 +1335,11 @@ class Runner:
                     height=height,
                 )
                 if sky_colors is not None:
+                    # Compose sky splats with SH background if enabled
+                    sky_colors = self.skysphere_model.compose_with_background(
+                        sky_colors, sky_alphas, camtoworlds, Ks, width, height
+                    )
+                    
                     # Composite: world over sky
                     world_rgb = world_renders[..., :3]
                     sky_colors = sky_colors.clamp(0, 1)
@@ -1905,6 +1910,10 @@ class Runner:
                     height=height,
                 )
                 if sky_colors is not None:
+                    sky_colors = self.skysphere_model.compose_with_background(
+                        sky_colors, sky_alphas, camtoworlds, Ks, width, height
+                    )
+                    
                     # Composite: world over sky (same as in train)
                     sky_colors = sky_colors.clamp(0, 1)
                     sky_alpha = sky_alphas.clamp(0, 1)  # sky_alphas is wsum
@@ -2090,6 +2099,10 @@ class Runner:
                         height=height,
                     )
                     if sky_colors is not None:
+                        sky_colors = self.skysphere_model.compose_with_background(
+                            sky_colors, sky_alphas, camtoworlds, K[None], width, height
+                        )
+
                         sky_colors = sky_colors[0].clamp(0, 1)
                         sky_alpha = sky_alphas[0].clamp(0, 1)
                         colors, _ = compose_renders_back_to_front(

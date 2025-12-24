@@ -4,8 +4,7 @@ import math
 from typing import Dict
 from gsplat.strategy.ops import scaling_inverse_activation
 from examples.utils import knn
-from examples.lib_skysphere import compute_skysphere_geometry
-
+from examples.lib_skysphere import compute_skysphere_geometry, compute_skysphere_geometry_dog
 
 """
 !!!CRITICAL IMPLEMENTATION DETAILS - LLM MUST READ CAREFULLY!!!
@@ -112,12 +111,20 @@ class SkysphereModelParametrized(nn.Module):
         num_points: int = 50_000,
         init_opacity: float = 0.1,
         init_scale: float = 1.0,
+        use_dog: bool = False,
+        dog_sigma: float = 2.0,
+        dog_k: float = 3.6,
     ):
         """Initialize skysphere from training set data."""
         # Initialize skysphere geometry
-        points, colors, quats = compute_skysphere_geometry(
-            trainset, self.radius, num_points, self.device
-        )
+        if use_dog:
+            points, colors, quats = compute_skysphere_geometry_dog(
+                trainset, self.radius, num_points, self.device, dog_sigma, dog_k
+            )
+        else:
+            points, colors, quats = compute_skysphere_geometry(
+                trainset, self.radius, num_points, self.device
+            )
         
         if points is None:
             # No sky masks available, create empty skysphere

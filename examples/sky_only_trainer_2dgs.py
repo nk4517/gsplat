@@ -62,7 +62,7 @@ class SkyOnlyConfig:
 
     # Skysphere parameters
     skysphere_radius_multiplier: float = 20.0
-    skysphere_points: int = 250_000
+    skysphere_points: int = 50_000
     init_opacity: float = 0.1
     init_scale: float = 1.0
 
@@ -191,6 +191,7 @@ class SkyOnlyRunner:
             num_points=cfg.skysphere_points,
             init_opacity=cfg.init_opacity,
             init_scale=cfg.init_scale,
+            use_dog=True,
         )
 
         if self.skysphere_model.is_empty:

@@ -4,39 +4,12 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from typing_extensions import Literal
 
-from .base import Strategy, EpochContext, StateWrapper
+from .base import Strategy, StateWrapper
 from .ops import (
     duplicate, remove, reset_opa, split, split_n_2dgs, opacity_activation, scaling_activation
 )
 from ..antialias_2dgs import update_max_sampling_rate
-
-
-def _accumulate_by_ids(
-        target_tensor: torch.Tensor,
-        gs_ids: torch.Tensor,
-        values: torch.Tensor,
-        packed: bool,
-):
-    """Generic accumulation method that handles both packed and non-packed cases.
-
-    Args:
-        target_tensor: Tensor to accumulate into
-        gs_ids: Gaussian IDs for indexing
-        values: Values to accumulate
-        packed: Whether the data is in packed format
-    """
-    if packed:
-        # Direct index_add for packed case
-        target_tensor.index_add_(0, gs_ids, values)
-    else:
-        # For non-packed case, need to handle per-camera data
-        if values.dim() == 2:  # [C, N] format
-            # Sum across cameras for each gaussian
-            values_sum = values.sum(dim=0)  # [N]
-            target_tensor += values_sum
-        else:  # [N] format
-            target_tensor += values
-
+from .epoch_stats import EpochStatistics, EpochContext
 
 
 @torch.jit.script
@@ -156,15 +129,9 @@ class DefaultStrategy(Strategy):
         # - importance: running accum of importance scores (vG^2) for each GS.
         # - radii: the radii of the GSs (normalized by the image resolution).
         state = {
-            "grad2d": None, 
-            "grad2d_abs": None,  # For GCR computation
-            "count": None, 
-            "importance": None,  # For importance-based pruning (vG^2)
             "scene_scale": scene_scale,
             "last_reset_epoch": -1000,
         }
-        if self.refine_scale2d_stop_iter > 0:
-            state["radii"] = None
         return state
 
     @torch.no_grad()
@@ -295,13 +262,14 @@ class DefaultStrategy(Strategy):
                     f"Now having {len(params['means'])} GSs."
                 )
 
-            # reset running stats
-            state["grad2d"].zero_()
-            state["grad2d_abs"].zero_()
-            state["count"].zero_()
-            state["importance"].zero_()
-            if self.refine_scale2d_stop_iter > 0:
-                state["radii"].zero_()
+            # Reset gradient stats in epoch_stats
+            if "epoch_stats" in state:
+                state["epoch_stats"].grad2d.zero_()
+                state["epoch_stats"].grad2d_abs.zero_()
+                state["epoch_stats"].count.zero_()
+                state["epoch_stats"].importance.zero_()
+                if state["epoch_stats"].radii is not None:
+                    state["epoch_stats"].radii.zero_()
 
         # оно всегда, но на всякий случай чтобы понятно было
         if epoch_ctx.epoch_end:
@@ -338,114 +306,15 @@ class DefaultStrategy(Strategy):
             info: Dict[str, Any],
             packed: bool = False,
     ):
-        for key in [
-            "width",
-            "height",
-            "n_cameras",
-            "radii",
-            "gaussian_ids",
-            self.key_for_gradient,
-        ]:
-            assert key in info, f"{key} is required but missing."
-
-        # normalize grads to [-1, 1] screen space
-        if self.key_for_gradient == "gradient_2dgs":
-            # For gradient_2dgs, select appropriate elements based on absgrad
-            gradient_2dgs = info[self.key_for_gradient].grad.clone()
-            # Take elements 0 and 1 if not absgrad
-            grads = gradient_2dgs[..., :2]
-            # Take elements 2 and 3 for absolute gradients
-            grads_abs = gradient_2dgs[..., 2:4]
-            # Take element 4 for importance (vG^2)
-            importance_grads = gradient_2dgs[..., 4:5]
-        else:
-            raise NotImplementedError("inria disabled")
-        grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
-        grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
-        grads_abs[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
-        grads_abs[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
-
-        # initialize state on the first run
-        n_gaussian = len(list(params.values())[0])
-
-        if state["grad2d"] is None:
-            state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
-        if state["grad2d_abs"] is None:
-            state["grad2d_abs"] = torch.zeros(n_gaussian, device=grads.device)
-        if state["count"] is None:
-            state["count"] = torch.zeros(n_gaussian, device=grads.device)
-        if state["importance"] is None:
-            state["importance"] = torch.zeros(n_gaussian, device=grads.device)
-        if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
-            assert "radii" in info, "radii is required but missing."
-            state["radii"] = torch.zeros(n_gaussian, device=grads.device)
-
-        # update the running state
-        if packed:
-            # grads is [nnz, 2]
-            gs_ids = info["gaussian_ids"]  # [nnz]
-            radii = info["radii"].max(dim=-1).values  # [nnz]
-            # grads_abs is already extracted above for packed case
-        else:
-            # grads is [C, N, 2]
-            sel = (info["radii"] > 0.0).all(dim=-1)  # [C, N]
-            gs_ids = torch.where(sel)[1]  # [nnz]
-            grads = grads[sel]  # [nnz, 2]
-            grads_abs = grads_abs[sel]  # [nnz, 2]
-            importance_grads = importance_grads[sel]  # [nnz, 1]
-            radii = info["radii"][sel].max(dim=-1).values  # [nnz]
-        state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
-        state["grad2d_abs"].index_add_(0, gs_ids, grads_abs.norm(dim=-1))
-        state["importance"].index_add_(0, gs_ids, importance_grads.squeeze(-1))
-        state["count"].index_add_(
-            0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
-        )
-        if self.refine_scale2d_stop_iter > 0:
-            # Should be ideally using scatter max
-            state["radii"][gs_ids] = torch.maximum(
-                state["radii"][gs_ids],
-                # normalize radii to [0, 1] screen space
-                radii / float(max(info["width"], info["height"])),
-            )
-
+        # Update statistics in epoch_stats
         if "epoch_stats" in state:
-            # ========== Epoch-based statistics block ==========
-            if "n_touched" in info and "n_dominated" in info:
-                state["epoch_stats"].update_domination_stats(
-                    n_touched=info["n_touched"], n_dominated=info["n_dominated"],
-                    width=info["width"], height=info["height"],
-                    gs_ids=gs_ids, packed=packed)
-
-
-            # Update minimum depth statistics if available
-            if "camtoworlds" in info and "Ks" in info:
-                # Compute euclidean distances from camera to gaussians
-                camtoworlds = info["camtoworlds"]
-
-                # Euclidean distance from camera to gaussian center
-                cam_positions = camtoworlds[:, :3, 3].unsqueeze(1)  # [C, 1, 3]
-                means = params["means"].unsqueeze(0)  # [1, N, 3]
-                distances = torch.norm(cam_positions - means, dim=2)  # [C, N]
-                
-                # Compute sampling rates f/d for each camera
-                # Extract focal lengths from camera intrinsics
-                Ks = info["Ks"]  # [C, 3, 3]
-                # Use average of fx and fy
-                focals = (Ks[:, 0, 0] + Ks[:, 1, 1]) / 2.0  # [C]
-                # Compute sampling rates f/d
-                sampling_rates = focals.unsqueeze(1) / distances  # [C, N]
-                
-                # Update max_sampling_rate tracking
-                # Use n_touched for visibility - accounts for transparency and actual pixel coverage
-                if "n_touched" in info:
-                    visible_mask = info["n_touched"] > 0  # [C, N] or [N] - gaussians that touched at least one pixel
-                else:
-                    # Fallback to radii if n_touched not available
-                    visible_mask = info["radii"][..., 0] > 0
-                state["epoch_stats"].update_max_sampling_rate(sampling_rates, visible_mask)
-
-            # ========== End of epoch-based statistics block ==========
-
+            # Update all statistics from info
+            state["epoch_stats"].update_from_info(
+                info=info,
+                params=params,
+                key_for_gradient=self.key_for_gradient,
+                packed=packed
+            )
     @torch.no_grad()
     def _grow_gs(
         self,
@@ -455,8 +324,13 @@ class DefaultStrategy(Strategy):
         step: int,
         epoch_ctx: EpochContext,
     ) -> Tuple[int, int]:
-        count = state["count"]
-        grads = state["grad2d"] / count.clamp_min(1)
+        # Get gradient stats from epoch_stats
+        if "epoch_stats" not in state:
+            return 0, 0
+        
+        epoch_stats = state["epoch_stats"]
+        count = epoch_stats.count
+        grads = epoch_stats.grad2d / count.clamp_min(1)
         device = grads.device
 
         n_before = len(params["opacities"])
@@ -473,7 +347,7 @@ class DefaultStrategy(Strategy):
         is_certain_sky = ~is_not_sky
 
         # GDAGS: Compute GCR and dynamic weights
-        grads_abs = state["grad2d_abs"] / count.clamp_min(1)
+        grads_abs = epoch_stats.grad2d_abs / count.clamp_min(1)
 
         # Compute Gradient Consistency Ratio (GCR)
         consistency = (grads + 1e-8) / (grads_abs + 1e-8)
@@ -519,15 +393,15 @@ class DefaultStrategy(Strategy):
         n_dupli = is_dupli.sum().item()
 
         # Split gaussians that dominate too many pixels (using current epoch statistics)
-        if "epoch_stats" in state and hasattr(state["epoch_stats"], "max_touchedPct"):
+        if "epoch_stats" in state and hasattr(epoch_stats, "max_touchedPct"):
             # Use split_n for very large gaussians (> 2% of image)
             # is_split_huge = (state["epoch_stats"].max_touchedPct > 0.005) & is_not_sky
             # is_split_huge |= (state["epoch_stats"].max_touchedPct > 0.05) & is_certain_sky
 
             # Use regular split for moderately large gaussians
-            split_by_domination = (state["epoch_stats"].max_dominatedPct > self.split_big_dominated_pct) & ~is_split_huge
-            split_by_big_touch = ((state["epoch_stats"].max_touchedPct > self.split_big_touched_pct) & ~split_by_domination) & is_not_sky
-            split_by_big_touch |= ((state["epoch_stats"].max_touchedPct > self.split_big_touched_pct * 10) & ~split_by_domination) & is_certain_sky
+            split_by_domination = (epoch_stats.max_dominatedPct > self.split_big_dominated_pct) & ~is_split_huge
+            split_by_big_touch = ((epoch_stats.max_touchedPct > self.split_big_touched_pct) & ~split_by_domination) & is_not_sky
+            split_by_big_touch |= ((epoch_stats.max_touchedPct > self.split_big_touched_pct * 10) & ~split_by_domination) & is_certain_sky
 
             print("split_n by huge touch pct:", is_split_huge.sum().item())
             print("split by domination pct:", split_by_domination.sum().item())
@@ -536,7 +410,7 @@ class DefaultStrategy(Strategy):
             is_split |= split_by_domination
             is_split_huge |= split_by_big_touch
 
-            is_large = state["epoch_stats"].max_touchedPct > self.split_big_touched_pct / 5
+            is_large = epoch_stats.max_touchedPct > self.split_big_touched_pct / 5
 
             is_split |= is_grad_high_for_split & ~is_large
 
@@ -634,20 +508,20 @@ class DefaultStrategy(Strategy):
         # is_prune = is_prune & is_not_sky
 
         # Only prune by size after first reset epoch
-        # if (epoch_ctx.i_epoch - state.get("last_reset_epoch", -1000)) > 0:
-        #     is_too_big = (
-        #         scaling_activation(params["scales"][:n_old]).max(dim=-1).values
-        #         > self.prune_scale3d * state["scene_scale"]
-        #     )
-        #     # The official code also implements sreen-size pruning but
-        #     # it's actually not being used due to a bug:
-        #     # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
-        #     # We implement it here for completeness but set `refine_scale2d_stop_iter`
-        #     # to 0 by default to disable it.
-        #     if step < self.refine_scale2d_stop_iter:
-        #         is_too_big |= state["radii"][:n_old] > self.prune_scale2d
-        #
-        #     is_prune[:n_old] = is_prune[:n_old] | is_too_big
+        if (epoch_ctx.i_epoch - state.get("last_reset_epoch", -1000)) > 0:
+            is_too_big = (
+                scaling_activation(params["scales"]).max(dim=-1).values
+                > self.prune_scale3d * state["scene_scale"]
+            )
+            #     # The official code also implements sreen-size pruning but
+            #     # it's actually not being used due to a bug:
+            #     # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
+            #     # We implement it here for completeness but set `refine_scale2d_stop_iter`
+            #     # to 0 by default to disable it.
+            if step < self.refine_scale2d_stop_iter:
+                is_too_big |= state["radii"] > self.prune_scale2d
+
+            is_prune |= is_too_big
 
         # Prune gaussians that were never visible from any camera (using current epoch statistics)
         epoch_stats = state["epoch_stats"]
@@ -665,11 +539,11 @@ class DefaultStrategy(Strategy):
         if (self.importance_prune_enabled and
                 self.importance_prune_start_epoch <= epoch_ctx.i_epoch < self.importance_prune_end_epoch and
             epoch_ctx.i_epoch % self.importance_prune_every_epochs == 0 and
-            "importance" in state and state["importance"] is not None):
+            "epoch_stats" in state):
 
-            scores = state["importance"]
-            count = state["count"]
-
+            epoch_stats = state["epoch_stats"]
+            scores = epoch_stats.importance
+            count = epoch_stats.count
             # Normalize scores by number of cameras where gaussian was visible
             # to avoid bias against gaussians visible in fewer views
             normalized_scores = torch.where(

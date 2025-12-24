@@ -27,6 +27,7 @@ from adan import Adan
 
 # GPU поддерживает TensorFloat32 (TF32) tensor cores для ускорения матричных умножений с float32, но PyTorch не использует их по умолчанию.
 torch.set_float32_matmul_precision('high')
+# torch.autograd.set_detect_anomaly(True)
 
 import torch.nn.functional as F
 import tqdm
@@ -107,12 +108,12 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [500, 7_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
     # Initialization strategy
-    init_type: str = "sfm"
+    init_type: str = "sfm" # "random" # "sfm"
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
@@ -143,11 +144,13 @@ class Config:
     prune_scale3d: float = 0.1
 
     # Start refining GSs after this epoch
-    refine_start_epochs: int = 3
+    refine_start_epochs: int = 0
     # Stop refining GSs after this epoch
     refine_stop_epochs: int = 500
     # Refine GSs every this many epochs
     refine_every_epochs: int = 1
+    # Add new GSs every this many epochs (for MCMCStrategy)
+    add_every_epochs: int = 2
     # Start resetting opacities after this epoch
     reset_start_epochs: int = 100
     # Stop resetting opacities after this epoch
@@ -158,7 +161,7 @@ class Config:
     pause_refine_after_reset_epochs: int = 1
 
     # Auto-calculate epoch parameters from legacy step-based values
-    auto_epoch_params: bool = True
+    auto_epoch_params: bool = False
     # Legacy step-based values for auto-calculation
     legacy_refine_start_iter: int = 1
     legacy_refine_stop_iter: int = 25_000
@@ -233,7 +236,7 @@ class Config:
     dist_start_iter: int = 3_000
 
     # Opacity entropy regularization (penalizes partial transparency)
-    opacity_entropy_loss: bool = False
+    opacity_entropy_loss: bool = True
     # Weight for opacity entropy loss
     opacity_entropy_lambda: float = 1e-3
     # Iteration to start opacity entropy regularization
@@ -247,6 +250,13 @@ class Config:
     elongation_threshold: float = 4.0
     # Iteration to start elongation regularization
     elongation_start_iter: int = 0
+
+    # L1 opacity regularization (penalizes high opacity)
+    opacity_l1_loss: bool = False
+    # Weight for L1 opacity loss
+    opacity_l1_lambda: float = 1e-5
+    # Epoch to start L1 opacity regularization
+    opacity_l1_start_epoch: int = 3
 
     # Scale percentile regularization (penalizes extreme sizes)
     scale_percentile_loss: bool = False
@@ -262,7 +272,7 @@ class Config:
     # Effective rank regularization (penalizes low-rank gaussians). from arXiv:2406.11672
     erank_loss: bool = False
     # Weight for effective rank loss
-    erank_lambda: float = 1e-6
+    erank_lambda: float = 1e-3
     # Iteration to start effective rank regularization
     erank_start_iter: int = 0
 
@@ -279,7 +289,7 @@ class Config:
 
     # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
-        default_factory=lambda: DefaultStrategy()
+        default_factory=lambda: MCMCStrategy()
     )
 
     # AA-2DGS parameters
@@ -397,7 +407,7 @@ def create_splats_with_optimizers(
         # Scaled learning rate and hyperparameters based on batch size
         scaled_lr = lr * math.sqrt(batch_size)
         scaled_eps = 1e-15 / math.sqrt(batch_size)
-        scaled_betas = (1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.99), 1 - batch_size * (1 - 0.99))
+        scaled_betas = (1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.99))#, 1 - batch_size * (1 - 0.99))
 
         # Choose optimizer based on sparse_grad setting
         if sparse_grad:
@@ -409,7 +419,7 @@ def create_splats_with_optimizers(
             )
         else:
             # Use Adan optimizer (drop-in replacement for Adam with better performance)
-            optimizer = Adan(
+            optimizer = torch.optim.Adam(
                 [{"params": splats[name], "lr": lr }],
                 eps=scaled_eps,
                 betas=scaled_betas,
@@ -506,6 +516,9 @@ class Runner:
             cfg.reset_every_epochs = max(1, math.ceil(legacy_reset_every_iter / n_cameras_per_epoch))
             cfg.refine_every_epochs = max(1, math.ceil(legacy_refine_every_iter / n_cameras_per_epoch))
             
+            # For MCMC strategy, add_every_epochs is 3x refine_every_epochs by default
+            cfg.add_every_epochs = cfg.refine_every_epochs * 3
+            
             # Adjust reset_start_epochs to be after some refinement cycles
             cfg.reset_start_epochs = cfg.refine_start_epochs + cfg.refine_every_epochs * 2
             
@@ -515,10 +528,14 @@ class Runner:
         
         print(f"  refine_start={cfg.refine_start_epochs} epochs, "
               f"refine_stop={cfg.refine_stop_epochs} epochs")
-        print(f"  reset_every={cfg.reset_every_epochs} epochs, "
-              f"refine_every={cfg.refine_every_epochs} epochs")
-        print(f"  reset_start={cfg.reset_start_epochs} epochs, "
-              f"reset_end={cfg.reset_end_epochs} epochs")
+        if isinstance(cfg.strategy, MCMCStrategy):
+            print(f"  refine_every={cfg.refine_every_epochs} epochs, "
+                  f"add_every={cfg.add_every_epochs} epochs")
+        else:
+            print(f"  reset_every={cfg.reset_every_epochs} epochs, "
+                  f"refine_every={cfg.refine_every_epochs} epochs")
+            print(f"  reset_start={cfg.reset_start_epochs} epochs, "
+                  f"reset_end={cfg.reset_end_epochs} epochs")
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -613,8 +630,11 @@ class Runner:
             self.cfg.strategy.refine_start_epochs = cfg.refine_start_epochs
             self.cfg.strategy.refine_stop_epochs = cfg.refine_stop_epochs
             self.cfg.strategy.refine_every_epochs = cfg.refine_every_epochs
+            self.cfg.strategy.add_every_epochs = cfg.add_every_epochs
+            self.cfg.strategy.min_opacity = cfg.prune_opa
             self.cfg.strategy.growth_factor = 1.15
             self.cfg.strategy.verbose = True
+            self.cfg.strategy.model_type = cfg.model_type
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -953,8 +973,8 @@ class Runner:
 
             # forward
             (
-                renders,
-                alphas,
+                world_renders,
+                world_alphas,
                 normals,
                 normals_from_depth,
                 render_distort,
@@ -994,8 +1014,8 @@ class Runner:
                     sky_render_median,
                     sky_info,
                 ) = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
+                    camtoworlds=camtoworlds.clone().detach(), # не тренировать на далёком небе
+                    Ks=Ks.clone().detach(),
                     width=width,
                     height=height,
                     splats=sky_splats,
@@ -1032,7 +1052,7 @@ class Runner:
                     sky_mask_gt = data["sky_mask"].to(device).float()  # [B, H, W] binary mask
                     
                     # World alpha should be high (1) where sky_mask is low (0)
-                    world_alpha_before_blend = alphas[0, :, :, 0].clone()  # [H, W] - world opacity before blending
+                    world_alpha_before_blend = world_alphas[0, :, :, 0].clone()  # [H, W] - world opacity before blending
                     
                     # Binary cross-entropy for world alpha vs inverse sky mask
                     world_mask_gt = 1.0 - sky_mask_gt[0]  # [H, W]
@@ -1051,6 +1071,10 @@ class Runner:
                             (1 - sky_mask_gt[0]) * torch.log(1 - sky_alpha_clamped)
                         ).mean()
 
+            else:
+                render_alphas = world_alphas
+                render_colors = world_renders
+
             # Add camtoworlds to info for distance computation in strategy
             info["camtoworlds"] = camtoworlds
             info["Ks"] = Ks
@@ -1065,10 +1089,10 @@ class Runner:
                     "aa_compute_every": cfg.aa_compute_every,
                 }
 
-            if renders.shape[-1] == 4:
-                colors, depths = renders[..., 0:3], renders[..., 3:4]
+            if render_colors.shape[-1] == 4:
+                colors, depths = render_colors[..., 0:3], render_colors[..., 3:4]
             else:
-                colors, depths = renders, None
+                colors, depths = render_colors, None
 
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
@@ -1086,7 +1110,7 @@ class Runner:
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+                colors = colors + bkgd * (1.0 - render_alphas)
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -1146,7 +1170,7 @@ class Runner:
                     curr_normal_lambda = 0.0
                 # normal consistency loss
                 normals = normals.squeeze(0).permute((2, 0, 1))
-                normals_from_depth *= alphas.squeeze(0).detach()
+                normals_from_depth *= world_alphas.squeeze(0).detach()
                 if len(normals_from_depth.shape) == 4:
                     normals_from_depth = normals_from_depth.squeeze(0)
                 normals_from_depth = normals_from_depth.permute((2, 0, 1))
@@ -1217,6 +1241,16 @@ class Runner:
                 
                 scale_percentile_loss = (below_penalty + above_penalty).mean()
                 loss += scale_percentile_loss * curr_scale_percentile_lambda
+
+            if cfg.opacity_l1_loss:
+                if epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
+                    curr_opacity_l1_lambda = cfg.opacity_l1_lambda
+                else:
+                    curr_opacity_l1_lambda = 0.0
+                # L1 regularization on activated opacities
+                activated_opacities = opacity_activation(self.splats["opacities"])
+                opacity_l1_loss = (activated_opacities).mean()
+                loss += opacity_l1_loss * curr_opacity_l1_lambda
 
             if cfg.erank_loss:
                 if step > cfg.erank_start_iter:
@@ -1346,6 +1380,9 @@ class Runner:
             if cfg.erank_loss and step > cfg.erank_start_iter:
                 loss_components["erank_loss"] = erank_loss
 
+            if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
+                loss_components["opacity_l1_loss"] = opacity_l1_loss
+
             # if cfg.skysphere_enabled:
             #     if cfg.skyness_reg > 0:
             #         loss_components["skyness_entropy"] = skyness_entropy
@@ -1379,6 +1416,8 @@ class Runner:
                 desc += f" scale_percentile={scale_percentile_loss.item():.4f}"
             if cfg.erank_loss and step > cfg.erank_start_iter:
                 desc += f" erank={erank_loss.item():.4f}"
+            if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
+                desc += f" op_l1={opacity_l1_loss.item():.4f}"
             pbar.set_description(desc)
 
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
@@ -1400,6 +1439,8 @@ class Runner:
                     self.writer.add_scalar("train/elongation_loss", elongation_loss.item(), step)
                 if cfg.scale_percentile_loss and step > cfg.scale_percentile_start_iter:
                     self.writer.add_scalar("train/scale_percentile_loss", scale_percentile_loss.item(), step)
+                if cfg.opacity_l1_loss and epoch_ctx.i_epoch >= cfg.opacity_l1_start_epoch:
+                    self.writer.add_scalar("train/opacity_l1_loss", opacity_l1_loss.item(), step)
                 if cfg.skysphere_enabled and cfg.skyness_reg > 0:
                 #     skyness_probs = torch.sigmoid(self.splats["skyness"])
                 #     self.writer.add_scalar("train/skyness_supervision_loss", skyness_supervision_loss.item(), step)
@@ -1587,6 +1628,38 @@ class Runner:
             )  # [1, H, W, 3]
             colors = torch.clamp(colors, 0.0, 1.0)
             colors = colors[..., :3]  # Take RGB channels
+
+            # Render and blend skysphere if enabled
+            if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
+                sky_splats = self.skysphere_model.get_splats()
+                (
+                    sky_colors,
+                    sky_alphas,
+                    _, _, _, _, _,
+                ) = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    splats=sky_splats,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane * 2,  # Larger far plane for sky
+                    render_mode="RGB+ED",
+                    distloss=False,  # No distortion loss for sky
+                    track_domination=False,
+                    drop_rate=0,  # No dropout for sky
+                    override_colors = sky_splats["colors"][None, ...],
+                    sh_degree = None,
+                )
+                # Use compose_renders for proper alpha blending
+                # World is in front, sky is behind
+                combined, alphas = compose_renders(
+                    renders_list=[colors, sky_colors[..., :3]],
+                    alphas_list=[alphas, sky_alphas],
+                    compositing_order=CompositingOrder.FRONT_TO_BACK
+                )
+                colors = torch.clamp(combined[..., :3], 0.0, 1.0)
+
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -1652,28 +1725,6 @@ class Runner:
                 metrics["cc_psnr"].append(self.psnr(cc_colors, pixels))
                 metrics["cc_ssim"].append(self.ssim(cc_colors, pixels))
                 metrics["cc_lpips"].append(self.lpips(cc_colors, pixels))
-
-            # Render and blend skysphere if enabled
-            if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
-                sky_splats = self.skysphere_model.get_splats()
-                (
-                    sky_colors,
-                    sky_alphas,
-                    _, _, _, _, _,
-                ) = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                    splats=sky_splats,
-                    sh_degree=cfg.sh_degree,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane * 2,
-                    render_mode="RGB+ED",
-                )
-                # Alpha blend sky behind world
-                colors = colors * alphas + sky_colors[..., :3] * sky_alphas * (1.0 - alphas)
-                alphas = alphas + sky_alphas * (1.0 - alphas)
 
         ellipse_time /= len(valloader)
 
@@ -1742,7 +1793,7 @@ class Runner:
 
         canvas_all = []
         for i in tqdm.trange(len(camtoworlds), desc="Rendering trajectory"):
-            renders, _, _, surf_normals, _, _, _ = self.rasterize_splats(
+            renders, alphas, _, surf_normals, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds[i : i + 1],
                 Ks=K[None],
                 width=width,
@@ -1752,10 +1803,40 @@ class Runner:
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
+
+            # Render and blend skysphere if enabled
+            if cfg.skysphere_enabled and self.skysphere_model and not self.skysphere_model.is_empty:
+                sky_splats = self.skysphere_model.get_splats()
+                (
+                    sky_renders,
+                    sky_alphas,
+                    _, _, _, _, _,
+                ) = self.rasterize_splats(
+                    camtoworlds=camtoworlds[i : i + 1],
+                    Ks=K[None],
+                    width=width,
+                    height=height,
+                    splats=sky_splats,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane * 2,  # Larger far plane for sky
+                    render_mode="RGB+ED",
+                    distloss=False,  # No distortion loss for sky
+                    track_domination=False,
+                    drop_rate=0,  # No dropout for sky
+                    override_colors = sky_splats["colors"][None, ...],
+                    sh_degree = None,
+                )
+                # Use compose_renders for proper alpha blending
+                # World is in front, sky is behind
+                renders, alphas = compose_renders(
+                    renders_list=[renders, sky_renders],
+                    alphas_list=[alphas, sky_alphas],
+                    compositing_order=CompositingOrder.FRONT_TO_BACK
+                )
+
             colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
             depths = renders[0, ..., 3:4]  # [H, W, 1]
             depths = normalize_robust(depths)
-
             surf_normals = normalize_robust(surf_normals)
 
             # write images
@@ -1902,9 +1983,9 @@ class Runner:
 
         elif render_tab_state.render_mode == "grad2d_accum":
             # Visualize accumulated gradient magnitudes
-            if "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None:
-                grad2d = self.strategy_state["grad2d_abs"].clone()
-                count = self.strategy_state["count"].clone()
+            if "epoch_stats" in self.strategy_state and hasattr(self.strategy_state["epoch_stats"], "grad2d_abs"):
+                grad2d = self.strategy_state["epoch_stats"].grad2d_abs.clone()
+                count = self.strategy_state["epoch_stats"].count.clone()
                 # Average gradient per visibility count
                 avg_grad = torch.where(count > 0, grad2d / count.clamp_min(1), torch.zeros_like(grad2d))
                 override_colors = scalar_to_colormap(
@@ -1920,8 +2001,8 @@ class Runner:
         
         elif render_tab_state.render_mode == "grad2d_count":
             # Visualize visibility count (how many times each gaussian was visible)
-            if "count" in self.strategy_state and self.strategy_state["count"] is not None:
-                count = self.strategy_state["count"].clone()
+            if "epoch_stats" in self.strategy_state and hasattr(self.strategy_state["epoch_stats"], "count"):
+                count = self.strategy_state["epoch_stats"].count.clone()
                 override_colors = scalar_to_colormap(
                     count,
                     colormap=render_tab_state.colormap,
@@ -1935,12 +2016,12 @@ class Runner:
         
         elif render_tab_state.render_mode == "gcr":
             # Visualize Gradient Consistency Ratio (GCR) from GDAGS
-            if ("grad2d" in self.strategy_state and self.strategy_state["grad2d"] is not None and
-                "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None):
-                grad2d = self.strategy_state["grad2d"].clone()
-                grad2d_abs = self.strategy_state["grad2d_abs"].clone()
-                count = self.strategy_state["count"].clone()
-                # Average gradients per visibility count
+            if ("epoch_stats" in self.strategy_state and 
+                hasattr(self.strategy_state["epoch_stats"], "grad2d") and
+                hasattr(self.strategy_state["epoch_stats"], "grad2d_abs")):
+                grad2d = self.strategy_state["epoch_stats"].grad2d.clone()
+                grad2d_abs = self.strategy_state["epoch_stats"].grad2d_abs.clone()
+                count = self.strategy_state["epoch_stats"].count.clone()
                 avg_grad = torch.where(count > 0, grad2d / count.clamp_min(1), torch.zeros_like(grad2d))
                 avg_grad_abs = torch.where(count > 0, grad2d_abs / count.clamp_min(1), torch.zeros_like(grad2d_abs))
                 # Compute GCR = grad / grad_abs
@@ -1959,12 +2040,12 @@ class Runner:
         
         elif render_tab_state.render_mode == "gdags_weight":
             # Visualize GDAGS weight: w = 0.8 + 25 * (1 - GCR)^15
-            if ("grad2d" in self.strategy_state and self.strategy_state["grad2d"] is not None and
-                "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None):
-                grad2d = self.strategy_state["grad2d"].clone()
-                grad2d_abs = self.strategy_state["grad2d_abs"].clone()
-                count = self.strategy_state["count"].clone()
-                # Average gradients per visibility count
+            if ("epoch_stats" in self.strategy_state and
+                hasattr(self.strategy_state["epoch_stats"], "grad2d") and
+                hasattr(self.strategy_state["epoch_stats"], "grad2d_abs")):
+                grad2d = self.strategy_state["epoch_stats"].grad2d.clone()
+                grad2d_abs = self.strategy_state["epoch_stats"].grad2d_abs.clone()
+                count = self.strategy_state["epoch_stats"].count.clone()
                 avg_grad = torch.where(count > 0, grad2d / count.clamp_min(1), torch.zeros_like(grad2d))
                 avg_grad_abs = torch.where(count > 0, grad2d_abs / count.clamp_min(1), torch.zeros_like(grad2d_abs))
                 # Compute GCR = grad / grad_abs
@@ -1985,12 +2066,12 @@ class Runner:
         
         elif render_tab_state.render_mode == "grad2d_gcr_combined":
             # Combined visualization: grad2d_abs determines intensity, gcr determines hue
-            if ("grad2d" in self.strategy_state and self.strategy_state["grad2d"] is not None and
-                "grad2d_abs" in self.strategy_state and self.strategy_state["grad2d_abs"] is not None):
-                grad2d = self.strategy_state["grad2d"].clone()
-                grad2d_abs = self.strategy_state["grad2d_abs"].clone()
-                count = self.strategy_state["count"].clone()
-                
+            if ("epoch_stats" in self.strategy_state and
+                hasattr(self.strategy_state["epoch_stats"], "grad2d") and
+                hasattr(self.strategy_state["epoch_stats"], "grad2d_abs")):
+                grad2d = self.strategy_state["epoch_stats"].grad2d.clone()
+                grad2d_abs = self.strategy_state["epoch_stats"].grad2d_abs.clone()
+                count = self.strategy_state["epoch_stats"].count.clone()
                 # Average gradients per visibility count
                 avg_grad = torch.where(count > 0, grad2d / count.clamp_min(1), torch.zeros_like(grad2d))
                 avg_grad_abs = torch.where(count > 0, grad2d_abs / count.clamp_min(1), torch.zeros_like(grad2d_abs))
@@ -2026,9 +2107,9 @@ class Runner:
         
         elif render_tab_state.render_mode == "importance":
             # Visualize importance (vG^2) from accumulated gradients
-            if "importance" in self.strategy_state and self.strategy_state["importance"] is not None:
-                importance = self.strategy_state["importance"].clone()
-                count = self.strategy_state["count"].clone()
+            if "epoch_stats" in self.strategy_state and hasattr(self.strategy_state["epoch_stats"], "importance"):
+                importance = self.strategy_state["epoch_stats"].importance.clone()
+                count = self.strategy_state["epoch_stats"].count.clone()
                 
                 # Normalize by number of cameras where gaussian was visible
                 avg_importance = torch.where(count > 0, importance / count.clamp_min(1), torch.zeros_like(importance))
@@ -2106,9 +2187,13 @@ class Runner:
                 override_colors=sky_splats["colors"][None, ...],
             )
             
-            # Alpha blend sky behind world
-            render_colors = render_colors[..., :3] * render_alphas + sky_renders[..., :3] * sky_alphas * (1.0 - render_alphas)
-            render_alphas = render_alphas + sky_alphas * (1.0 - render_alphas)
+            # Use compose_renders for proper alpha blending
+            # World is in front, sky is behind
+            render_colors, render_alphas = compose_renders(
+                renders_list=[render_colors[..., :3], sky_renders[..., :3]],
+                alphas_list=[render_alphas, sky_alphas],
+                compositing_order=CompositingOrder.FRONT_TO_BACK
+            )
 
         if render_tab_state.render_mode in ("depth(expected)", "depth(dominating)"):
             if render_tab_state.render_mode == "depth(dominating)":

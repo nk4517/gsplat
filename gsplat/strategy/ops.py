@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 from typing import Callable, Dict, List, Union, Optional
 
@@ -408,6 +410,8 @@ def reset_opa(
     )
 
 
+LOG_TINY_SCALE = math.log(1e-16)
+
 @torch.no_grad()
 def relocate(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -416,6 +420,7 @@ def relocate(
     mask: Tensor,
     binoms: Tensor,
     min_opacity: float = 0.005,
+    model_type: str | None = None,
 ):
     """Inplace relocate some dead Gaussians to the lives ones.
 
@@ -445,10 +450,13 @@ def relocate(
     new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
+        nonlocal new_opacities, new_scales
         if name == "opacities":
             p[sampled_idxs] = opacity_inverse_activation(new_opacities)
         elif name == "scales":
             p[sampled_idxs] = scaling_inverse_activation(new_scales)
+            if model_type == "2dgs":
+                p[sampled_idxs, 2] = LOG_TINY_SCALE
         p[dead_indices] = p[sampled_idxs]
         return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
@@ -461,7 +469,7 @@ def relocate(
     # update the extra running state
     wrapped_state = StateWrapper(state)
     for k, v in wrapped_state.items():
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor) and len(v) == len(opacities):
             v[sampled_idxs] = 0
 
 
@@ -473,6 +481,7 @@ def sample_add(
     n: int,
     binoms: Tensor,
     min_opacity: float = 0.005,
+    model_type: str | None = None,
 ):
     opacities = opacity_activation(params["opacities"])
 
@@ -488,10 +497,13 @@ def sample_add(
     new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
+        nonlocal new_opacities, new_scales
         if name == "opacities":
             p[sampled_idxs] = opacity_inverse_activation(new_opacities)
         elif name == "scales":
             p[sampled_idxs] = scaling_inverse_activation(new_scales)
+            if model_type == "2dgs":
+                p[sampled_idxs, 2] = LOG_TINY_SCALE
         p_new = torch.cat([p, p[sampled_idxs]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
@@ -504,7 +516,7 @@ def sample_add(
     # update the extra running state
     wrapped_state = StateWrapper(state)
     for k, v in wrapped_state.items():
-        if isinstance(v, torch.Tensor):
+        if isinstance(v, torch.Tensor) and len(v) == len(opacities):
             v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
             wrapped_state[k] = torch.cat((v, v_new))
 

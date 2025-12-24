@@ -28,6 +28,7 @@ class MCMCStrategy(Strategy):
         refine_start_epochs (int): Start refining GSs after this many epochs. Default is 15.
         refine_stop_epochs (int): Stop refining GSs after this many epochs. Default is 500.
         refine_every_epochs (int): Refine GSs every this many epochs. Default is 3.
+        add_every_epochs (int): Add new GSs every this many epochs. Default is 9 (3x refine_every_epochs).
         min_opacity (float): GSs with opacity below this value will be pruned. Default to 0.005.
         growth_factor (float): Factor for growing the number of GSs. Default to 1.05.
         verbose (bool): Whether to print verbose information. Default to False.
@@ -53,9 +54,11 @@ class MCMCStrategy(Strategy):
     refine_start_epochs: int = 15  # Start refining GSs after this many epochs
     refine_stop_epochs: int = 500  # Stop refining GSs after this many epochs
     refine_every_epochs: int = 3  # Refine GSs every this many epochs
+    add_every_epochs: int = 9  # Add new GSs every this many epochs (default 3x refine_every_epochs)
     min_opacity: float = 0.005
     growth_factor: float = 1.05
     verbose: bool = False
+    model_type: str | None = None
 
     def initialize_state(self) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy."""
@@ -91,17 +94,40 @@ class MCMCStrategy(Strategy):
         # The following keys are required for this strategy.
         for key in ["means", "scales", "quats", "opacities"]:
             assert key in params, f"{key} is required in params but missing."
+            
+    @torch.no_grad()
+    def step_epoch_start(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        epoch_ctx: EpochContext,
+    ):
+        """Callback function to be executed before forward pass of the first camera in batch."""
+        # Initialize epoch statistics at the start of each epoch
+        n_gaussian = len(list(params.values())[0])
+        device = list(params.values())[0].device
 
-    # def step_pre_backward(
-    #     self,
-    #     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    #     optimizers: Dict[str, torch.optim.Optimizer],
-    #     # state: Dict[str, Any],
-    #     step: int,
-    #     info: Dict[str, Any],
-    # ):
-    #     """Callback function to be executed before the `loss.backward()` call."""
-    #     pass
+        # Initialize epoch statistics block
+        if "epoch_stats" not in state:
+            state["epoch_stats"] = EpochStatistics(n_gaussian, device)
+
+    def step_pre_backward(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        info: Dict[str, Any],
+        epoch_ctx: EpochContext,
+    ):
+        """Callback function to be executed before the `loss.backward()` call."""
+        # For gradient tracking, we need to retain gradients
+        if "gradient_2dgs" in info:
+            info["gradient_2dgs"].retain_grad()
+        elif "means2d" in info:
+            info["means2d"].retain_grad()
 
     def step_post_backward(
         self,
@@ -120,39 +146,61 @@ class MCMCStrategy(Strategy):
             epoch_ctx (EpochContext): Context information about the current epoch.
         """
         # move to the correct device
+        device = params["means"].device
 
-        if not epoch_ctx.epoch_end:
-            return
-
-        state["binoms"] = state["binoms"].to(params["means"].device)
-
-        binoms = state["binoms"]
-
-        # Check if refinement should happen at this epoch
-        should_refine = (self.refine_stop_epochs <= epoch_ctx.i_epoch < self.refine_start_epochs and
-                         epoch_ctx.i_epoch % self.refine_every_epochs == 0)
-
-
-        if should_refine:
-            # teleport GSs
-            n_relocated_gs = self._relocate_gs(params, optimizers, binoms)
-            if self.verbose:
-                print(f"Epoch {epoch_ctx.i_epoch} (Step {step}): Relocated {n_relocated_gs} GSs.")
-
-            # add new GSs
-            n_new_gs = self._add_new_gs(params, optimizers, binoms)
-            if self.verbose:
-                print(
-                    f"Epoch {epoch_ctx.i_epoch} (Step {step}): Added {n_new_gs} GSs. "
-                    f"Now having {len(params['means'])} GSs."
+        with torch.no_grad():
+            # Update statistics in epoch_stats
+            if "epoch_stats" in state:
+                # Update all statistics from info
+                state["epoch_stats"].update_from_info(
+                    info=info,
+                    params=params,
+                    key_for_gradient="gradient_2dgs",
+                    packed=info.get("packed", False)
                 )
 
-            torch.cuda.empty_cache()
+            if not epoch_ctx.epoch_end:
+                return
+
+            state["binoms"] = state["binoms"].to(device)
+
+            binoms = state["binoms"]
+
+            # Check if relocation should happen at this epoch
+            should_relocate = (self.refine_stop_epochs > epoch_ctx.i_epoch >= self.refine_start_epochs and
+                               epoch_ctx.i_epoch % self.refine_every_epochs == 0)
+
+            # Check if adding new GSs should happen at this epoch
+            should_add = (self.refine_stop_epochs > epoch_ctx.i_epoch >= self.refine_start_epochs and
+                          epoch_ctx.i_epoch % self.add_every_epochs == 0)
+
+            if should_relocate:
+                # teleport GSs
+                n_relocated_gs = self._relocate_gs(params, optimizers, binoms, state)
+                if self.verbose:
+                    print(f"Epoch {epoch_ctx.i_epoch} (Step {step}): Relocated {n_relocated_gs} GSs.")
+
+            if should_add:
+                # add new GSs
+                n_new_gs = self._add_new_gs(params, optimizers, binoms, state)
+                if self.verbose:
+                    print(
+                        f"Epoch {epoch_ctx.i_epoch} (Step {step}): Added {n_new_gs} GSs. "
+                        f"Now having {len(params['means'])} GSs."
+                    )
+
+            if should_relocate or should_add:
+                torch.cuda.empty_cache()
 
         # add noise to GSs
         inject_noise_to_position(
             params=params, optimizers=optimizers, state={}, scaler=lr * self.noise_lr
         )
+
+        with torch.no_grad():
+            # Reset epoch statistics for next epoch
+            if "epoch_stats" in state:
+                state["epoch_stats"].reset()
 
     @torch.no_grad()
     def _relocate_gs(
@@ -160,18 +208,44 @@ class MCMCStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
+        state: Dict[str, Any],
     ) -> int:
         opacities = opacity_activation(params["opacities"].flatten())
         dead_mask = opacities <= self.min_opacity
+        if "epoch_stats" in state:
+            # Use n_touched from epoch to determine dead splats
+            dead_mask |= state["epoch_stats"].n_touched_accum == 0
+            
+            # Relocate 10% of splats with lowest importance scores
+            epoch_stats = state["epoch_stats"]
+            if hasattr(epoch_stats, "importance") and hasattr(epoch_stats, "count"):
+                scores = epoch_stats.importance
+                count = epoch_stats.count
+                # Normalize scores by number of cameras where gaussian was visible
+                normalized_scores = torch.where(
+                    count > 0,
+                    scores / count.clamp_min(1),
+                    torch.zeros_like(scores)
+                )
+                
+                # Find threshold for relocating 10% with lowest importance
+                if normalized_scores.numel() > 0:
+                    # Use quantile to find 10th percentile threshold
+                    threshold = torch.quantile(normalized_scores, 0.1)
+                    # Mark gaussians below threshold for relocation
+                    is_low_importance = normalized_scores <= threshold
+                    dead_mask |= is_low_importance
+                        
         n_gs = dead_mask.sum().item()
         if n_gs > 0:
             relocate(
                 params=params,
                 optimizers=optimizers,
-                state={},
+                state=state,
                 mask=dead_mask,
                 binoms=binoms,
                 min_opacity=self.min_opacity,
+                model_type=self.model_type,
             )
         return n_gs
 
@@ -181,6 +255,7 @@ class MCMCStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
+        state: Dict[str, Any],
     ) -> int:
         current_n_points = len(params["means"])
         n_target = min(self.cap_max, int(self.growth_factor * current_n_points))
@@ -189,9 +264,10 @@ class MCMCStrategy(Strategy):
             sample_add(
                 params=params,
                 optimizers=optimizers,
-                state={},
+                state=state,
                 n=n_gs,
                 binoms=binoms,
                 min_opacity=self.min_opacity,
+                model_type=self.model_type,
             )
         return n_gs

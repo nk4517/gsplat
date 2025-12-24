@@ -337,7 +337,7 @@ class MCMCStrategy(Strategy):
         binoms: Tensor,
         state: Dict[str, Any],
     ) -> int:
-        current_n_points = len(params["means"] if "means" in params else params["quats"])
+        current_n_points = len(params["scales"])
         n_target = min(self.cap_max, int(self.growth_factor * current_n_points))
         n_gs = max(0, n_target - current_n_points)
         if n_gs > 0:

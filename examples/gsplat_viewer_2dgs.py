@@ -29,6 +29,7 @@ class GsplatRenderTabState(RenderTabState):
         "effective_rank",
         "grad2d_accum", "grad2d_count", "gcr", "gdags_weight", "grad2d_gcr_combined", 
         "importance",
+        "global_significance",
     ] = "rgb"
     normalize_nearfar: bool = False
     inverse: bool = False
@@ -184,6 +185,7 @@ class GsplatViewer(Viewer):
                      "effective_rank",
                      "grad2d_accum", "grad2d_count", "gcr", "gdags_weight", "grad2d_gcr_combined", 
                      "importance",
+                     "global_significance",
                      ),
                     initial_value=self.render_tab_state.render_mode,
                     hint="Render mode to use.",

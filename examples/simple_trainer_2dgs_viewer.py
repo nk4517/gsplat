@@ -7,7 +7,7 @@ from nerfview import apply_float_colormap
 from examples.lib_compose import compose_renders, CompositingOrder, compose_renders_back_to_front
 from examples.utils import scalar_to_colormap, normalize_robust, index_map_to_pseudocolor
 from gsplat.antialias_2dgs import calc_sigma_sq
-from gsplat.strategy.ops import scaling_activation
+from gsplat.strategy.ops import scaling_activation, opacity_activation
 
 if TYPE_CHECKING:
     from nerfview import CameraState
@@ -288,6 +288,29 @@ def render_inner(
             ).unsqueeze(1)  # Reshape for rasterization: [N, 1, 3]
         else:
             # Fallback if no importance data available
+            override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=device)
+
+    elif render_tab_state.render_mode == "global_significance":
+        if epoch_stats and hasattr(epoch_stats, "n_touched_accum"):
+            n_touched = epoch_stats.n_touched_accum.clone().float()
+            
+            opacity = opacity_activation(viewer_splats["opacities"]).squeeze()  # (N,)
+            scales = scaling_activation(viewer_splats["scales"])[..., :2]  # (N, 2)
+            
+            area = torch.pi * scales[:, 0] * scales[:, 1]  # (N,)
+            area_90 = torch.quantile(area, 0.9)
+            area_norm = torch.clamp(area / (area_90 + 1e-10), max=1.0)
+            
+            beta = 0.1
+            gs_score = n_touched * opacity * (area_norm ** beta)
+            
+            override_colors = scalar_to_colormap(
+                gs_score,
+                colormap=render_tab_state.colormap,
+                inverse=render_tab_state.inverse,
+            ).unsqueeze(1)  # [N, 1, 3]
+
+        else:
             override_colors = torch.zeros((len(viewer_splats["means"]), 1, 3), device=device)
 
     (

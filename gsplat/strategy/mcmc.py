@@ -10,7 +10,25 @@ from .ops import inject_noise_to_position, relocate, sample_add, opacity_activat
 from .epoch_stats import EpochStatistics, EpochContext
 
 
+def _calc_global_significance(params, state):
     opacities = opacity_activation(params["opacities"].flatten())
+    # Global Significance from LightGaussian: GS = V * α * S^β
+    # V = n_touched, α = opacity, S = normalized area, β = 0.1
+    if "epoch_stats" in state and hasattr(state["epoch_stats"], "n_touched_accum"):
+        epoch_stats = state["epoch_stats"]
+        n_touched = epoch_stats.n_touched_accum.float()
+        
+        scales = scaling_activation(params["scales"])[..., :2]  # (N, 2)
+        area = torch.pi * scales[:, 0] * scales[:, 1]  # (N,)
+        area_90 = torch.quantile(area, 0.9)
+        area_norm = torch.clamp(area / (area_90 + 1e-10), max=1.0)
+        
+        beta = 0.1
+        probs = n_touched * opacities * (area_norm ** beta)
+    else:
+        probs = opacities.clone()
+    return probs
+
 
 def _calc_importance(params, state):
     """Calculate importance scores based on epoch_stats importance/count."""
@@ -133,7 +151,7 @@ class MCMCStrategy(Strategy):
     ):
         """Callback function to be executed before forward pass of the first camera in batch."""
         # Initialize epoch statistics at the start of each epoch
-        n_gaussian = len(list(params.values())[0])
+        n_gaussian = len(params["scales"])
         device = list(params.values())[0].device
 
         # Initialize epoch statistics block
@@ -172,11 +190,7 @@ class MCMCStrategy(Strategy):
             lr (float): Learning rate for "means" attribute of the GS.
             epoch_ctx (EpochContext): Context information about the current epoch.
         """
-        # move to the correct device
-        if "means" in params:
-            device = params["means"].device
-        else:
-            device = params["quats"].device
+        device = params["scales"].device
 
         with torch.no_grad():
             # Update statistics in epoch_stats
@@ -224,7 +238,7 @@ class MCMCStrategy(Strategy):
                 if self.verbose:
                     print(
                         f"Epoch {epoch_ctx.i_epoch} (Step {step}): Added {n_new_gs} GSs. "
-                        f"Now having {len(params['means'] if 'means' in params else params['quats'])} GSs."
+                        f"Now having {len(params['scales'])} GSs."
                     )
 
             if should_relocate or should_add:
@@ -278,6 +292,11 @@ class MCMCStrategy(Strategy):
                 is_too_big_2d = state["epoch_stats"].max_touchedPct > self.prune_scale2d
                 dead_mask |= is_too_big_2d
 
+        gs_score = _calc_global_significance(params, state)
+        if gs_score.numel() > 0:
+            threshold = torch.quantile(gs_score, pct)
+            is_low_significance = gs_score <= threshold
+            dead_mask |= is_low_significance
 
         n_gs = dead_mask.sum().item()
         if n_gs > 0:

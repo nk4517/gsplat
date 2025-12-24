@@ -15,7 +15,6 @@ from nerfstudio.cameras.cameras import Cameras
 
 import torch
 import torch.nn.functional as F
-import torch.nn as nn
 from adan import Adan
 import numpy as np
 import imageio
@@ -43,7 +42,7 @@ from nerfview import CameraState
 @dataclass
 class SkyOnlySimpleConfig:
     # Dataset configuration
-    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_SEGMENT_102751)
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_TRAIN)
 
     # Downsample factor for the dataset
     data_factor: int = 4

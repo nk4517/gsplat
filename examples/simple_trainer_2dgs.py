@@ -114,7 +114,7 @@ def binary_cross_entropy_loss(input: torch.Tensor, target: torch.Tensor) -> torc
 @dataclass
 class Config:
     # Dataset configuration
-    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_TRAIN)
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_DUCKOV_COLMAP)
     
     # Disable viewer
     disable_viewer: bool = False
@@ -123,7 +123,7 @@ class Config:
     # Downsample factor for the dataset
     data_factor: int = None
     # Target resolution (alternative to factor): int for max side, tuple for (max_w, max_h)
-    target_resolution: int | tuple[int, int] | None = 320
+    target_resolution: int | tuple[int, int] | None = 480 # 320
 
     # Every N images there is a test image
     test_every: int = 8
@@ -145,9 +145,9 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [Config.max_steps//4, Config.max_steps])
+    eval_steps: List[int] = field(default_factory=lambda: [100, Config.max_steps])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [Config.max_steps//4, Config.max_steps])
+    save_steps: List[int] = field(default_factory=lambda: [100, Config.max_steps])
 
     # Initialization strategy
     init_type: str = "sfm" # "random" # "sfm"
@@ -189,9 +189,9 @@ class Config:
     # Stop refining GSs after this epoch
     refine_stop_epochs: int = 500
     # Refine GSs every this many epochs
-    refine_every_frames: int = 400  # Target frames between refines (~100 iters * batch_size=16)
+    refine_every_frames: int = 200  # Target frames between refines (~100 iters * batch_size=16)
     # Add new GSs every this many epochs (for MCMCStrategy)
-    add_every_frames: int = 1000  # Target frames between adds (2x refine)
+    add_every_frames: int = 600  # Target frames between adds (2x refine)
     # Start resetting opacities after this epoch
     reset_start_epochs: int = 100000000
     # Stop resetting opacities after this epoch
@@ -202,7 +202,8 @@ class Config:
     pause_refine_after_reset_frames: int = 3000  # Target frames to pause after reset
 
     # MCMC strategy cap_max parameter
-    mcmc_cap_max: int = 500_000
+    mcmc_cap_max: int = 1_000_000
+    mcmc_growth_factor: float = 1.1
 
     # Auto-calculate epoch parameters from legacy step-based values
     auto_epoch_params: bool = False
@@ -238,7 +239,7 @@ class Config:
     # Whether to tie fx and fy together (single focal length)
     tie_focal_lengths: bool = False
     # Use single shared intrinsics for all cameras (averaged from all cameras)
-    shared_intrinsics: bool = False
+    shared_intrinsics: bool = True
 
     # Enable appearance optimization. (experimental)
     app_opt: bool = False
@@ -347,7 +348,7 @@ class Config:
     split_big_touched_pct: float = 0.025  # Split gaussians touching more than this percentage of pixels in one view
 
     # Skysphere parameters for joint sky training
-    enable_skysphere: bool = True  # Enable joint skysphere training
+    enable_skysphere: bool = False  # Enable joint skysphere training
     skysphere_radius_multiplier: float = 20.0  # Radius = scene_scale * multiplier
     skysphere_num_points: int = 100_000  # Number of sky gaussians
     skysphere_init_opacity: float = 0.1
@@ -355,10 +356,10 @@ class Config:
     skysphere_loss_lambda: float = 1.0  # Weight for sky loss
 
     # Sky mask: 1 = sky, 0 = world (after inversion if invert_sky_mask=True in dataset)
-    require_sky_mask: bool = True  # Require sky masks in dataset
+    require_sky_mask: bool = False  # Require sky masks in dataset
     
     # Sky alpha regularization (penalizes world splats rendering in sky regions)
-    sky_alpha_loss: bool = True  # Enable sky alpha regularization
+    sky_alpha_loss: bool = False  # Enable sky alpha regularization
     sky_alpha_lambda: float = 0.1  # Weight for sky alpha loss
     sky_alpha_start_iter: int = 0  # Iteration to start sky alpha regularization
 
@@ -481,7 +482,7 @@ def create_optimizers_for_splats(
 
         scaled_lr = lr * math.sqrt(batch_size)
         scaled_eps = 1e-15 / math.sqrt(batch_size)
-        scaled_betas = (0.98/16, 0.92/16, 0.99/16)
+        scaled_betas = (0.98/4, 0.92/4, 0.99/4)
 
         if sparse_grad:
             optimizer = torch.optim.SparseAdam(
@@ -751,7 +752,7 @@ class Runner:
             self.cfg.strategy.add_every_epochs = cfg.add_every_epochs
             self.cfg.strategy.min_opacity = cfg.prune_opa
             self.cfg.strategy.cap_max = cfg.mcmc_cap_max
-            self.cfg.strategy.growth_factor = 1.15
+            self.cfg.strategy.growth_factor = cfg.mcmc_growth_factor
             self.cfg.strategy.verbose = True
             self.cfg.strategy.model_type = cfg.model_type
             self.cfg.strategy.prune_scale3d = cfg.prune_scale3d
@@ -1772,6 +1773,7 @@ class Runner:
             # Optimize skysphere
             for optimizer in self.skysphere_optimizers.values():
                 optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             # Optimize intrinsics if enabled
             for optimizer in self.intrinsics_optimizers:
                 optimizer.step()
@@ -2100,7 +2102,7 @@ class Runner:
                     )
                     if sky_colors is not None:
                         sky_colors = self.skysphere_model.compose_with_background(
-                            sky_colors, sky_alphas, camtoworlds, K[None], width, height
+                            sky_colors, sky_alphas, camtoworlds[i : i + 1], K[None], width, height
                         )
 
                         sky_colors = sky_colors[0].clamp(0, 1)

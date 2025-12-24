@@ -106,7 +106,7 @@ DATASET_GOOD_PARK = ColmapDatasetConfig(
 )
 DATASET_SEGMENT_102751 = ColmapDatasetConfig(
     dataset_dir=r"x:\_ai\_demos\_gsplat\_datasets\segment-102751",
-    skysphere_ckpt=r"X:\_ai\_demos\_gsplat\_datasets\segment-102751.out\ckpts\ckpt_9999.pt",
+    skysphere_ckpt=r"X:\_ai\_demos\_gsplat\_datasets\segment-102751.out\sky-full\ckpts\step_005999\skysphere.pt",
     invert_mask=True,
 )
 DATASET_YOUTUBE01 = ColmapDatasetConfig(
@@ -129,6 +129,7 @@ DATASET_WAYMO_COLMAP_PROJ = WaymoDatasetConfig(
 DATASET_TRAIN = ColmapDatasetConfig(
     dataset_dir=r"x:\_ai\_demos\_gsplat\_datasets\train",
     skysphere_ckpt=r"X:\_ai\_demos\_gsplat\_datasets\train.out\sky-full\ckpts\step_005999\skysphere.pt",
+    resume_ckpt=r"X:\_ai\_demos\_gsplat\_datasets\train.out\ckpts\ckpt_240x133_6023.pt"
 )
 DATASET_TRUCK = ColmapDatasetConfig(
     dataset_dir=r"x:\_ai\_demos\_gsplat\_datasets\truck",
@@ -137,4 +138,8 @@ DATASET_TRUCK = ColmapDatasetConfig(
 DATASET_TRAIN_DA3 = ColmapDatasetConfig(
     dataset_dir=r"x:\_ai\_my_depthanything_3_workspace\output",
     output_dir=r"X:\_ai\_demos\_gsplat\_datasets\train.out",
+)
+
+DATASET_DUCKOV_COLMAP = ColmapDatasetConfig(
+    dataset_dir=r"x:\_ai\_gsplat\datasets\__my\duckov_depth_normals\conv"
 )

@@ -45,7 +45,7 @@ from nerfview import CameraState
 @dataclass
 class SkyOnlyConfig:
     # Dataset configuration
-    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_TRAIN)
+    dataset: my_datasets.DatasetConfig = field(default_factory=lambda: my_datasets.DATASET_TRUCK)
 
     # Downsample factor for the dataset
     data_factor: int = 4

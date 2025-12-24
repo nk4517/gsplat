@@ -10,22 +10,22 @@ from .ops import inject_noise_to_position, relocate, sample_add, opacity_activat
 from .epoch_stats import EpochStatistics, EpochContext
 
 
-def _calc_prob1(params, state):
     opacities = opacity_activation(params["opacities"].flatten())
-    probs = opacities.clone()
-    # Can modify probs here based on other criteria
-    # For example, using importance scores from epoch_stats
+
+def _calc_importance(params, state):
+    """Calculate importance scores based on epoch_stats importance/count."""
+    opacities = opacity_activation(params["opacities"].flatten())
     if "epoch_stats" in state and hasattr(state["epoch_stats"], "importance"):
-        importance = state["epoch_stats"].importance
-        count = state["epoch_stats"].count
-        # Weight by normalized importance
-        normalized_importance = torch.where(
+        epoch_stats = state["epoch_stats"]
+        importance = epoch_stats.importance
+        count = epoch_stats.count
+        probs = torch.where(
             count > 0,
             importance / count.clamp_min(1),
             torch.zeros_like(importance)
         )
-        # Combine opacity with importance
-        probs = normalized_importance
+    else:
+        probs = opacities.clone()
     return probs
 
 
@@ -278,26 +278,7 @@ class MCMCStrategy(Strategy):
                 is_too_big_2d = state["epoch_stats"].max_touchedPct > self.prune_scale2d
                 dead_mask |= is_too_big_2d
 
-            # Also relocate N% of splats with lowest importance scores
-            epoch_stats = state["epoch_stats"]
-            if hasattr(epoch_stats, "importance") and hasattr(epoch_stats, "count"):
-                scores = epoch_stats.importance
-                count = epoch_stats.count
-                # Normalize scores by number of cameras where gaussian was visible
-                normalized_scores = torch.where(
-                    count > 0,
-                    scores / count.clamp_min(1),
-                    torch.zeros_like(scores)
-                )
 
-                # Find threshold for relocating N% with lowest importance
-                if normalized_scores.numel() > 0:
-                    # Use quantile to find 10th percentile threshold
-                    threshold = torch.quantile(normalized_scores, pct)
-                    # Mark gaussians below threshold for relocation
-                    is_low_importance = normalized_scores <= threshold
-                    dead_mask |= is_low_importance
-                        
         n_gs = dead_mask.sum().item()
         if n_gs > 0:
             # Compute sampling probabilities

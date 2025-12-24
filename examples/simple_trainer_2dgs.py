@@ -195,6 +195,8 @@ class Config:
     optimize_principal_point: bool = True
     # Whether to tie fx and fy together (single focal length)
     tie_focal_lengths: bool = False
+    # Use single shared intrinsics for all cameras (averaged from all cameras)
+    shared_intrinsics: bool = False
 
     # Enable appearance optimization. (experimental)
     app_opt: bool = False
@@ -663,34 +665,63 @@ class Runner:
         self.intrinsics_optimizers = []
         self.optimized_Ks = None
         if cfg.optimize_intrinsics:
-            # Create optimizable K matrices for each camera
-            Ks_list = []
-            for i in range(len(self.trainset)):
-                # Get original K matrix for this camera
-                cam_data = self.trainset[i]
-                K_orig = cam_data["K"].clone()
+            if cfg.shared_intrinsics:
+                # Compute average intrinsics across all cameras
+                sum_fx, sum_fy, sum_cx, sum_cy = 0.0, 0.0, 0.0, 0.0
+                n_cams = len(self.trainset)
+                for i in range(n_cams):
+                    cam_data = self.trainset[i]
+                    K_orig = cam_data["K"]
+                    sum_fx += K_orig[0, 0].item()
+                    sum_fy += K_orig[1, 1].item()
+                    sum_cx += K_orig[0, 2].item()
+                    sum_cy += K_orig[1, 2].item()
+                avg_fx = sum_fx / n_cams
+                avg_fy = sum_fy / n_cams
+                avg_cx = sum_cx / n_cams
+                avg_cy = sum_cy / n_cams
                 
-                # Create optimizable parameters
                 if cfg.tie_focal_lengths:
-                    # Single focal length parameter
-                    focal = (K_orig[0, 0] + K_orig[1, 1]) / 2.0
+                    focal = (avg_fx + avg_fy) / 2.0
                     focal_param = torch.nn.Parameter(torch.tensor([focal], device=self.device))
-                    if cfg.optimize_principal_point:
-                        principal_point = torch.nn.Parameter(K_orig[0:1, 2:3].clone().to(self.device))
-                        cy_param = torch.nn.Parameter(K_orig[1:2, 2:3].clone().to(self.device))
-                        Ks_list.append((focal_param, focal_param, principal_point, cy_param))
-                    else:
-                        Ks_list.append((focal_param, focal_param, None, None))
+                    fx_param, fy_param = focal_param, focal_param
                 else:
-                    # Separate fx, fy parameters
-                    fx_param = torch.nn.Parameter(torch.tensor([K_orig[0, 0]], device=self.device))
-                    fy_param = torch.nn.Parameter(torch.tensor([K_orig[1, 1]], device=self.device))
-                    if cfg.optimize_principal_point:
-                        cx_param = torch.nn.Parameter(torch.tensor([K_orig[0, 2]], device=self.device))
-                        cy_param = torch.nn.Parameter(torch.tensor([K_orig[1, 2]], device=self.device))
-                        Ks_list.append((fx_param, fy_param, cx_param, cy_param))
+                    fx_param = torch.nn.Parameter(torch.tensor([avg_fx], device=self.device))
+                    fy_param = torch.nn.Parameter(torch.tensor([avg_fy], device=self.device))
+                
+                if cfg.optimize_principal_point:
+                    cx_param = torch.nn.Parameter(torch.tensor([avg_cx], device=self.device))
+                    cy_param = torch.nn.Parameter(torch.tensor([avg_cy], device=self.device))
+                else:
+                    cx_param, cy_param = None, None
+                
+                # Single shared entry, will be used for all cameras
+                Ks_list = [(fx_param, fy_param, cx_param, cy_param)]
+            else:
+                # Per-camera intrinsics
+                Ks_list = []
+                for i in range(len(self.trainset)):
+                    cam_data = self.trainset[i]
+                    K_orig = cam_data["K"].clone()
+                    
+                    if cfg.tie_focal_lengths:
+                        focal = (K_orig[0, 0] + K_orig[1, 1]) / 2.0
+                        focal_param = torch.nn.Parameter(torch.tensor([focal], device=self.device))
+                        if cfg.optimize_principal_point:
+                            principal_point = torch.nn.Parameter(K_orig[0:1, 2:3].clone().to(self.device))
+                            cy_param = torch.nn.Parameter(K_orig[1:2, 2:3].clone().to(self.device))
+                            Ks_list.append((focal_param, focal_param, principal_point, cy_param))
+                        else:
+                            Ks_list.append((focal_param, focal_param, None, None))
                     else:
-                        Ks_list.append((fx_param, fy_param, None, None))
+                        fx_param = torch.nn.Parameter(torch.tensor([K_orig[0, 0]], device=self.device))
+                        fy_param = torch.nn.Parameter(torch.tensor([K_orig[1, 1]], device=self.device))
+                        if cfg.optimize_principal_point:
+                            cx_param = torch.nn.Parameter(torch.tensor([K_orig[0, 2]], device=self.device))
+                            cy_param = torch.nn.Parameter(torch.tensor([K_orig[1, 2]], device=self.device))
+                            Ks_list.append((fx_param, fy_param, cx_param, cy_param))
+                        else:
+                            Ks_list.append((fx_param, fy_param, None, None))
             
             self.optimized_Ks = torch.nn.ParameterList([
                 param for params_tuple in Ks_list 
@@ -1025,6 +1056,7 @@ class Runner:
                 batch_size=cfg.batch_size,
                 shuffle=True,
                 device=device,
+                shared_intrinsics=cfg.shared_intrinsics,
             )
         else:
             trainloader = torch.utils.data.DataLoader(
@@ -1070,7 +1102,8 @@ class Runner:
                 Ks_opt = torch.zeros(batch_size, 3, 3, device=device)
                 
                 for b_idx in range(batch_size):
-                    cam_idx = image_ids[b_idx].item()
+                    # Use index 0 for shared intrinsics, otherwise per-camera index
+                    cam_idx = 0 if cfg.shared_intrinsics else image_ids[b_idx].item()
                     fx, fy, cx, cy = self.Ks_structure[cam_idx]
                     
                     Ks_opt[b_idx, 0, 0] = fx if fx is not None else Ks[b_idx, 0, 0]

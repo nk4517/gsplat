@@ -276,40 +276,52 @@ class PreloadedDataLoader:
             batch_size: int = 1,
             shuffle: bool = True,
             device: str = "cuda",
+            shared_intrinsics: bool = False,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.device = device
         self.num_samples = len(dataset)
-        # Group indices by camera_id for same-resolution batching
-        self.indices_by_camera: dict[int, list[int]] = defaultdict(list)
-        for idx in range(self.num_samples):
-            cam_id = dataset.preloaded_camera_ids[idx]
-            self.indices_by_camera[cam_id].append(idx)
-        self.camera_ids = list(self.indices_by_camera.keys())
+        self.shared_intrinsics = shared_intrinsics
+        
+        if shared_intrinsics:
+            # Group by resolution (H, W) when using shared intrinsics
+            self.indices_by_group: dict[tuple[int, int], list[int]] = defaultdict(list)
+            for idx in range(self.num_samples):
+                img = dataset.preloaded_images[idx]
+                resolution = (img.shape[0], img.shape[1])  # (H, W)
+                self.indices_by_group[resolution].append(idx)
+            self.group_keys = list(self.indices_by_group.keys())
+        else:
+            # Group indices by camera_id for same-resolution batching
+            self.indices_by_group: dict[int, list[int]] = defaultdict(list)
+            for idx in range(self.num_samples):
+                cam_id = dataset.preloaded_camera_ids[idx]
+                self.indices_by_group[cam_id].append(idx)
+            self.group_keys = list(self.indices_by_group.keys())
 
     def __len__(self):
         # Each camera group produces ceil(n_images / batch_size) batches
-        return sum(ceil(len(indices) / self.batch_size) for indices in self.indices_by_camera.values())
+        return sum(ceil(len(indices) / self.batch_size) for indices in self.indices_by_group.values())
 
     def __iter__(self):
         if self.shuffle:
-            # Shuffle camera order and indices within each camera
-            camera_order = torch.randperm(len(self.camera_ids)).tolist()
+            # Shuffle group order and indices within each group
+            group_order = torch.randperm(len(self.group_keys)).tolist()
             shuffled_groups = []
-            for cam_idx in camera_order:
-                cam_id = self.camera_ids[cam_idx]
-                cam_indices = self.indices_by_camera[cam_id].copy()
-                np.random.shuffle(cam_indices)
-                shuffled_groups.append(cam_indices)
+            for g_idx in group_order:
+                group_key = self.group_keys[g_idx]
+                group_indices = self.indices_by_group[group_key].copy()
+                np.random.shuffle(group_indices)
+                shuffled_groups.append(group_indices)
         else:
-            shuffled_groups = [self.indices_by_camera[cam_id].copy() for cam_id in self.camera_ids]
+            shuffled_groups = [self.indices_by_group[key].copy() for key in self.group_keys]
 
-        # Yield batches from each camera group
-        for cam_indices in shuffled_groups:
-            for i in range(0, len(cam_indices), self.batch_size):
-                batch_indices = cam_indices[i:i + self.batch_size]
+        # Yield batches from each group
+        for group_indices in shuffled_groups:
+            for i in range(0, len(group_indices), self.batch_size):
+                batch_indices = group_indices[i:i + self.batch_size]
                 batch_data = []
 
                 for idx in batch_indices:

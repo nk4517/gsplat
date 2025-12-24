@@ -1,10 +1,13 @@
 import json
-import math
 import os
 import time
+import threading
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+
+from examples.vs_env import set_vc_envs; set_vc_envs()
 
 import torch
 import torch.nn.functional as F
@@ -17,10 +20,9 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
 from datasets.colmap import Dataset, Parser
-from examples.skysphere_model import SkysphereModel
 from examples.skysphere_model_parametrized import SkysphereModelParametrized
 from gsplat import rasterization_2dgs, RasterizationMode2DGS
-from gsplat.strategy.ops import opacity_activation
+from gsplat.strategy.epoch_stats import EpochStatistics, training_data_generator
 from gsplat_viewer_2dgs import GsplatViewer
 from nerfview import CameraState
 
@@ -30,8 +32,11 @@ from nerfview import CameraState
 class SkyOnlyConfig:
     # Path to dataset
     data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\segment-102751"
+    # data_dir: str = r"y:\_gopro_kv92\2025-10-06-1\3-good-park"
+    # data_dir: str = r"x:\_ai\_demos\_gsplat\_datasets\youtube01"
     # Directory to save results
     result_dir: str = r"x:\_ai\_my_nerfstudio_results\sky_only"
+
     # Downsample factor for the dataset
     data_factor: int = 4
     # Every N images there is a test image
@@ -51,7 +56,7 @@ class SkyOnlyConfig:
     
     # Skysphere parameters
     skysphere_radius_multiplier: float = 20.0
-    skysphere_points: int = 50_000
+    skysphere_points: int = 250_000
     init_opacity: float = 0.1
     init_scale: float = 1.0
     
@@ -66,12 +71,24 @@ class SkyOnlyConfig:
     tb_every: int = 100
 
     # Bilateral grid parameters
-    use_bilateral_grid: bool = True
+    use_bilateral_grid: bool = False
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
     use_fused_bilagrid: bool = True
 
     # Color correction for evaluation
     use_color_correct: bool = False
+
+
+def with_lock(lock_name):
+    """Decorator to make method thread-safe with specified lock."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            lock = getattr(self, lock_name)
+            with lock:
+                return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 class SkyOnlyRunner:
@@ -80,7 +97,8 @@ class SkyOnlyRunner:
     def __init__(self, cfg: SkyOnlyConfig) -> None:
         self.cfg = cfg
         self.device = "cuda"
-        
+        self.rasterize_lock = threading.Lock()
+
         # Setup output directories
         os.makedirs(cfg.result_dir, exist_ok=True)
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
@@ -111,6 +129,8 @@ class SkyOnlyRunner:
                 load_depths=False,
                 device=self.device,
                 to_gpu=True,
+                require_sky_mask=True,
+                invert_sky_mask=True,
             )
             self.valset = PreloadedDataset(
                 self.parser,
@@ -119,6 +139,8 @@ class SkyOnlyRunner:
                 load_depths=False,
                 device=self.device,
                 to_gpu=False,
+                require_sky_mask=True,
+                invert_sky_mask=True,
             )
         else:
             self.trainset = Dataset(
@@ -173,6 +195,9 @@ class SkyOnlyRunner:
                 ),
             ]
 
+        # Initialize epoch statistics for tracking
+        self.epoch_stats = None  # Will be initialized at first epoch
+
         # Metrics
         from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -188,12 +213,15 @@ class SkyOnlyRunner:
                 mode="training",
             )
     
+    @with_lock('rasterize_lock')
     def rasterize_sky(
         self,
         camtoworlds: Tensor,
         Ks: Tensor,
         width: int,
         height: int,
+        track_domination: bool = False,
+        override_colors: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Dict]:
         """Rasterize sky using WEIGHTED_SUM mode."""
         
@@ -203,7 +231,12 @@ class SkyOnlyRunner:
         quats = sky_splats["quats"]  # [N, 4]
         scales = sky_splats["scales"]  # [N, 3]
         opacities = sky_splats["opacities"]  # [N,] - already 1.0 constants
-        colors = sky_splats["colors"]  # [N, 3] - direct RGB values
+
+        # Use override colors if provided, otherwise use sky colors
+        if override_colors is not None:
+            colors = override_colors
+        else:
+            colors = sky_splats["colors"]  # [N, 3] - direct RGB values
         
         batch_size = camtoworlds.shape[0]
         # Expand colors for batch processing
@@ -234,6 +267,7 @@ class SkyOnlyRunner:
             rasterization_mode=RasterizationMode2DGS.WEIGHTED_SUM,  # Use WEIGHTED_SUM
             packed=False,
             sparse_grad=False,
+            track_domination=track_domination,
         )
         
         return render_colors, info
@@ -289,25 +323,25 @@ class SkyOnlyRunner:
                 persistent_workers=True,
                 pin_memory=True,
             )
-        
+
         # Training loop
         global_tic = time.time()
         pbar = tqdm.tqdm(range(max_steps))
 
-        data_iter = iter(trainloader)
-        for step in pbar:
+        n_cameras = len(trainloader)
+
+        for step, data, epoch_ctx in training_data_generator(trainloader, pbar):
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
             
-            # Get next batch
-            try:
-                data = next(data_iter)
-            except StopIteration:
-                data_iter = iter(trainloader)
-                data = next(data_iter)
+            # Initialize epoch statistics at the start of each epoch
+            if epoch_ctx.epoch_start:
+                n_gaussian = self.skysphere_model.n_points
+                if self.epoch_stats is None or len(self.epoch_stats.count) != n_gaussian:
+                    self.epoch_stats = EpochStatistics(n_gaussian, device)
             
             camtoworlds = data["camtoworld"].to(device)  # [B, 4, 4]
             Ks = data["K"].to(device)  # [B, 3, 3]
@@ -326,6 +360,7 @@ class SkyOnlyRunner:
                 Ks=Ks,
                 width=width,
                 height=height,
+                track_domination=False,
             )
 
             # sky_colors = sky_colors.clamp(0, 1)
@@ -371,8 +406,31 @@ class SkyOnlyRunner:
 
             # Backward pass
             loss.backward()
-            
+
+
+            # Update epoch statistics with rendering info
+            if self.epoch_stats is not None:
+                # Add width and height to info for statistics update
+                info["width"] = width
+                info["height"] = height
+                info["camtoworlds"] = camtoworlds
+                info["Ks"] = Ks
+                info["n_cameras"] = n_cameras
+
+                # Create dummy params dict with skysphere parameters
+                # sky_params = self.skysphere_model.get_splats()
+                sky_params = None
+
+                # Update statistics
+                self.epoch_stats.update_from_info(
+                    info=info,
+                    params=sky_params,
+                    key_for_gradient="gradient_2dgs",
+                    packed=info.get("packed", False)
+                )
+
             # Optimize
+
             for optimizer in self.skysphere_optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -385,6 +443,10 @@ class SkyOnlyRunner:
             for scheduler in schedulers:
                 scheduler.step()
             
+            # Reset epoch statistics at the end of epoch
+            if epoch_ctx.epoch_end and self.epoch_stats is not None:
+                self.epoch_stats.reset()
+
             # Update viewer
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -395,7 +457,8 @@ class SkyOnlyRunner:
                 self.viewer.update(step, num_train_rays_per_step)
             
             # Logging
-            desc = f"loss={loss.item():.3f} | l1={l1loss.item():.3f} | ssim={ssimloss.item():.4f}"
+            desc = f"epoch={epoch_ctx.i_epoch} ({100.0 * (epoch_ctx.i + 1) / epoch_ctx.epoch_len:.1f}%) | "
+            desc += f"loss={loss.item():.3f} | l1={l1loss.item():.3f} | ssim={ssimloss.item():.4f}"
             if cfg.use_bilateral_grid:
                 desc += f" | tv={tvloss.item():.4f}"
             pbar.set_description(desc)
@@ -409,14 +472,13 @@ class SkyOnlyRunner:
             
             # Save checkpoint
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                checkpoint_data = {
-                    "step": step,
-                    "skysphere": self.skysphere_model.state_dict(),
-                }
-                torch.save(
-                    checkpoint_data,
-                    f"{self.ckpt_dir}/ckpt_{step}.pt",
-                )
+                # Create checkpoint directory for this step
+                step_dir = f"{self.ckpt_dir}/step_{step:06d}"
+                os.makedirs(step_dir, exist_ok=True)
+
+                # Save skysphere model
+                self.skysphere_model.save_checkpoint(f"{step_dir}/skysphere.pt")
+
                 print(f"Saved checkpoint at step {step}")
             
             # Evaluation
@@ -512,28 +574,16 @@ class SkyOnlyRunner:
         self, camera_state: CameraState, render_tab_state
     ):
         """Render function for viewer."""
-        width = render_tab_state.viewer_width
-        height = render_tab_state.viewer_height
-        c2w = camera_state.c2w
-        K = camera_state.get_K((width, height))
-        c2w = torch.from_numpy(c2w).float().to(self.device)
-        K = torch.from_numpy(K).float().to(self.device)
-        
-        # Render sky
-        sky_colors, _ = self.rasterize_sky(
-            camtoworlds=c2w[None],
-            Ks=K[None],
-            width=width,
-            height=height,
-        )
 
-        renders = sky_colors.squeeze(0).clamp(0, 1)
-        
-        # Update render tab state
-        render_tab_state.total_gs_count = self.skysphere_model.n_points
-        render_tab_state.rendered_gs_count = self.skysphere_model.n_points
-        
-        return renders.cpu().numpy()
+        # Prepare all needed parameters for external function
+        device = self.device
+        rasterize_fn = self.rasterize_sky
+        epoch_stats = self.epoch_stats
+        trainset_len = len(self.trainset)
+        grow_grad2d = self.cfg.grow_grad2d if hasattr(self.cfg, 'grow_grad2d') else 0.0002
+        n_points = self.skysphere_model.n_points
+
+        return skysphere_renderer(device, rasterize_fn, epoch_stats, trainset_len, grow_grad2d, n_points, camera_state, render_tab_state)
 
 
 def main(cfg: SkyOnlyConfig):
@@ -541,19 +591,9 @@ def main(cfg: SkyOnlyConfig):
     global BilateralGrid, slice, total_variation_loss, color_correct
     if cfg.use_bilateral_grid:
         if cfg.use_fused_bilagrid:
-            from fused_bilagrid import (
-                BilateralGrid,
-                color_correct,
-                slice,
-                total_variation_loss,
-            )
+            pass
         else:
-            from lib_bilagrid import (
-                BilateralGrid,
-                color_correct,
-                slice,
-                total_variation_loss,
-            )
+            pass
 
     runner = SkyOnlyRunner(cfg)
     runner.train()

@@ -1,7 +1,52 @@
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, Optional
 import torch
-from torch import Tensor
 
+
+"""
+nnz — стандартная аббревиатура для "number of non-zero elements" (количество ненулевых элементов) в разреженных матрицах и тензорах.
+
+В gsplat промежуточные результаты в meta словаре содержат:
+
+gaussian_ids - индексы гауссианов (для nnz, иначе None)
+camera_ids - индексы камер (для nnz, иначе None)
+isect_ids - индексы пересечений (гауссиан, тайл)
+flatten_ids - линейные индексы для развёртки
+Для прямого доступа к парам (камера, гауссиан) в packed режиме используются camera_ids и gaussian_ids из возвращаемого meta словаря.
+
+
+# После рендеринга
+colors, alphas, meta = rasterization(..., packed=True)
+
+# Индексы активных пар
+camera_indices = meta['camera_ids']    # [nnz]
+gaussian_indices = meta['gaussian_ids'] # [nnz]
+"""
+
+"""
+ВАЖНО ДЛЯ LLM: Семантика touched и dominated статистик
+
+n_touched и n_dominated в packed формате:
+- Размер [nnz], где каждый элемент соответствует паре (камера, гауссиан)
+- n_touched[i] - количество пикселей камеры cam_ids[i], лучи которых затронули гауссиан gs_ids[i]
+  (луч может НЕ затронуть гауссиан если прошёл далеко от него, или если гауссиан загорожен другими и на него не хватило прозрачности)
+- n_dominated[i] - количество пикселей камеры cam_ids[i], где гауссиан gs_ids[i] съел самую большую долю прозрачности среди всех гауссианов
+
+touched_pct и dominated_pct:
+- Это проценты от общего количества пикселей КОНКРЕТНОЙ камеры (width * height)
+- Для каждой пары (камера, гауссиан) процент считается независимо
+- max_touchedPct[gs_id] хранит максимальный процент по всем камерам, из которых был виден гауссиан gs_id
+- max_dominatedPct[gs_id] аналогично
+
+n_cameras_visible_from:
+- Считает количество уникальных камер, из которых гауссиан был виден (n_touched > 0) за всю эпоху
+- В батче с несколькими камерами каждая уникальная камера считается отдельно
+
+n_touched_accum и n_dominated_accum:
+- Накапливают общее количество пикселей за эпоху для каждого гауссиана
+- При батчевой обработке суммируются значения от всех пар (камера, гауссиан) с одинаковым gs_id
+"""
 
 @torch.no_grad()
 def _accumulate_by_ids(
@@ -29,6 +74,68 @@ def _accumulate_by_ids(
             target_tensor += values_sum
         else:  # [N] format
             target_tensor += values
+
+
+@torch.no_grad()
+def _accumulate_max(
+        target_tensor: torch.Tensor,
+        gs_ids: torch.Tensor | None,
+        values: torch.Tensor,
+        packed: bool,
+):
+    """Generic maximum accumulation method that handles both packed and non-packed cases.
+
+    Args:
+        target_tensor: Tensor to update with maximum values [N]
+        gs_ids: Gaussian IDs for indexing (for packed format) [nnz]
+        values: Values to take maximum of [nnz] for packed, [C, N] or [N] for non-packed
+        packed: Whether the data is in packed format
+    """
+    if packed:
+        # Use index_reduce with 'amax' for packed case
+        target_tensor.index_reduce_(0, gs_ids, values, 'amax', include_self=True)
+    else:
+        # For non-packed case, handle per-camera data
+        if values.dim() == 2:  # [C, N] format
+            # Maximum across cameras for each gaussian
+            max_values = values.max(dim=0).values  # [N]
+            target_tensor.copy_(torch.maximum(target_tensor, max_values))
+        else:  # [N] format
+            target_tensor.copy_(torch.maximum(target_tensor, values))
+
+
+@torch.no_grad()
+def _accumulate_count(
+        target_tensor: torch.Tensor,
+        gs_ids: torch.Tensor | None,
+        mask: torch.Tensor,
+        packed: bool,
+):
+    """Generic count accumulation method that handles both packed and non-packed cases.
+
+    Args:
+        target_tensor: Tensor to accumulate counts into [N]
+        gs_ids: Gaussian IDs for indexing (for packed format) [nnz]
+        mask: Boolean or integer mask to count [nnz] for packed, [C, N] or [N] for non-packed
+        packed: Whether the data is in packed format
+    """
+    if packed:
+        # Convert boolean mask to int if needed
+        count_values = mask.int() if mask.dtype == torch.bool else mask
+        target_tensor.index_add_(0, gs_ids, count_values)
+    else:
+        # For non-packed case, handle per-camera data
+        if mask.dim() == 2:  # [C, N] format
+            # Sum counts across cameras for each gaussian
+            count_sum = mask.sum(dim=0)  # [N]
+            if mask.dtype == torch.bool:
+                count_sum = count_sum.int()
+            target_tensor += count_sum
+        else:  # [N] format
+            if mask.dtype == torch.bool:
+                target_tensor += mask.int()
+            else:
+                target_tensor += mask
 
 
 class EpochStatistics:
@@ -62,61 +169,50 @@ class EpochStatistics:
             n_touched: torch.Tensor,
             n_dominated: torch.Tensor,
             width: int, height: int,
-            gs_ids: torch.Tensor, packed: bool = False
+            gs_ids: torch.Tensor|None,
+            cam_ids: torch.Tensor | None,
+            packed: bool = False
     ):
-        """Update domination statistics for the current camera view.
+        """Update domination statistics.
         
         Args:
-            gs_ids: Gaussian IDs that were rendered
-            n_touched: Number of pixels touched by each gaussian
-            n_dominated: Number of pixels dominated by each gaussian
+            n_touched: [nnz] for packed, [C, N] or [N] for non-packed - Number of pixels touched
+            n_dominated: [nnz] for packed, [C, N] or [N] for non-packed - Number of pixels dominated
             width: Image width
             height: Image height
+            gs_ids: [nnz] Gaussian IDs (for packed format), None for non-packed
+            cam_ids: [nnz] Camera IDs (for packed format), None for non-packed
             packed: Whether the data is in packed format
         """
+        if len(n_touched) == 0:
+            return
+
+        # Unify [N] format as [1, N] for non-packed processing
+        if not packed and n_touched.dim() == 1:
+            n_touched = n_touched.unsqueeze(0)  # [N] -> [1, N]
+            n_dominated = n_dominated.unsqueeze(0)  # [N] -> [1, N]
+        
+        # Calculate percentages
         total_px = width * height
-        device = self.n_cameras_visible_from.device
-        n_gaussian = self.n_cameras_visible_from.shape[0]
+        touched_pct = n_touched.float() / total_px
+        dominated_pct = n_dominated.float() / total_px
         
-        # Create update filter based on which gaussians are being updated
-        update_filter = torch.zeros(n_gaussian, dtype=torch.bool, device=device)
-        update_filter[gs_ids] = True
+        # Update max percentages
+        _accumulate_max(self.max_touchedPct, gs_ids, touched_pct, packed=packed)
+        _accumulate_max(self.max_dominatedPct, gs_ids, dominated_pct, packed=packed)
         
-        # Calculate percentages of touched camera space for updated gaussians
-        ntoched_upd = torch.zeros(n_gaussian, dtype=torch.int32, device=device)
-        ndom_upd = torch.zeros(n_gaussian, dtype=torch.int32, device=device)
-        
-        # Handle both packed and full-size tensors based on packed flag
+        # Count cameras from which each gaussian was visible
         if packed:
-            # Packed format: n_touched/n_dominated contain only values for rendered gaussians
-            ntoched_upd[gs_ids] = n_touched
-            ndom_upd[gs_ids] = n_dominated
+            visible_mask = n_touched > 0  # [nnz]
         else:
-            # Non-packed format: n_touched/n_dominated are full-size, index by gs_ids
-            ntoched_upd[gs_ids] = n_touched[gs_ids]
-            ndom_upd[gs_ids] = n_dominated[gs_ids]
+            # For non-packed: sum visibility across cameras for each gaussian
+            visible_mask = (n_touched > 0).sum(dim=0) if n_touched.dim() == 2 else (n_touched > 0).int()
         
-        # Update epoch max percentages
-        self.max_touchedPct[update_filter] = torch.max(
-            self.max_touchedPct[update_filter], 
-            ntoched_upd[update_filter] / total_px
-        )
-        self.max_dominatedPct[update_filter] = torch.max(
-            self.max_dominatedPct[update_filter], 
-            ndom_upd[update_filter] / total_px
-        )
+        _accumulate_count(self.n_cameras_visible_from, gs_ids, visible_mask, packed=packed)
         
-        # Increment counter of cameras from which each gaussian was visible in this epoch
-        if packed:
-            visible_mask = torch.zeros(n_gaussian, dtype=torch.bool, device=device)
-            visible_mask[gs_ids] = n_touched > 0
-            self.n_cameras_visible_from[visible_mask] += 1
-        else:
-            self.n_cameras_visible_from[n_touched > 0] += 1
-        
-        # Accumulate touched and dominated counts for this epoch
-        _accumulate_by_ids(self.n_touched_accum, gs_ids, n_touched, packed)
-        _accumulate_by_ids(self.n_dominated_accum, gs_ids, n_dominated, packed)
+        # Accumulate total touched and dominated pixels across all cameras
+        _accumulate_by_ids(self.n_touched_accum, gs_ids, n_touched, packed=packed)
+        _accumulate_by_ids(self.n_dominated_accum, gs_ids, n_dominated, packed=packed)
 
     @torch.no_grad()
     def update_max_sampling_rate(
@@ -130,59 +226,66 @@ class EpochStatistics:
             sampling_rates: [C, N] or [N] - Sampling rates (f/d) for gaussians
             visible_mask: [C, N] or [N] - Boolean mask of visible gaussians
         """
-        if sampling_rates.dim() == 2:  # [C, N] format
-            # For each gaussian, find maximum sampling rate across all cameras where it's visible
-            for c in range(sampling_rates.shape[0]):
-                visible = visible_mask[c]
-                if visible.any():
-                    self.max_sampling_rate[visible] = torch.maximum(
-                        self.max_sampling_rate[visible],
-                        sampling_rates[c, visible]
-                    )
-        else:  # [N] format
-            if visible_mask.any():
-                self.max_sampling_rate[visible_mask] = torch.maximum(
-                    self.max_sampling_rate[visible_mask],
-                    sampling_rates[visible_mask]
-                )
+        # Set invisible elements to zero so they don't affect maximum
+        masked_rates = sampling_rates * visible_mask.float()
+        _accumulate_max(self.max_sampling_rate, None, masked_rates, packed=False)
     
     @torch.no_grad()
     def update_gradient_stats(
             self,
+            width: int,
+            height: int,
             grads: torch.Tensor,
             grads_abs: torch.Tensor,
             importance_grads: torch.Tensor,
-            gs_ids: torch.Tensor,
+            gs_ids: Optional[torch.Tensor],
+            n_touched: Optional[torch.Tensor] = None,
             radii: Optional[torch.Tensor] = None,
-            width: Optional[int] = None,
-            height: Optional[int] = None,
+            packed: bool = False,
     ):
         """Update gradient accumulation statistics.
         
         Args:
-            grads: Gradient norms for each gaussian
-            grads_abs: Absolute gradient norms for each gaussian
-            importance_grads: Importance gradients (vG^2) for each gaussian
-            gs_ids: Gaussian IDs that were rendered
-            radii: Optional radii values for scale tracking
-            width: Optional image width for radii normalization
-            height: Optional image height for radii normalization
+            grads: [nnz] for packed, [C, N] or [N] for non-packed - Gradient norms
+            grads_abs: [nnz] for packed, [C, N] or [N] for non-packed - Absolute gradient norms
+            importance_grads: [nnz] for packed, [C, N] or [N] for non-packed - Importance gradients (vG^2)
+            gs_ids: [nnz] Gaussian IDs (for packed format), None for non-packed
+            n_touched: [nnz] for packed, [C, N] or [N] for non-packed - Number of touched pixels (more reliable than radii)
+            radii: [nnz] for packed, [C, N] or [N] for non-packed - Optional radii values
+            width: Image width for radii normalization
+            height: Image height for radii normalization
+            packed: Whether the data is in packed format
         """
-        self.grad2d.index_add_(0, gs_ids, grads)
-        self.grad2d_abs.index_add_(0, gs_ids, grads_abs)
-        self.importance.index_add_(0, gs_ids, importance_grads)
-        self.count.index_add_(0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32))
         
-        if radii is not None and width is not None and height is not None:
+        # Accumulate gradients
+        _accumulate_by_ids(self.grad2d, gs_ids, grads, packed=packed)
+        _accumulate_by_ids(self.grad2d_abs, gs_ids, grads_abs, packed=packed)
+        _accumulate_by_ids(self.importance, gs_ids, importance_grads, packed=packed)
+        
+        # Count how many times each gaussian was rendered  
+        # Priority: n_touched > radii > assume all visible
+        # Determine visibility mask
+        if n_touched is not None and len(n_touched):
+            visible_mask = (n_touched > 0).float()
+        elif radii is not None:
+            visible_mask = (radii[..., 0] > 0).float()
+        elif packed:
+            visible_mask = torch.ones_like(gs_ids, dtype=torch.float32)
+        else:
+            # Without visibility info, assume all gaussians processed
+            n_cameras = grads.shape[0] if grads.dim() == 2 else 1
+            self.count += n_cameras
+            visible_mask = None
+        
+        if visible_mask is not None:
+            _accumulate_count(self.count, gs_ids, visible_mask, packed=packed)
+        
+        if radii is not None:
             if self.radii is None:
                 self.radii = torch.zeros_like(self.grad2d)
-            # Should be ideally using scatter max
-            self.radii[gs_ids] = torch.maximum(
-                self.radii[gs_ids],
-                # normalize radii to [0, 1] screen space
-                radii / float(max(width, height)),
-            )
-   
+            # Normalize radii to [0, 1] screen space
+            normalized_radii = torch.norm(radii.float(), dim=-1) / float(max(width, height))
+            _accumulate_max(self.radii, gs_ids, normalized_radii, packed=packed)
 
     @torch.no_grad()
     def update_from_info(
@@ -202,32 +305,31 @@ class EpochStatistics:
         """
         device = self.n_cameras_visible_from.device
         n_gaussian = self.n_cameras_visible_from.shape[0]
-        
+
         # Update domination statistics if available
         if "n_touched" in info and "n_dominated" in info:
-            gs_ids = info.get("gaussian_ids")
-            packed_data = gs_ids is not None and len(info["n_touched"]) == len(gs_ids)
             self.update_domination_stats(
                 n_touched=info["n_touched"],
                 n_dominated=info["n_dominated"],
                 width=info.get("width", 1920),  # Default if not provided
                 height=info.get("height", 1080),  # Default if not provided
-                gs_ids=gs_ids if gs_ids is not None else torch.arange(n_gaussian, device=device),
-                packed=packed_data
+                gs_ids=info["gaussian_ids"],
+                cam_ids=info["camera_ids"],
+                packed=packed
             )
-        
+
         # Update gradient statistics if gradients are available
         if key_for_gradient in info and info[key_for_gradient].grad is not None:
             if key_for_gradient == "gradient_2dgs":
                 # For gradient_2dgs, extract appropriate elements
-                gradient_2dgs = info[key_for_gradient].grad.clone()
+                gradient_2dgs = info[key_for_gradient].grad.detach().clone()
                 grads = gradient_2dgs[..., :2]
                 grads_abs = gradient_2dgs[..., 2:4]
                 importance_grads = gradient_2dgs[..., 4:5]
             else:
                 # For means2d (not currently used in 2DGS)
                 raise NotImplementedError(f"Gradient key {key_for_gradient} not implemented")
-            
+
             # Normalize gradients
             width = info.get("width", 1920)
             height = info.get("height", 1080)
@@ -236,59 +338,40 @@ class EpochStatistics:
             grads[..., 1] *= height / 2.0 * n_cameras
             grads_abs[..., 0] *= width / 2.0 * n_cameras
             grads_abs[..., 1] *= height / 2.0 * n_cameras
-            
-            # Get gaussian IDs and filter by visibility
-            if packed:
-                # Packed format: gradients already correspond to visible gaussians
-                gs_ids = info["gaussian_ids"]  # [nnz]
-                radii = info.get("radii")
-                if radii is not None:
-                    radii = radii.max(dim=-1).values  # [nnz]
-            else:
-                # Non-packed format: need to filter by visibility
-                radii = info.get("radii")
-                if radii is not None:
-                    sel = (radii > 0.0).all(dim=-1)  # [C, N]
-                    gs_ids = torch.where(sel)[1]  # [nnz]
-                    grads = grads[sel]  # [nnz, 2]
-                    grads_abs = grads_abs[sel]  # [nnz, 2]
-                    importance_grads = importance_grads[sel]  # [nnz, 1]
-                    radii = radii[sel].max(dim=-1).values  # [nnz]
-                else:
-                    gs_ids = torch.arange(n_gaussian, device=device)
-                    radii = None
-            
+
             # Update gradient statistics
             self.update_gradient_stats(
+                width=width,
+                height=height,
                 grads=grads.norm(dim=-1),
                 grads_abs=grads_abs.norm(dim=-1),
                 importance_grads=importance_grads.squeeze(-1),
-                gs_ids=gs_ids,
-                radii=radii,
-                width=width if radii is not None else None,
-                height=height if radii is not None else None,
+                gs_ids=info["gaussian_ids"],
+                n_touched=info.get("n_touched"),
+                radii=info.get("radii"),
+                packed=packed,
             )
-        
+
         # Update sampling rate statistics if available
-        if "camtoworlds" in info and "Ks" in info:
+        if params is not None and "camtoworlds" in info and "Ks" in info:
             # Compute euclidean distances from camera to gaussians
             camtoworlds = info["camtoworlds"]
             Ks = info["Ks"]
-            
+
             # Get means from params
-            means = params["means"]
-            
+            means = params["means"].detach()
+
             # Euclidean distance from camera to gaussian center
             cam_positions = camtoworlds[:, :3, 3].unsqueeze(1)  # [C, 1, 3]
             means = means.unsqueeze(0)  # [1, N, 3]
             distances = torch.norm(cam_positions - means, dim=2)  # [C, N]
-            
+
             # Extract focal lengths from camera intrinsics
             # Use average of fx and fy
             focals = (Ks[:, 0, 0] + Ks[:, 1, 1]) / 2.0  # [C]
             # Compute sampling rates f/d
             sampling_rates = focals.unsqueeze(1) / distances  # [C, N]
-            
+
             # Update max_sampling_rate tracking
             # Use n_touched for visibility - accounts for transparency and actual pixel coverage
             if "n_touched" in info:
